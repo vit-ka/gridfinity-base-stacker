@@ -580,6 +580,7 @@ socket taper at **{angle:.1f} degrees** from horizontal.
 | Interface layers (top and bottom) | **{iface}** | {ifacewhy} |
 | Interface spacing | **0** | solid interface |
 | Base pattern spacing | 2.5 mm | the support is only {gap} mm tall, it needs no bulk |
+| Normal Support expansion | **-0.25 mm** | contracts the support region, removing the ribbons and nubs that print inside the open cells. Verified end to end: 4.93 h and 6.7 g, with all five gaps carried (thinnest 0.85 of a solid layer). See the curve below -- -0.3 is a cliff |
 | Support/object XY distance | **0.8 mm** | the default 0.35 lets the slicer build columns up through the open cells to reach the socket corners of the plate above. Those corners are 45 deg walls that print unsupported anyway. Measured on a six-plate stack: 0.35 -> 0.8 mm cuts support from 19.0 g to 11.9 g and 5.38 h to 5.08 h, with the gap interfaces unchanged. It flattens out past 0.8 |
 
 **Other**
@@ -608,8 +609,10 @@ socket taper at **{angle:.1f} degrees** from horizontal.
   | -0.3 | 6.3 g | 0.73 <- cliff |
   | -0.4 | 5.3 g | 0.58 |
 
-  -0.2 is the safe setting and -0.25 buys a further 3 g. Past -0.25 the gap
-  interfaces start losing the lands they have to carry, so stop there.
+  -0.25 is the setting to use and is what the table above recommends; -0.2 is the
+  cautious one. Past -0.25 the gap interfaces start losing the lands they have to
+  carry, so stop there. At -0.25 the thinnest gap is always the topmost
+  land-to-land joint, which has the smallest contact area of the five.
 - Two things cut it and simply break the gaps. Do not use them: "don't support
   bridges" (coverage 0.93x -> 0.40x), and tree support in any style, which either
   fills the cells with branches (97 g) or supports the gaps not at all.
