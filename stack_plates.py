@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import gridfinity as gf
-from stl_io import (Bounds, Mesh, bounds_of, loft, read_stl, rotate_x180,
+from stl_io import (Bounds, Mesh, bounds_of, box, loft, read_stl, rotate_x180,
                     rotate_y180, split_shells, translate, write_stl)
 
 LAND, RIB = "land", "rib"
@@ -420,7 +420,28 @@ def make_blockers(placements: tuple[Placement, ...], gap: float,
         oriented = flipped_mesh(tuple(local), pl.flip_axis)
         offset = bounds_of(flipped_mesh(plate.mesh, pl.flip_axis)).z0
         mesh.extend(translate(oriented, pl.dx, pl.dy, pl.dz - offset))
-    return tuple(mesh)
+    return match_bbox(tuple(mesh),
+                      bounds_of(tuple(f for pl in placements for f in pl.placed_mesh())))
+
+
+BBOX_PIN = 0.1      # mm; large enough that the slicer keeps it, small enough to ignore
+
+
+def match_bbox(mesh: Mesh, target: Bounds) -> Mesh:
+    """Pad a blocker mesh so its bounding box matches the model's.
+
+    Bambu Studio centres a loaded part on the object it joins. The cell lattice is
+    not centred in the plate outline, so the blockers' own bbox centre sits a few
+    mm off the model's -- and every blocker lands that far out, over the ribs
+    instead of the chimneys, silently doing nothing. Two pin-sized cubes at
+    opposite corners make the centres agree, so the placement is a no-op.
+    """
+    b = bounds_of(mesh)
+    pins = (
+        box(target.x0, target.y0, b.z0, target.x0 + BBOX_PIN, target.y0 + BBOX_PIN, b.z0 + BBOX_PIN),
+        box(target.x1 - BBOX_PIN, target.y1 - BBOX_PIN, b.z1 - BBOX_PIN, target.x1, target.y1, b.z1),
+    )
+    return mesh + pins[0] + pins[1]
 
 
 def registration_error(lower: Placement, upper: Placement) -> tuple[float, float]:
@@ -539,9 +560,7 @@ socket taper at **{angle:.1f} degrees** from horizontal.
    objects" or "split to parts", the whole point is that they print as one piece.
 2. Do not let auto-arrange rotate it. Orientation is already correct: the bottom
    plate's {rib:.2f} mm ribs sit on the bed.
-3. Add the blockers: right-click the object -> **Add support blocker** -> **Load...**
-   -> pick `{blockers}`. It lands in the object's own coordinate frame, so do not
-   move it afterwards.
+{blocker_step}
 
 ## Slicer settings
 
@@ -581,6 +600,16 @@ land-to-land interfaces you should see support only on the narrow {land:.2f} mm
 webs, and the socket funnels should be empty.
 """
 
+BLOCKER_STEP = """3. Add the blockers: right-click the object -> **Add support blocker** ->
+   **Load...** -> pick `{blockers}`. Bambu Studio centres a loaded part on the
+   object, and the blockers' bounding box is pinned to match the model's so that
+   centring is a no-op -- do not move it afterwards."""
+
+NO_BLOCKER_STEP = """3. No support blockers needed. Sliced both ways on a
+   six-plate stack they came out the same, 5.66 h and 24.3 g with them against
+   5.69 h and 24.5 g without: with snug support the slicer does not pack the
+   chimneys in the first place. `--blockers` emits them if you want them anyway."""
+
 SAME_FILAMENT = """**Filament -- one spool, no AMS**
 
 Print the support in the same PLA as the model, and assign **no** support
@@ -595,16 +624,19 @@ optional."""
 
 PETG_FILAMENT = """**Filament (AMS)**
 - Slot 1: PLA -- the model.
-- Slot 2: **PETG** -- support/raft interface only. PETG does not bond to PLA, so
-  the plates separate with almost no force and leave no scarring.
+- Slot 2: **PETG**, or **Bambu Support W** -- support/raft interface only.
+  Neither bonds to PLA, so the plates separate with almost no force and leave no
+  scarring. With one of these, set both Z distances to **0**.
 
-The tool changes are not free: expect a prime tower and a purge deposit at every
-change. Weigh that against the cleaner release.
+The tool changes are not free. Measured on a six-plate stack, a Support W
+interface cost **0.88 h** against same-material support, plus a wipe tower and a
+purge deposit at every change. Worth it for the release, but know the price.
 """
 
 
 def write_printing_notes(path: Path, placements, gap, layer, report_text,
-                         stl_name, blocker_name, source, interface="same") -> None:
+                         stl_name, blocker_name, source, interface="same",
+                         blockers=False) -> None:
     lat = placements[0].lattice
     plate = placements[0].plate
     rib = lat.pitch - lat.bottom_opening
@@ -616,6 +648,7 @@ def write_printing_notes(path: Path, placements, gap, layer, report_text,
         rib=rib, land=land, funnel=plate.funnel_depth, ledge=(rib - land) / 2,
         angle=angle, cells=sum(p.plate.lattice.cells for p in placements),
         gap=gap, layer=layer, layers=round(gap / layer),
+        blocker_step=(BLOCKER_STEP.format(blockers=blocker_name) if blockers else NO_BLOCKER_STEP),
         filament_section=PETG_FILAMENT if petg else SAME_FILAMENT,
         ztop="0" if petg else f"{layer:g} mm",
         zwhy=("PETG does not bond to PLA, so zero gap still releases"
@@ -640,7 +673,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="keep every plate the same way up")
     ap.add_argument("--no-register", action="store_true",
                     help="centre plates instead of aligning their cell lattices")
-    ap.add_argument("--no-blockers", action="store_true")
+    ap.add_argument("--blockers", action="store_true",
+                    help="also emit support blockers. Measured to make no "
+                         "difference with snug support; kept for grid, or for "
+                         "plate profiles this tool has not seen")
     ap.add_argument("--order", choices=("nested", "area"), default="nested",
                     help="nested: each plate sits on the one below (default); "
                          "area: plain footprint order")
@@ -680,7 +716,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nwrote {stl_path}")
 
     blocker_path = out / f"{stem}-blockers.stl"
-    if not args.no_blockers:
+    if args.blockers:
         blockers = make_blockers(placements, gap)
         write_stl(blocker_path, blockers, "support blockers")
         print(f"wrote {blocker_path} ({len(blockers)} facets)")
@@ -688,7 +724,7 @@ def main(argv: list[str] | None = None) -> int:
     notes = out / "PRINTING.md"
     write_printing_notes(notes, placements, gap, args.layer_height, report_text,
                          stl_path.name, blocker_path.name, args.stl.name,
-                         interface=args.interface)
+                         interface=args.interface, blockers=args.blockers)
     print(f"wrote {notes}")
     return 0
 

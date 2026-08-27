@@ -43,20 +43,30 @@ partial cell row (21 mm border one end, 9 mm the other) and shift 18 mm if
 rotated about X, hanging off the stack over open air. We take whichever axis
 leaves the plate closest to centred.
 
-Support blockers are emitted as a companion STL, one solid per socket, lofted to
-that socket's own measured void and built in the plate's own frame so it goes
-through the same rotation and translation as the plate.
+Support blockers are available as a companion STL (`--blockers`), one solid per
+socket, lofted to that socket's own measured void and built in the plate's own
+frame. They are **off by default**: sliced both ways they make no measurable
+difference, so they are not part of the design, only an escape hatch.
 
 ## Consequences
 
 The socket surfaces come out untouched, and the stack is exactly the bottom
 plate's footprint, so nothing needs support from the bed.
 
-The material saving is smaller than the geometry suggests. Sliced for real, a
-six-plate stack takes 23 g of support, against 4 g predicted from contact area
-alone -- the slicer puts support into the chimneys regardless, and the support
-style matters more than the stacking does (59 g with grid, 23 g with snug).
-Treat the flip as protecting the socket surfaces, not as a way to save filament.
+The material saving is smaller than the geometry suggests, and most of what we
+can control is not in the geometry at all. Sliced for real on a six-plate stack:
+
+| | time | support |
+|---|---|---|
+| flat, six separate jobs | 4.2 h | none |
+| stacked, snug support | 5.7 h | 24 g |
+| stacked, grid support | 7.1 h | 59 g |
+| stacked, snug, blockers loaded | 5.7 h | 24 g |
+
+Support **style** dominates: grid packs the socket chimneys and costs 1.4 h and
+35 g, snug does not. The blockers -- the most intricate code here -- change
+nothing once the style is right. Treat the flip as protecting the socket
+surfaces, not as a way to save filament or time.
 
 Three of the six plates print their top land face-down against support. That
 surface is the flat rim, not the socket walls, so a PETG interface leaves it

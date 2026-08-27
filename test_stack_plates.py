@@ -378,7 +378,10 @@ class TestBlockers(unittest.TestCase):
         plates = tuple(sp.build_plate(perforated_plate(w, d))
                        for w, d in ((4, 3), (3, 3), (3, 2)))
         self.pl = sp.plan(plates, 0.8, flip=True, register=True)
-        self.solids = stl_io.split_shells(sp.make_blockers(self.pl, 0.8))
+        every = stl_io.split_shells(sp.make_blockers(self.pl, 0.8))
+        # the two bbox pins are not sockets; they exist only to fix placement
+        self.solids = tuple(s for s in every
+                            if stl_io.bounds_of(s).width > sp.BBOX_PIN + 1e-9)
 
     def test_one_solid_per_cell(self):
         self.assertEqual(len(self.solids),
@@ -436,14 +439,36 @@ class TestBlockers(unittest.TestCase):
                                 f"the {pl.plate.label} plate")
         self.assertGreater(sampled, 100)
 
-    def test_no_blockers_flag_skips_the_file(self):
+    def test_bbox_matches_the_model(self):
+        """Regression: Bambu centres a loaded part on the object it joins.
+
+        The cell lattice is not centred in the plate outline, so without pinning
+        the bbox the blockers land several mm off -- over the ribs, blocking
+        nothing, and silently. Measured 3.0 mm in X on the real cabinet set.
+        """
+        model = stl_io.bounds_of(tuple(f for pl in self.pl for f in pl.placed_mesh()))
+        blockers = stl_io.bounds_of(sp.make_blockers(self.pl, 0.8))
+        self.assertAlmostEqual(blockers.cx, model.cx, places=6)
+        self.assertAlmostEqual(blockers.cy, model.cy, places=6)
+
+    def test_pins_are_small_enough_to_ignore(self):
+        pinned = sp.make_blockers(self.pl, 0.8)
+        pins = [s for s in stl_io.split_shells(pinned)
+                if stl_io.bounds_of(s).width <= sp.BBOX_PIN + 1e-9]
+        self.assertEqual(len(pins), 2)
+        for pin in pins:
+            self.assertLessEqual(stl_io.signed_volume(pin), sp.BBOX_PIN ** 3 + 1e-9)
+
+    def test_blockers_are_opt_in(self):
+        """They measured as worth nothing with snug support, so they are off."""
         mesh = perforated_plate(4, 3) + perforated_plate(3, 3, origin=(500.0, 0.0))
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "in.stl"
             stl_io.write_stl(src, mesh)
-            out = Path(td) / "out"
-            sp.main([str(src), "-o", str(out), "--no-blockers"])
-            self.assertFalse((out / "gf-stack-2-blockers.stl").exists())
+            for flags, expected in ((["--blockers"], True), ([], False)):
+                out = Path(td) / ("on" if expected else "off")
+                sp.main([str(src), "-o", str(out), *flags])
+                self.assertEqual((out / "gf-stack-2-blockers.stl").exists(), expected)
 
 
 class TestCli(unittest.TestCase):
@@ -454,7 +479,7 @@ class TestCli(unittest.TestCase):
             src = Path(td) / "in.stl"
             stl_io.write_stl(src, mesh)
             out = Path(td) / "out"
-            self.assertEqual(sp.main([str(src), "-o", str(out)]), 0)
+            self.assertEqual(sp.main([str(src), "-o", str(out), "--blockers"]), 0)
             self.assertTrue((out / "gf-stack-2.stl").exists())
             self.assertTrue((out / "gf-stack-2-blockers.stl").exists())
             notes = (out / "PRINTING.md").read_text()
