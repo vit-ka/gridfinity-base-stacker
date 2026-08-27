@@ -16,7 +16,7 @@ Writes to `out/`:
 |---|---|
 | `gf-stack-N.stl` | the stacked model, one object |
 | `gf-stack-N-blockers.stl` | support blockers, one solid per socket |
-| `PRINTING.md` | Bambu Studio settings for the model it was generated from |
+| `gf-stack-N-PRINTING.md` | Bambu Studio settings for the model it was generated from |
 
 ## What it does
 

@@ -721,7 +721,9 @@ def main(argv: list[str] | None = None) -> int:
         write_stl(blocker_path, blockers, "support blockers")
         print(f"wrote {blocker_path} ({len(blockers)} facets)")
 
-    notes = out / "PRINTING.md"
+    # Named after the model: a fixed name silently overwrites the notes for an
+    # earlier variant, leaving instructions that describe a different STL.
+    notes = out / f"{stem}-PRINTING.md"
     write_printing_notes(notes, placements, gap, args.layer_height, report_text,
                          stl_path.name, blocker_path.name, args.stl.name,
                          interface=args.interface, blockers=args.blockers)

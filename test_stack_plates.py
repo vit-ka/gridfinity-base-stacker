@@ -465,7 +465,7 @@ class TestBlockers(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "in.stl"
             stl_io.write_stl(src, mesh)
-            for flags, expected in ((["--blockers"], True), ([], False)):
+            for flags, expected in ((["--blockers"], True), ([], False)):  # noqa: E501
                 out = Path(td) / ("on" if expected else "off")
                 sp.main([str(src), "-o", str(out), *flags])
                 self.assertEqual((out / "gf-stack-2-blockers.stl").exists(), expected)
@@ -482,9 +482,25 @@ class TestCli(unittest.TestCase):
             self.assertEqual(sp.main([str(src), "-o", str(out), "--blockers"]), 0)
             self.assertTrue((out / "gf-stack-2.stl").exists())
             self.assertTrue((out / "gf-stack-2-blockers.stl").exists())
-            notes = (out / "PRINTING.md").read_text()
+            notes = (out / "gf-stack-2-PRINTING.md").read_text()
             self.assertIn("land-to-land", notes)
             self.assertIn("Threshold angle", notes)
+
+    def test_variants_keep_their_own_notes(self):
+        """Regression: a fixed notes filename leaves instructions for the wrong STL."""
+        mesh = perforated_plate(4, 3) + perforated_plate(3, 3, origin=(500.0, 0.0))
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "in.stl"
+            stl_io.write_stl(src, mesh)
+            out = Path(td) / "out"
+            sp.main([str(src), "-o", str(out), "--gap", "0.8"])
+            sp.main([str(src), "-o", str(out), "--gap", "0.6", "--name", "tight"])
+            wide = (out / "gf-stack-2-PRINTING.md").read_text()
+            tight = (out / "tight-PRINTING.md").read_text()
+            self.assertIn("gf-stack-2.stl", wide)
+            self.assertIn("tight.stl", tight)
+            self.assertIn("0.8 mm", wide)
+            self.assertIn("0.6 mm", tight)
 
     def test_gap_snaps_to_layer_height(self):
         mesh = (perforated_plate(4, 3) + perforated_plate(3, 3, origin=(500.0, 0.0)))
