@@ -4,3 +4,4 @@ __pycache__/
 *.stl
 .DS_Store
 result.json
+*.3mf

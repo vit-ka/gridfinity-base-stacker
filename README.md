@@ -43,6 +43,33 @@ contact faces match and the socket funnels never fill with support. See
 --name STEM           output basename
 ```
 
+## Reusing the slicer settings
+
+The settings that matter are in `settings/`, distilled to the twelve that this
+arrangement actually depends on. Everything else is stock.
+
+| profile | for | gap |
+|---|---|---|
+| `petg-interface` | a support interface that does not bond to PLA (PETG) | 0.2 mm |
+| `same-material` | same filament, or one that still grabs (Bambu Support W) | 0.8 mm |
+
+Set them once in Bambu Studio and save the project as a template, then swap the
+model for each new stack. To confirm a template still says what you think it
+says:
+
+```
+python3 check_settings.py mystack.3mf
+python3 check_settings.py mystack.3mf --profile same-material
+```
+
+It reads `Metadata/project_settings.config` out of the 3mf, reports any setting
+that differs, and exits non-zero, so it can gate a print. Worth running after
+touching anything in the support panel: several of these look harmless and are
+not. Setting the top Z distance to 0 with a bonding interface costs an hour;
+support style `grid` costs 1.4 h and 35 g.
+
+Keep the 3mf itself outside the repo -- it carries the mesh.
+
 ## Checking a result
 
 `verify.py` re-derives the plan and checks the written files independently:

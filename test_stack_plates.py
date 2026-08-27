@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import itertools
+import json
 import math
 import re
+import zipfile
 import tempfile
 import unittest
 from pathlib import Path
 
+import check_settings as cs
 import gridfinity as gf
 import stack_plates as sp
 import stl_io
@@ -470,6 +473,63 @@ class TestBlockers(unittest.TestCase):
                 out = Path(td) / ("on" if expected else "off")
                 sp.main([str(src), "-o", str(out), *flags])
                 self.assertEqual((out / "gf-stack-2-blockers.stl").exists(), expected)
+
+
+class TestSettingsCheck(unittest.TestCase):
+    def profile(self, name):
+        return json.loads((Path("settings") / f"{name}.json").read_text())
+
+    def test_both_profiles_parse_and_cover_the_settings_that_matter(self):
+        must = {"support_style", "support_top_z_distance", "support_object_xy_distance",
+                "support_expansion", "support_interface_spacing", "support_type"}
+        for name in ("petg-interface", "same-material"):
+            keys = {k for k in self.profile(name) if not k.startswith("_")}
+            self.assertTrue(must <= keys, f"{name} missing {must - keys}")
+
+    def test_a_matching_project_passes(self):
+        want = self.profile("petg-interface")
+        project = {k: [v] for k, v in want.items() if not k.startswith("_")}
+        self.assertEqual(cs.compare(project, want), [])
+
+    def test_a_wrong_setting_is_reported(self):
+        want = self.profile("petg-interface")
+        project = {k: [v] for k, v in want.items() if not k.startswith("_")}
+        project["support_style"] = ["grid"]
+        bad = cs.compare(project, want)
+        self.assertEqual([b[0] for b in bad], ["support_style"])
+        self.assertEqual(bad[0][1:], ("snug", "grid"))
+
+    def test_a_missing_setting_is_reported(self):
+        want = self.profile("petg-interface")
+        project = {k: [v] for k, v in want.items() if not k.startswith("_")}
+        del project["support_expansion"]
+        self.assertIn(("support_expansion", "-0.25", "missing"),
+                      cs.compare(project, want))
+
+    def test_bare_scalars_compare_the_same_as_bambus_one_element_lists(self):
+        want = self.profile("petg-interface")
+        self.assertEqual(cs.compare({k: v for k, v in want.items()}, want), [])
+
+    def test_reads_settings_out_of_a_3mf(self):
+        want = self.profile("same-material")
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "p.3mf"
+            with zipfile.ZipFile(path, "w") as z:
+                z.writestr("Metadata/project_settings.config",
+                           json.dumps({k: [v] for k, v in want.items()
+                                       if not k.startswith("_")}))
+            self.assertEqual(cs.compare(cs.load_project(path), want), [])
+            self.assertEqual(cs.main([str(path), "--profile", "same-material"]), 0)
+
+    def test_exits_nonzero_when_something_differs(self):
+        want = self.profile("petg-interface")
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "p.3mf"
+            broken = {k: [v] for k, v in want.items() if not k.startswith("_")}
+            broken["support_top_z_distance"] = ["0.2"]
+            with zipfile.ZipFile(path, "w") as z:
+                z.writestr("Metadata/project_settings.config", json.dumps(broken))
+            self.assertEqual(cs.main([str(path)]), 1)
 
 
 class TestCli(unittest.TestCase):
