@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -485,6 +486,44 @@ class TestCli(unittest.TestCase):
             notes = (out / "gf-stack-2-PRINTING.md").read_text()
             self.assertIn("land-to-land", notes)
             self.assertIn("Threshold angle", notes)
+
+    def test_notes_have_no_unrendered_placeholders(self):
+        """Regression: a section substituted as a value keeps its own braces.
+
+        PETG_FILAMENT is inserted into the template as a value, so its {layer}
+        never went through .format() and shipped literally.
+        """
+        mesh = perforated_plate(4, 3) + perforated_plate(3, 3, origin=(500.0, 0.0))
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "in.stl"
+            stl_io.write_stl(src, mesh)
+            for i, iface in enumerate(("same", "petg")):
+                out = Path(td) / f"o{i}"
+                sp.main([str(src), "-o", str(out), "--interface", iface,
+                         "--gap", "0.2" if iface == "petg" else "0.8"])
+                notes = (out / "gf-stack-2-PRINTING.md").read_text()
+                leftover = re.findall(r"\{[a-z_]+(?::[^}]*)?\}", notes)
+                self.assertEqual(leftover, [], f"{iface}: unrendered {leftover}")
+
+    def test_petg_gets_zero_z_distance_and_same_material_does_not(self):
+        mesh = perforated_plate(4, 3) + perforated_plate(3, 3, origin=(500.0, 0.0))
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "in.stl"
+            stl_io.write_stl(src, mesh)
+            sp.main([str(src), "-o", str(Path(td) / "p"), "--interface", "petg", "--gap", "0.2"])
+            sp.main([str(src), "-o", str(Path(td) / "s"), "--interface", "same", "--gap", "0.8"])
+            petg = (Path(td) / "p/gf-stack-2-PRINTING.md").read_text()
+            same = (Path(td) / "s/gf-stack-2-PRINTING.md").read_text()
+            self.assertIn("| Top Z distance | **0** |", petg)
+            self.assertIn("| Top Z distance | **0.2 mm** |", same)
+
+    def test_interface_layers_fit_the_gap(self):
+        # 0.2 mm gap at 0.2 mm layers holds exactly one layer, not two
+        self.assertEqual(sp.iface_layers(0.2, 0.2, petg=True), 1)
+        self.assertEqual(sp.support_layers(0.2, 0.2, petg=True), 1)
+        # same-material loses a layer to each clearance
+        self.assertEqual(sp.support_layers(0.8, 0.2, petg=False), 2)
+        self.assertEqual(sp.support_layers(0.6, 0.2, petg=False), 1)
 
     def test_variants_keep_their_own_notes(self):
         """Regression: a fixed notes filename leaves instructions for the wrong STL."""
