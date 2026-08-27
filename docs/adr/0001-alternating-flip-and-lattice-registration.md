@@ -59,14 +59,21 @@ can control is not in the geometry at all. Sliced for real on a six-plate stack:
 | | time | support |
 |---|---|---|
 | flat, six separate jobs | 4.2 h | none |
-| stacked, snug support | 5.7 h | 24 g |
-| stacked, grid support | 7.1 h | 59 g |
-| stacked, snug, blockers loaded | 5.7 h | 24 g |
+| stacked, first working slice | 10.6 h | 88 g |
+| ... support style snug, not grid | 8.7 h | 24 g |
+| ... top Z distance 0.2, not 0 | 6.5 h | 23 g |
+| ... gap 0.6 mm, not 0.8 | **6.2 h** | 18 g |
+| stacked, blockers loaded | no change | no change |
 
-Support **style** dominates: grid packs the socket chimneys and costs 1.4 h and
-35 g, snug does not. The blockers -- the most intricate code here -- change
-nothing once the style is right. Treat the flip as protecting the socket
-surfaces, not as a way to save filament or time.
+Every one of those wins is a slicer setting. None is geometry. Support **style**
+dominates -- grid packs the socket chimneys, snug does not -- and a top Z
+distance of 0 makes support fill the whole gap rather than the part left between
+the clearances. The blockers, the most intricate code here, change nothing.
+
+Treat the flip as protecting the socket surfaces, not as a way to save filament
+or time. And measure: these numbers came from slicing with the Bambu Studio CLI,
+and each of them contradicted a plausible-sounding prediction made from the
+geometry alone.
 
 Three of the six plates print their top land face-down against support. That
 surface is the flat rim, not the socket walls, so a PETG interface leaves it

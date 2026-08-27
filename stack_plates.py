@@ -575,8 +575,8 @@ socket taper at **{angle:.1f} degrees** from horizontal.
 | Style | **snug** | grid expands support to a bounding box and packs the socket chimneys with it -- measured at 59 g against 23 g for snug on a six-plate stack, and 1.7 h of print time |
 | Threshold angle | **30 deg** | must stay well below {angle:.0f} deg or it will fill the socket funnels |
 | On build plate only | **OFF** | the whole point -- support must build on the plates |
-| Top Z distance | **{ztop}** | {zwhy} |
-| Bottom Z distance | **{ztop}** | |
+| Top Z distance | **{layer:g} mm** | never 0. At 0 the support fills the whole gap instead of the part left between the clearances -- measured +1.0 h and +7.5 g on a six-plate stack. Applies even with a support-interface filament: they bond to PLA more than the marketing suggests |
+| Bottom Z distance | **{layer:g} mm** | free either way (no measurable difference), so take the clearance |
 | Interface layers (top and bottom) | **{iface}** | {ifacewhy} |
 | Interface spacing | **0** | solid interface |
 | Base pattern spacing | 2.5 mm | the support is only {gap} mm tall, it needs no bulk |
@@ -586,6 +586,9 @@ socket taper at **{angle:.1f} degrees** from horizontal.
 - Layer height **{layer} mm**. The {gap} mm gap is exactly {layers:.0f} layers; a
   different layer height that does not divide {gap} evenly will make the gaps
   inconsistent.
+- The gap itself is the cheapest lever left. With both Z distances at {layer:g} mm a
+  {gap} mm gap leaves {support_layers:.0f} support layer(s). Going from 0.8 mm to 0.6 mm
+  measured -0.27 h and -4.5 g, at the cost of one layer of interface instead of two.
 - Do **not** enable "independent support layer height".
 
 ## After printing
@@ -648,12 +651,9 @@ def write_printing_notes(path: Path, placements, gap, layer, report_text,
         rib=rib, land=land, funnel=plate.funnel_depth, ledge=(rib - land) / 2,
         angle=angle, cells=sum(p.plate.lattice.cells for p in placements),
         gap=gap, layer=layer, layers=round(gap / layer),
+        support_layers=max(0, round((gap - 2 * layer) / layer)),
         blocker_step=(BLOCKER_STEP.format(blockers=blocker_name) if blockers else NO_BLOCKER_STEP),
         filament_section=PETG_FILAMENT if petg else SAME_FILAMENT,
-        ztop="0" if petg else f"{layer:g} mm",
-        zwhy=("PETG does not bond to PLA, so zero gap still releases"
-              if petg else
-              "SAME MATERIAL -- a zero gap welds the plates together"),
         iface=2 if petg else 1,
         ifacewhy=("solid PETG sheet, peels off in one piece" if petg else
                   "every interface layer is solid; one is enough and halves the support"),
