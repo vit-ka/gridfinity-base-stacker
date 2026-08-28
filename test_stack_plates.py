@@ -595,6 +595,11 @@ class TestBlockers(unittest.TestCase):
 
 
 class TestSettingsCheck(unittest.TestCase):
+    def test_each_profile_declares_the_gap_it_pairs_with(self):
+        """The settings are tuned per gap; a mismatched stack undoes the tuning."""
+        for name in ("petg-interface", "same-material"):
+            self.assertIn("_gap_mm", self.profile(name))
+
     def profile(self, name):
         return json.loads((Path("settings") / f"{name}.json").read_text())
 
@@ -622,7 +627,7 @@ class TestSettingsCheck(unittest.TestCase):
         want = self.profile("petg-interface")
         project = {k: [v] for k, v in want.items() if not k.startswith("_")}
         del project["support_expansion"]
-        self.assertIn(("support_expansion", "-0.25", "missing"),
+        self.assertIn(("support_expansion", want["support_expansion"], "missing"),
                       cs.compare(project, want))
 
     def test_bare_scalars_compare_the_same_as_bambus_one_element_lists(self):

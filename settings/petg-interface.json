@@ -1,6 +1,6 @@
 {
-  "_comment": "Support settings for a stacked Gridfinity baseplate printed with a non-bonding interface filament (PETG). Pairs with a 0.2 mm gap stack. Measured: 4.93 h and 6.7 g of support on a six-plate stack, all five gaps carried.",
-  "_gap_mm": 0.2,
+  "_comment": "Support settings for a stacked Gridfinity baseplate printed with a non-bonding interface filament (PETG). Pairs with a 0.4 mm gap stack: two interface layers, so the film peels off in one piece instead of tearing, which one layer tends to do.",
+  "_gap_mm": 0.4,
   "enable_support": "1",
   "support_type": "normal(auto)",
   "support_style": "snug",
@@ -12,5 +12,6 @@
   "support_interface_bottom_layers": "1",
   "support_interface_spacing": "0",
   "support_object_xy_distance": "0.8",
-  "support_expansion": "-0.25"
+  "support_expansion": "-0.25",
+  "support_interface_pattern": "rectilinear_interlaced"
 }

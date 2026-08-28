@@ -87,8 +87,13 @@ arrangement actually depends on. Everything else is stock.
 
 | profile | for | gap |
 |---|---|---|
-| `petg-interface` | a support interface that does not bond to PLA (PETG) | 0.2 mm |
+| `petg-interface` | a support interface that does not bond to PLA (PETG) | 0.4 mm |
 | `same-material` | same filament, or one that still grabs (Bambu Support W) | 0.8 mm |
+
+The gap is part of the profile, not a free choice: `check_settings.py` prints the
+gap each one expects. A 0.4 mm gap with a non-bonding interface gives two
+interface layers, so the film lifts off in one piece; at 0.2 mm it is a single
+layer and tends to tear on the way out.
 
 Set them once in Bambu Studio and save the project as a template, then swap the
 model for each new stack. To confirm a template still says what you think it
