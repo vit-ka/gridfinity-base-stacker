@@ -330,6 +330,45 @@ class TestOrdering(unittest.TestCase):
         self.assertLessEqual(cost(nested), cost(by_area))
 
 
+class TestNestingGroups(unittest.TestCase):
+    def plates(self, sizes):
+        return tuple(sp.build_plate(perforated_plate(w, d)) for w, d in sizes)
+
+    def test_a_fully_nested_set_stays_one_stack(self):
+        groups = sp.nesting_groups(self.plates(((5, 4), (4, 4), (4, 3))))
+        self.assertEqual(len(groups), 1)
+
+    def test_incomparable_plates_are_split_apart(self):
+        """5x3 and 4x4 contain neither one another, so they cannot share a stack."""
+        groups = sp.nesting_groups(self.plates(((5, 4), (5, 3), (4, 4), (4, 3))))
+        self.assertEqual(len(groups), 2)
+
+    def test_every_plate_appears_exactly_once(self):
+        plates = self.plates(((5, 4), (5, 3), (4, 4), (4, 3), (3, 3)))
+        got = [p for g in sp.nesting_groups(plates) for p in g]
+        self.assertEqual(len(got), len(plates))
+        self.assertEqual({id(p) for p in got}, {id(p) for p in plates})
+
+    def test_each_group_nests_with_no_ledge(self):
+        plates = self.plates(((5, 4), (5, 3), (4, 4), (4, 3), (3, 3)))
+        for group in sp.nesting_groups(plates):
+            for lo, up in zip(group, group[1:]):
+                self.assertTrue(sp.contains(lo, up))
+            self.assertEqual(sp.ledges(sp.plan(group, 0.2, True, True), 0.2), ())
+
+    def test_uses_the_fewest_stacks_possible(self):
+        """Dilworth: the fewest chains equals the largest set of mutually
+        incomparable plates. Here 5x3 and 4x4 are the only such pair."""
+        plates = self.plates(((5, 4), (5, 3), (4, 4), (4, 3)))
+        self.assertEqual(len(sp.nesting_groups(plates)), 2)
+
+    def test_largest_plate_leads_its_stack(self):
+        plates = self.plates(((4, 3), (5, 4), (4, 4)))
+        for group in sp.nesting_groups(plates):
+            self.assertEqual(group[0].bounds.footprint,
+                             max(p.bounds.footprint for p in group))
+
+
 class TestUnsupported(unittest.TestCase):
     def test_fully_covered_is_free(self):
         rect = (0.0, 0.0, 10.0, 10.0)
@@ -600,6 +639,30 @@ class TestCli(unittest.TestCase):
             self.assertIn("tight.stl", tight)
             self.assertIn("0.8 mm", wide)
             self.assertIn("0.6 mm", tight)
+
+    def test_split_writes_one_stack_per_group(self):
+        mesh = (perforated_plate(5, 4) + perforated_plate(5, 3, origin=(500.0, 0.0))
+                + perforated_plate(4, 4, origin=(0.0, 500.0))
+                + perforated_plate(4, 3, origin=(500.0, 500.0)))
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "in.stl"
+            stl_io.write_stl(src, mesh)
+            out = Path(td) / "out"
+            self.assertEqual(sp.main([str(src), "-o", str(out), "--split"]), 0)
+            for n in (1, 2):
+                self.assertTrue((out / f"gf-stack-4-{n}of2.stl").exists())
+                self.assertTrue((out / f"gf-stack-4-{n}of2-PRINTING.md").exists())
+            self.assertFalse((out / "gf-stack-4.stl").exists())
+
+    def test_without_split_it_stays_one_file(self):
+        mesh = perforated_plate(5, 4) + perforated_plate(5, 3, origin=(500.0, 0.0))
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "in.stl"
+            stl_io.write_stl(src, mesh)
+            out = Path(td) / "out"
+            sp.main([str(src), "-o", str(out)])
+            self.assertTrue((out / "gf-stack-2.stl").exists())
+            self.assertFalse((out / "gf-stack-2-1of2.stl").exists())
 
     def test_gap_snaps_to_layer_height(self):
         mesh = (perforated_plate(4, 3) + perforated_plate(3, 3, origin=(500.0, 0.0)))

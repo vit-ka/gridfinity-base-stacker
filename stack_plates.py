@@ -148,6 +148,52 @@ def uncovered(lower: Plate, upper: Plate) -> float:
     return a.footprint - min(a.width, b.width) * min(a.depth, b.depth)
 
 
+def contains(lower: Plate, upper: Plate) -> bool:
+    """True when `upper` sits entirely on `lower` with nothing overhanging."""
+    return (lower.bounds.width >= upper.bounds.width
+            and lower.bounds.depth >= upper.bounds.depth)
+
+
+def nesting_groups(plates: tuple[Plate, ...]) -> tuple[tuple[Plate, ...], ...]:
+    """Split into the fewest stacks in which every plate rests fully on the one below.
+
+    A ledge forces the slicer to build a tall, thin freestanding wall from
+    whatever is beneath it, which is the least printable thing in the whole
+    arrangement. Ordering alone cannot always avoid one: containment is a partial
+    order, and a set with incomparable plates has no single chain. The fewest
+    chains covering a poset is Dilworth's theorem, computed here as a maximum
+    bipartite matching -- each matched pair becomes an adjacency in some chain.
+    """
+    order = sorted(range(len(plates)), key=lambda i: -plates[i].bounds.footprint)
+    match: dict[int, int] = {}          # upper -> lower
+
+    def augment(lower: int, seen: set[int]) -> bool:
+        for upper in order:
+            if upper == lower or upper in seen:
+                continue
+            if not contains(plates[lower], plates[upper]):
+                continue
+            seen.add(upper)
+            if upper not in match or augment(match[upper], seen):
+                match[upper] = lower
+                return True
+        return False
+
+    for lower in order:
+        augment(lower, set())
+
+    nxt = {lo: up for up, lo in match.items()}
+    heads = [i for i in order if i not in match]
+    chains = []
+    for head in heads:
+        chain, cur = [], head
+        while cur is not None:
+            chain.append(plates[cur])
+            cur = nxt.get(cur)
+        chains.append(tuple(chain))
+    return tuple(chains)
+
+
 def order_plates(plates: tuple[Plate, ...]) -> tuple[Plate, ...]:
     """Order so each plate sits on the one below, largest on the bed.
 
@@ -757,6 +803,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="also emit support blockers. Measured to make no "
                          "difference with snug support; kept for grid, or for "
                          "plate profiles this tool has not seen")
+    ap.add_argument("--split", action="store_true",
+                    help="emit several stacks, each one in which every plate rests "
+                         "fully on the one below. Avoids the tall thin support wall "
+                         "a ledge forces, at the cost of one print job per stack")
     ap.add_argument("--order", choices=("nested", "area"), default="nested",
                     help="nested: each plate sits on the one below (default); "
                          "area: plain footprint order")
@@ -782,32 +832,38 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{args.stl.name}: {len(mesh)} facets, {len(shells)} shells")
     plates = tuple(build_plate(s) for s in shells)
 
-    placements = plan(plates, gap, flip=not args.no_flip,
-                      register=not args.no_register, order=args.order)
-    report_text = report(placements, gap, bed)
-    print()
-    print(report_text)
+    groups = nesting_groups(plates) if args.split else (plates,)
+    if args.split:
+        print(f"split into {len(groups)} stack(s) so no plate overhangs the one below")
+    stem = args.name or f"gf-stack-{len(plates)}"
 
-    stem = args.name or f"gf-stack-{len(placements)}"
-    out = args.out_dir
-    stl_path = out / f"{stem}.stl"
-    write_stl(stl_path, tuple(f for pl in placements for f in pl.placed_mesh()),
-              f"gridfinity stack of {len(placements)} plates")
-    print(f"\nwrote {stl_path}")
+    for i, group in enumerate(groups, 1):
+        placements = plan(group, gap, flip=not args.no_flip,
+                          register=not args.no_register, order=args.order)
+        report_text = report(placements, gap, bed)
+        name = stem if len(groups) == 1 else f"{stem}-{i}of{len(groups)}"
+        print()
+        if len(groups) > 1:
+            print(f"--- stack {i} of {len(groups)} ---")
+        print(report_text)
 
-    blocker_path = out / f"{stem}-blockers.stl"
-    if args.blockers:
-        blockers = make_blockers(placements, gap)
-        write_stl(blocker_path, blockers, "support blockers")
-        print(f"wrote {blocker_path} ({len(blockers)} facets)")
+        out = args.out_dir
+        stl_path = out / f"{name}.stl"
+        write_stl(stl_path, tuple(f for pl in placements for f in pl.placed_mesh()),
+                  f"gridfinity stack of {len(placements)} plates")
+        print(f"\nwrote {stl_path}")
 
-    # Named after the model: a fixed name silently overwrites the notes for an
-    # earlier variant, leaving instructions that describe a different STL.
-    notes = out / f"{stem}-PRINTING.md"
-    write_printing_notes(notes, placements, gap, args.layer_height, report_text,
-                         stl_path.name, blocker_path.name, args.stl.name,
-                         interface=args.interface, blockers=args.blockers)
-    print(f"wrote {notes}")
+        blocker_path = out / f"{name}-blockers.stl"
+        if args.blockers:
+            blockers = make_blockers(placements, gap)
+            write_stl(blocker_path, blockers, "support blockers")
+            print(f"wrote {blocker_path} ({len(blockers)} facets)")
+
+        notes = out / f"{name}-PRINTING.md"
+        write_printing_notes(notes, placements, gap, args.layer_height, report_text,
+                             stl_path.name, blocker_path.name, args.stl.name,
+                             interface=args.interface, blockers=args.blockers)
+        print(f"wrote {notes}")
     return 0
 
 

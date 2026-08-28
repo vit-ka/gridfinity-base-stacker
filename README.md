@@ -30,12 +30,33 @@ Alternating the orientation makes every interface land-to-land or rib-to-rib, so
 contact faces match and the socket funnels never fill with support. See
 [ADR 0001](docs/adr/0001-alternating-flip-and-lattice-registration.md) for why.
 
+## Ledges, and why you may want two stacks
+
+A plate that hangs past the one below it forces the slicer to build a tall thin
+freestanding wall up to the overhang -- the least printable thing in the whole
+arrangement. Ordering cannot always avoid this: containment is a partial order,
+and a set with incomparable plates (neither contains the other) has no single
+stack without a ledge.
+
+`--split` emits the fewest stacks in which every plate rests fully on the one
+below. On the six-plate cabinet set that is two stacks, and it wins on
+everything except job count:
+
+| | time | support | ledges |
+|---|---|---|---|
+| one 6-stack | 4.93 h | 6.7 g | 436 mm2, 8.6 mm tall |
+| two 3-stacks | 4.71 h | 4.2 g | none |
+
+Each stack is also a third of the height, so a failure costs a third of the
+print.
+
 ## Options
 
 ```
 --gap MM              separation gap, default 0.8 (snapped to layer height)
 --layer-height MM     default 0.2
 --bed WxDxH           default 256x256x256
+--split               emit one stack per nesting group, so nothing overhangs
 --no-flip             keep every plate the same way up
 --no-register         centre plates instead of aligning their lattices
 --no-blockers         skip the blocker file

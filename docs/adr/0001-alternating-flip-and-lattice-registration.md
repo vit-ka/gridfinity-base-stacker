@@ -88,6 +88,13 @@ Stacking costs print time rather than saving it. Measured on this set: 4.2 h to
 print the six plates flat with no support at all, against 5.7 h stacked. It buys
 one unattended job instead of six, and nothing else.
 
+A ledge cannot always be ordered away, and where it survives it is the worst
+thing in the print: a tall thin freestanding support wall. `--split` avoids it by
+emitting one stack per chain of the containment order, which for the cabinet set
+is two stacks and is faster and lighter than the single stack (4.71 h and 4.2 g
+against 4.93 h and 6.7 g) at the cost of a second job. Prefer it unless one job
+matters more than the wall does.
+
 Registration assumes every plate shares one pitch. Plates from different
 generators, or a mix of pitches, would need per-interface registration instead of
 one global origin. `--no-flip` and `--no-register` exist to fall back.
