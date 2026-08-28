@@ -31,12 +31,15 @@ Three things were tried and rejected:
   to load, not a model plus modifier parts.
 - **A solid slab.** Stable, but 27 cm3 against 6 cm3, and it pays for top and
   bottom shells over the whole area.
-- **Dilating the projection**, including projecting the plate's widest section.
-  The face is a lattice of ~1.5 mm webs, so dilation doubles every web and
-  squares off the rounded socket corners; and a filler wider than the face it
-  carries and the face it stands on needs bridging support under itself. Measured
-  against faithful projection: 9.5 cm3 and 5.6 g of support at 0.8 mm dilation,
-  12.5 cm3 and 6.0 g projecting the widest section, 6.0 cm3 and 5.3 g faithful.
+- **Projecting the plate's widest section.** The socket tapers, so the wide end
+  gives a filler broader than both the face it carries and the face it stands on,
+  and its own footprint then needs bridging support under itself: 12.5 cm3 and
+  6.0 g of support, against 5.4 cm3 and 5.3 g for the near face.
+- **Heavy dilation.** 0.8 mm doubles every web and swallows the rounded corners.
+  A small outward offset is still needed, though: a faithful projection
+  reproduces the plate's thinnest webs exactly and the slicer drops the thinnest
+  of them, leaving holes. The default is 0.5 mm, about two perimeters, dilated
+  with a disc rather than a square so corners stay round.
 
 `--split` remains as an alternative that avoids ledges entirely by emitting one
 stack per chain of the containment order. It is better on every measure -- 4.71 h

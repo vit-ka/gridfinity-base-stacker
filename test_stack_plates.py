@@ -424,17 +424,26 @@ class TestLedgeFillers(unittest.TestCase):
             self.assertLess(abs(covered - p.down_area), abs(covered - p.up_area),
                             f"{p.plate.label} did not follow its down face")
 
-    def test_projection_is_faithful_by_default(self):
-        """grow defaults to off.
+    def test_grown_slightly_by_default(self):
+        """A faithful projection reproduces webs the slicer drops as too thin.
 
-        The face is a lattice of ~1.5 mm webs, so even 0.8 mm of dilation doubles
-        every web and swallows the rounded socket corners.
+        0.5 mm, about two perimeters, keeps them. Much more and the webs double
+        and the rounded socket corners fill in.
         """
         pl = self.stack()
-        plain = sp.ledge_fillers(pl, 0.2)
-        grown = sp.ledge_fillers(pl, 0.2, grow=0.8)
-        self.assertGreater(stl_io.signed_volume(grown),
-                           stl_io.signed_volume(plain) * 1.2)
+        faithful = sp.ledge_fillers(pl, 0.2, grow=0.0)
+        default = sp.ledge_fillers(pl, 0.2)
+        self.assertGreater(stl_io.signed_volume(default),
+                           stl_io.signed_volume(faithful))
+
+    def test_dilation_is_a_disc_not_a_square(self):
+        """A square element offsets corners by r on both axes at once, squaring
+        off the sockets; a disc offsets every direction equally."""
+        pl = self.stack()
+        grown = sp.ledge_fillers(pl, 0.2, grow=1.0)
+        square_area = stl_io.signed_volume(sp.ledge_fillers(pl, 0.2, grow=0.0))
+        # a disc adds less than the square of the same radius would
+        self.assertLess(stl_io.signed_volume(grown), square_area * 4)
 
     def test_fillers_are_absent_when_asked(self):
         mesh = (perforated_plate(5, 4) + perforated_plate(5, 3, origin=(500.0, 0.0))

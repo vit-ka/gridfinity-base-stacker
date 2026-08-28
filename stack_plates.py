@@ -397,7 +397,7 @@ def ledge_regions(placements: tuple[Placement, ...], gap: float
 
 
 def solid_spans(pl: Placement, x0: float, y0: float, x1: float, y1: float,
-                step: float = 0.15, grow: float = 0.0
+                step: float = 0.15, grow: float = 0.5
                 ) -> tuple[tuple[float, float, float, float], ...]:
     """Rectangles covering this plate's own footprint inside the given area.
 
@@ -411,10 +411,11 @@ def solid_spans(pl: Placement, x0: float, y0: float, x1: float, y1: float,
     makes a filler broader than both the face it carries and the face it stands
     on, so its own footprint then needs bridging support underneath.
 
-    `grow` dilates the result and defaults to off. It is available, but it does
-    not do what it sounds like: the near face is a lattice of ~1.5 mm webs, so
-    even 0.8 mm doubles every web and swallows the rounded socket corners. At
-    grow 0 the projection matches the plate cell for cell, arcs included.
+    `grow` dilates the result outward by that many mm, using a disc so the socket's
+    rounded corners stay round. It defaults to 0.5, roughly two extra perimeters:
+    a faithful projection reproduces the plate's thinnest webs exactly, and the
+    slicer drops the thinnest of them entirely. Much beyond this the webs start
+    doubling and the corners fill in.
     """
     mesh = pl.placed_mesh()
     z = pl.z0 + 0.01
@@ -428,14 +429,17 @@ def solid_spans(pl: Placement, x0: float, y0: float, x1: float, y1: float,
             px = x0 + (ix + 0.5) * step
             grid[ix][iy] = sum(1 for c in crossings if c > px) % 2 == 1
 
-    r = int(round(grow / step))
+    rr = grow / step
+    r = int(math.ceil(rr - 1e-9))
     if r:
         # A disc, not a square: dilating with a square offsets corners by r in
         # each axis at once, squaring off the socket's rounded corners. A disc
         # offsets every direction equally, which is what an outward offset means
         # and what keeps the arcs.
+        # radius from `grow` directly, not the rounded cell count, so the offset
+        # is the millimetres asked for whatever the sampling step
         disc = [(dx, dy) for dx in range(-r, r + 1) for dy in range(-r, r + 1)
-                if dx * dx + dy * dy <= r * r]
+                if dx * dx + dy * dy <= rr * rr]
         grown = [[False] * h for _ in range(w)]
         for ix in range(w):
             for iy in range(h):
@@ -477,7 +481,7 @@ def solid_spans(pl: Placement, x0: float, y0: float, x1: float, y1: float,
 
 
 def ledge_fillers(placements: tuple[Placement, ...], gap: float,
-                  grow: float = 0.0, step: float = 0.15) -> Mesh:
+                  grow: float = 0.5, step: float = 0.15) -> Mesh:
     """Loose blocks filling each ledge void, one per plate level it spans.
 
     A ledge otherwise leaves the slicer to raise a tall thin fin under the
@@ -963,10 +967,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="resolution the filler outline is traced at, mm. Finer is "
                          "smoother and slower (default 0.15, below what a 0.4 mm "
                          "nozzle can render)")
-    ap.add_argument("--filler-grow", type=float, default=0.0,
-                    help="dilate the filler footprint by this much, mm. Off by "
-                         "default: the plate face is a lattice of thin webs, so "
-                         "any dilation doubles them and squares off the corners")
+    ap.add_argument("--filler-grow", type=float, default=0.5,
+                    help="dilate the filler footprint outward by this much, mm "
+                         "(default 0.5, about two perimeters). A faithful "
+                         "projection reproduces webs the slicer then drops as too "
+                         "thin; much more than this doubles them")
     ap.add_argument("--split", action="store_true",
                     help="emit several stacks, each one in which every plate rests "
                          "fully on the one below. Avoids the tall thin support wall "

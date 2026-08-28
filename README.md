@@ -55,13 +55,18 @@ Fillers cost 16 minutes and buy a structure that is not a thin wall. `--split`
 avoids the ledge outright by emitting one stack per chain of the containment
 order, and is better on every axis except that it is two print jobs.
 
-**Project faithfully.** `--filler-grow` dilates the footprint and is off for a
-reason: the face being copied is a lattice of ~1.5 mm webs, so even 0.8 mm of
-dilation doubles every web and squares off the rounded socket corners. Growing it
-also makes the filler wider than the face it carries *and* the face it stands on,
-so its own footprint then needs bridging support. Faithful is smallest, fastest
-and lightest at once -- 6.0 cm3 and 5.3 g of support, against 9.5 cm3 and 5.6 g
-at 0.8 mm, and 12.5 cm3 and 6.0 g projecting the plate's widest section.
+**Project the near face, grown a little.** `--filler-grow` defaults to 0.5 mm,
+about two perimeters. A faithful projection reproduces the plate's thinnest webs
+exactly, and the slicer then drops the thinnest of them as unprintable, leaving
+holes in the filler. Much beyond 0.5 mm the webs start doubling and the rounded
+socket corners fill in; the dilation uses a disc for that reason, since a square
+element offsets corners on both axes at once and squares them off.
+
+Project the *near* face, not the plate's widest section. The socket tapers, so
+the wide end gives a filler broader than both the face it carries and the face it
+stands on, and its own footprint then needs bridging support underneath --
+measured 12.5 cm3 and 6.0 g of support, against 5.4 cm3 and 5.3 g for the near
+face.
 
 ## Options
 
@@ -71,7 +76,7 @@ at 0.8 mm, and 12.5 cm3 and 6.0 g projecting the plate's widest section.
 --bed WxDxH           default 256x256x256
 --split               emit one stack per nesting group, so nothing overhangs
 --no-fillers          leave ledges to the slicer instead of filling them
---filler-grow MM      dilate the filler footprint (default 0, see above)
+--filler-grow MM      dilate the filler footprint (default 0.5, see above)
 --filler-step MM      resolution the filler outline is traced at (default 0.15)
 --no-flip             keep every plate the same way up
 --no-register         centre plates instead of aligning their lattices
