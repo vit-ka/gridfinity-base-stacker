@@ -16,19 +16,28 @@ does not repeat the dead ends.
 
 ## Decision
 
-Control balconies with **`support_expansion`** (slightly negative) and
-**`support_object_xy_distance`** (large). Nothing else reaches them.
+Set **`support_object_xy_distance` to 10 mm** and leave `support_expansion` at 0.
+That removes the balconies entirely and leaves the interfaces at their fullest.
 
 Measured on the nine-plate drawer stack, snug, 0.4 mm gap:
 
 | xy | expansion | time | support | balconies | thinnest interface |
 |---|---|---|---|---|---|
 | 0.35 | 0 | 11.50 h | 45.3 g | 12.2 g | 1.60 |
-| 0.8 | -0.25 | 9.18 h | 25.7 g | 5.6 g | 1.44 |
-| 1.6 | -0.25 | 9.08 h | 23.4 g | 3.2 g | 1.44 |
+| 1.6 | -0.25 | 9.07 h | 23.4 g | 3.2 g | 1.44 |
+| 6.0 | -0.25 | 8.90 h | 19.9 g | 0.1 g | 1.44 |
+| **10.0** | **0** | **9.01 h** | 22.5 g | **0.0 g** | **1.65** |
 
-Interface coverage tracks expansion only and is flat in xy, so xy can be pushed
-freely. Past -0.25 expansion the interfaces start losing the lands they carry.
+The XY distance has to be large -- larger than it sounds reasonable to set a
+"distance" to. It must exceed the distance from a socket wall to the middle of
+the shaft, about 18 mm here, to catch everything; 10 mm already gets all of it in
+practice. Sweeping only to 1.6 mm and stopping because support *weight* had
+flattened missed this: the balconies were still falling.
+
+Negative `support_expansion` is then unnecessary. It shrinks contacts before they
+are snapped, which reduces balconies as a side effect but also thins the
+interface (coverage 1.44 against 1.65). With the XY trim doing the work, leave it
+at 0.
 
 ## Why: the mechanism
 
@@ -64,8 +73,28 @@ phase is absolute -- `BoundingBox::align_to_grid` snaps `min(0)`/`min(1)` in
 absolute coordinates -- so a whole axis behaves alike, and they are never on both
 walls of a socket because the rib is never exactly centred in a cell.
 
-Only `support_expansion` and `support_object_xy_distance` change the size of that
-excess. Everything else leaves it alone.
+`support_expansion` shrinks that excess before the snap. But the setting that
+actually clears the balconies works differently and later:
+`trim_support_layers_by_object` is applied to contacts, bottom contacts *and*
+intermediate layers, and erases support that lies within `gap_xy` of the object:
+
+```cpp
+bool is_overlap = is_layers_overlap(support_layer, object_layer);
+coordf_t trimming_offset = is_sharptail ? sharp_tail_xy_gap :
+                           is_overlap   ? gap_xy_scaled :
+                                          no_overlap_xy_gap;
+polygons_append(polygons_trimming, offset({expoly}, trimming_offset, ...));
+```
+
+The `is_overlap` test is the whole story. Balconies sit at layers where the plate
+exists, so they overlap an object layer in Z and are trimmed by `gap_xy`.
+Interfaces sit in the gap layers, where nothing overlaps them in Z, so they get
+`no_overlap_xy_gap` -- a small constant -- whatever `gap_xy` is set to. That is
+why interface coverage is flat in XY while balconies fall away, and why the
+setting can be pushed far past any sane "clearance" value without harm.
+
+`support_object_xy_distance` is therefore not a clearance here. It is a trim
+radius, and it needs to reach from the socket wall to the middle of the shaft.
 
 ## Ruled out, with evidence
 
