@@ -121,6 +121,15 @@ the unwanted kind -- everything legitimate lives in the gaps.
 helps, for reasons the ADR records; they are kept because they are correct and
 the next idea in that direction can start from them.
 
+### Interface pattern
+
+Set `support_interface_pattern` to **Concentric**, not the Bambu default. The
+interface is peeled by hand and wants to come off as one sheet; concentric traces
+each rib as a continuous loop where the default zig-zags across it with a travel
+at every turn. Measured across all interfaces of a nine-plate stack: 6,214
+separate extrusion paths against 38,686, and 4 g less material. Leave
+`support_interface_loop_pattern` off.
+
 ## Reusing the slicer settings
 
 The settings that matter are in `settings/`, distilled to the twelve that this

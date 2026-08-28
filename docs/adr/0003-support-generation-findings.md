@@ -105,6 +105,32 @@ setting can be pushed far past any sane "clearance" value without harm.
 `support_object_xy_distance` is therefore not a clearance here. It is a trim
 radius, and it needs to reach from the socket wall to the middle of the shaft.
 
+## Interface continuity
+
+The interface is peeled off by hand, so it wants to come away as one sheet rather
+than tear at every travel move. The pattern decides that, and the default is the
+worst of the five. Measured on the nine-plate drawer stack, counting separate
+extrusion paths across all interfaces:
+
+| interface pattern | separate paths | material | longest unbroken run |
+|---|---|---|---|
+| rectilinear_interlaced (Bambu default) | 38,686 | 18.8 g | 50 mm |
+| grid | 33,963 | 19.1 g | 40 mm |
+| rectilinear | 26,317 | 18.7 g | 1001 mm |
+| **concentric** | **6,214** | **14.8 g** | 487 mm |
+| concentric + loop pattern | 11,255 | 15.9 g | 366 mm |
+
+Use **concentric**: six times fewer places to tear, and 4 g less material. The
+interface is a lattice of narrow ribs, and concentric traces each rib as one
+continuous loop where rectilinear zig-zags across it with a travel at every turn.
+Interlaced is worse still because it deliberately offsets alternate layers -- the
+Bambu wiki notes it "may be harder to remove than standard rectilinear", and
+recommends concentric with support material and zero interface spacing, which is
+exactly this arrangement.
+
+Leave `support_interface_loop_pattern` off: it nearly doubled the path count on
+concentric, and the slice failed outright with interlaced.
+
 ## Ruled out, with evidence
 
 - **Support blockers.** `blocker` appears once in 3308 lines, subtracting from
@@ -136,6 +162,15 @@ radius, and it needs to reach from the socket wall to the middle of the shaft.
   nothing. Its `make_overhang_printable` is interesting for a different reason:
   it edits model geometry to make overhangs printable, the same instinct as the
   ledge fillers here.
+
+## Open
+
+At `xy 10` the balconies go to zero but legitimate support disappears too --
+support under the ledge overhangs. The obvious explanation, that the ledge
+fillers leave some overhang uncovered, does not hold: measured, the fillers place
+101-125% of the material needing support directly beneath every ledge. So what is
+being lost there is not yet identified. If it were, pushing the XY distance high
+would become safe and the balconies would go with it.
 
 ## What would actually fix it
 
