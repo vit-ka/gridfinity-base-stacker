@@ -91,19 +91,21 @@ Two settings do all the work, and they are model-dependent -- sweep them rather
 than copying a number. See [ADR 0003](docs/adr/0003-support-generation-findings.md)
 for why nothing else reaches the problem.
 
-**Set `support_object_xy_distance` to 10 mm and leave `support_expansion` at 0.**
+**Use `support_object_xy_distance` 0.8 mm with `support_expansion` -0.25.**
 
 That setting is not a clearance despite the name. `trim_support_layers_by_object`
 erases support lying within it of the object, but only where the support layer
 overlaps an object layer in Z. Unwanted support sits inside a plate's own height,
 so it is erased; interfaces sit in the gaps, where nothing overlaps them, so they
-are untouched whatever the value. It therefore has to be big enough to reach from
-a socket wall to the middle of the shaft -- around 18 mm here, and 10 mm catches
-everything in practice.
+are untouched whatever the value. In practice it stops helping past about 0.8 mm -- beyond that the only thing left
+in the gap band is the interface, which the trim can never reach. A CLI sweep
+disagrees and shows it still helping to 6 mm; that discrepancy is unresolved and
+recorded in the ADR. Trust the slicer.
 
-Measured on the nine-plate drawer stack: 12.2 g of unwanted support at stock
-settings, **0.0 g at `xy 10`**, with the interfaces at their fullest (1.65 against
-1.44 when negative expansion is used instead).
+The last thin layer that survives is not unwanted support at all: a 0.4 mm gap
+holds two layers and both are interface, neither overlaps an object layer in Z,
+so no XY distance can trim them. It looks wider than the rib because contacts are
+snapped to a ~2.9 mm grid.
 
 The unwanted support -- ribbons hugging the socket walls inside a plate's own
 height -- is the downward projection of interface that is wider than the rib

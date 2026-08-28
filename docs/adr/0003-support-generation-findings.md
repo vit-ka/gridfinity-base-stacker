@@ -16,8 +16,12 @@ does not repeat the dead ends.
 
 ## Decision
 
-Set **`support_object_xy_distance` to 10 mm** and leave `support_expansion` at 0.
-That removes the balconies entirely and leaves the interfaces at their fullest.
+Use **`support_object_xy_distance` 0.8 mm** with **`support_expansion` -0.25**,
+which is what the settings profile carries.
+
+In practice the XY distance stops helping past about 0.8 mm: beyond that the only
+thing left in the gap band is the interface itself, which the trim cannot touch
+(see below), so raising it further changes nothing visible.
 
 Measured on the nine-plate drawer stack, snug, 0.4 mm gap:
 
@@ -26,18 +30,23 @@ Measured on the nine-plate drawer stack, snug, 0.4 mm gap:
 | 0.35 | 0 | 11.50 h | 45.3 g | 12.2 g | 1.60 |
 | 1.6 | -0.25 | 9.07 h | 23.4 g | 3.2 g | 1.44 |
 | 6.0 | -0.25 | 8.90 h | 19.9 g | 0.1 g | 1.44 |
-| **10.0** | **0** | **9.01 h** | 22.5 g | **0.0 g** | **1.65** |
+| 10.0 | 0 | 9.01 h | 22.5 g | 0.0 g | 1.65 |
 
-The XY distance has to be large -- larger than it sounds reasonable to set a
-"distance" to. It must exceed the distance from a socket wall to the middle of
-the shaft, about 18 mm here, to catch everything; 10 mm already gets all of it in
-practice. Sweeping only to 1.6 mm and stopping because support *weight* had
-flattened missed this: the balconies were still falling.
+**These last rows are disputed.** The CLI sweep above shows balconies still
+falling from 0.8 mm to 6 mm, but in Bambu Studio the effect saturates at about
+0.8 mm and larger values change nothing visible. The setting is not clamped
+(`def->max = 10`), so that is not the explanation. Unresolved; the GUI is the
+authority, so the profile stays at 0.8 mm and this is recorded as a discrepancy
+rather than a result. Anyone revisiting should reproduce the sweep in the GUI
+before trusting the numbers.
 
-Negative `support_expansion` is then unnecessary. It shrinks contacts before they
-are snapped, which reduces balconies as a side effect but also thins the
-interface (coverage 1.44 against 1.65). With the XY trim doing the work, leave it
-at 0.
+What is not in doubt is the last surviving layer. A 0.4 mm gap holds two layers,
+and with one top and one bottom interface layer *both* of them are interface.
+Neither overlaps an object layer in Z, so neither can ever be trimmed, whatever
+the XY distance. What looks like a final thin balcony is that interface spreading
+past the rib, because the contact was snapped to a ~2.9 mm grid. The only way to
+narrow it is to shrink the contact before the snap with negative
+`support_expansion`, which costs interface coverage -- 1.44 against 1.65.
 
 ## Why: the mechanism
 
