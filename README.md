@@ -30,25 +30,38 @@ Alternating the orientation makes every interface land-to-land or rib-to-rib, so
 contact faces match and the socket funnels never fill with support. See
 [ADR 0001](docs/adr/0001-alternating-flip-and-lattice-registration.md) for why.
 
-## Ledges, and why you may want two stacks
+## Ledges
 
-A plate that hangs past the one below it forces the slicer to build a tall thin
-freestanding wall up to the overhang -- the least printable thing in the whole
+A plate that hangs past the one below it leaves the slicer to raise a tall thin
+freestanding fin up to the overhang -- the least printable thing in the whole
 arrangement. Ordering cannot always avoid this: containment is a partial order,
-and a set with incomparable plates (neither contains the other) has no single
-stack without a ledge.
+and a set with incomparable plates has no single stack without a ledge. On the
+six-plate cabinet set, `216x126` must sit second because only `216x144` is wide
+enough to hold it, which forces a 144-deep plate above a 126-deep one later.
 
-`--split` emits the fewest stacks in which every plate rests fully on the one
-below. On the six-plate cabinet set that is two stacks, and it wins on
-everything except job count:
+By default the tool fills the void with **loose blocks instead**, one at each
+plate level the ledge spans. Each is the overhanging plate's own footprint,
+projected from the face directly above it and inset by the gap in XY. The stack's
+gaps already separate the levels, so every block ends up clear on all six sides,
+welded to nothing, and lifts out with the support.
 
-| | time | support | ledges |
+| | time | support | ledge |
 |---|---|---|---|
-| one 6-stack | 4.93 h | 6.7 g | 436 mm2, 8.6 mm tall |
-| two 3-stacks | 4.71 h | 4.2 g | none |
+| `--no-fillers` | 4.93 h | 6.7 g | a 174 mm long fin, 8.6 mm tall |
+| fillers (default) | 5.19 h | 5.3 g | braced blocks, 6.0 cm3 |
+| `--split` (two jobs) | 4.71 h | 4.2 g | none at all |
 
-Each stack is also a third of the height, so a failure costs a third of the
-print.
+Fillers cost 16 minutes and buy a structure that is not a thin wall. `--split`
+avoids the ledge outright by emitting one stack per chain of the containment
+order, and is better on every axis except that it is two print jobs.
+
+**Project faithfully.** `--filler-grow` dilates the footprint and is off for a
+reason: the face being copied is a lattice of ~1.5 mm webs, so even 0.8 mm of
+dilation doubles every web and squares off the rounded socket corners. Growing it
+also makes the filler wider than the face it carries *and* the face it stands on,
+so its own footprint then needs bridging support. Faithful is smallest, fastest
+and lightest at once -- 6.0 cm3 and 5.3 g of support, against 9.5 cm3 and 5.6 g
+at 0.8 mm, and 12.5 cm3 and 6.0 g projecting the plate's widest section.
 
 ## Options
 
@@ -57,6 +70,9 @@ print.
 --layer-height MM     default 0.2
 --bed WxDxH           default 256x256x256
 --split               emit one stack per nesting group, so nothing overhangs
+--no-fillers          leave ledges to the slicer instead of filling them
+--filler-grow MM      dilate the filler footprint (default 0, see above)
+--filler-step MM      resolution the filler outline is traced at (default 0.15)
 --no-flip             keep every plate the same way up
 --no-register         centre plates instead of aligning their lattices
 --no-blockers         skip the blocker file

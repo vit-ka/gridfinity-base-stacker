@@ -352,6 +352,160 @@ def ledges(placements: tuple[Placement, ...], gap: float) -> tuple[Ledge, ...]:
     return tuple(out)
 
 
+def ledge_regions(placements: tuple[Placement, ...], gap: float
+                  ) -> tuple[tuple[int, float, float, float, float, float], ...]:
+    """(plate index, x0, y0, x1, y1, base_z) for each area a plate hangs over nothing.
+
+    `base_z` is the top of the highest plate underneath that area, or 0 for the
+    bed. Rectangles merge only within one plate at one base height, never across
+    either -- merging across levels produces a block that runs through a plate.
+    """
+    rects = [stl_bounds(pl) for pl in placements]
+    xs = sorted({v for r in rects for v in (r[0], r[2])})
+    ys = sorted({v for r in rects for v in (r[1], r[3])})
+    out = []
+    for i, pl in enumerate(placements):
+        if i == 0:
+            continue
+        x0, y0, x1, y1 = rects[i]
+        by_base: dict[float, list[tuple[float, float, float, float]]] = {}
+        for xa, xb in zip(xs, xs[1:]):
+            if xb - xa < 1e-6 or xa < x0 - 1e-9 or xb > x1 + 1e-9:
+                continue
+            for ya, yb in zip(ys, ys[1:]):
+                if yb - ya < 1e-6 or ya < y0 - 1e-9 or yb > y1 + 1e-9:
+                    continue
+                cx, cy = (xa + xb) / 2, (ya + yb) / 2
+                tops = [placements[j].z1 for j in range(i)
+                        if rects[j][0] <= cx <= rects[j][2]
+                        and rects[j][1] <= cy <= rects[j][3]]
+                base = max(tops) if tops else 0.0
+                if pl.z0 - base > gap + 1e-6:
+                    by_base.setdefault(round(base, 6), []).append((xa, ya, xb, yb))
+        for base, boxes in by_base.items():
+            rows: dict[tuple[float, float], list[list[float]]] = {}
+            for xa, ya, xb, yb in sorted(boxes):
+                spans = rows.setdefault((ya, yb), [])
+                if spans and xa <= spans[-1][1] + 1e-9:
+                    spans[-1][1] = max(spans[-1][1], xb)
+                else:
+                    spans.append([xa, xb])
+            for (ya, yb), spans in rows.items():
+                for xa, xb in spans:
+                    out.append((i, xa, ya, xb, yb, base))
+    return tuple(out)
+
+
+def solid_spans(pl: Placement, x0: float, y0: float, x1: float, y1: float,
+                step: float = 0.15, grow: float = 0.0
+                ) -> tuple[tuple[float, float, float, float], ...]:
+    """Rectangles covering this plate's own footprint inside the given area.
+
+    Projected from the plate's bottom face, so the cell openings stay empty --
+    a solid slab would cost three times the material and pay for top and bottom
+    shells over the whole area.
+
+    Taken from the face directly above the filler, traced at `step`.
+
+    Not the plate's widest section: the socket tapers, and projecting the wide end
+    makes a filler broader than both the face it carries and the face it stands
+    on, so its own footprint then needs bridging support underneath.
+
+    `grow` dilates the result and defaults to off. It is available, but it does
+    not do what it sounds like: the near face is a lattice of ~1.5 mm webs, so
+    even 0.8 mm doubles every web and swallows the rounded socket corners. At
+    grow 0 the projection matches the plate cell for cell, arcs included.
+    """
+    mesh = pl.placed_mesh()
+    z = pl.z0 + 0.01
+    w = max(1, int(round((x1 - x0) / step)))
+    h = max(1, int(round((y1 - y0) / step)))
+    grid = [[False] * h for _ in range(w)]
+    for iy in range(h):
+        py = y0 + (iy + 0.5) * step
+        crossings = gf._ray_crossings(mesh, py, z)
+        for ix in range(w):
+            px = x0 + (ix + 0.5) * step
+            grid[ix][iy] = sum(1 for c in crossings if c > px) % 2 == 1
+
+    r = int(round(grow / step))
+    if r:
+        # A disc, not a square: dilating with a square offsets corners by r in
+        # each axis at once, squaring off the socket's rounded corners. A disc
+        # offsets every direction equally, which is what an outward offset means
+        # and what keeps the arcs.
+        disc = [(dx, dy) for dx in range(-r, r + 1) for dy in range(-r, r + 1)
+                if dx * dx + dy * dy <= r * r]
+        grown = [[False] * h for _ in range(w)]
+        for ix in range(w):
+            for iy in range(h):
+                if not grid[ix][iy]:
+                    continue
+                for dx, dy in disc:
+                    nx, ny = ix + dx, iy + dy
+                    if 0 <= nx < w and 0 <= ny < h:
+                        grown[nx][ny] = True
+        grid = grown
+
+    # maximal horizontal runs, then merge rows that share a run
+    out: list[tuple[float, float, float, float]] = []
+    open_runs: dict[tuple[int, int], list[int]] = {}
+    for iy in range(h):
+        runs = []
+        start_ix = None
+        for ix in range(w):
+            if grid[ix][iy] and start_ix is None:
+                start_ix = ix
+            elif not grid[ix][iy] and start_ix is not None:
+                runs.append((start_ix, ix)); start_ix = None
+        if start_ix is not None:
+            runs.append((start_ix, w))
+        seen = set(runs)
+        for run in runs:
+            if run in open_runs:
+                open_runs[run][1] = iy + 1
+            else:
+                open_runs[run] = [iy, iy + 1]
+        for run in [k for k in open_runs if k not in seen]:
+            a, b = open_runs.pop(run)
+            out.append((x0 + run[0] * step, y0 + a * step,
+                        x0 + run[1] * step, y0 + b * step))
+    for run, (a, b) in open_runs.items():
+        out.append((x0 + run[0] * step, y0 + a * step,
+                    x0 + run[1] * step, y0 + b * step))
+    return tuple(out)
+
+
+def ledge_fillers(placements: tuple[Placement, ...], gap: float,
+                  grow: float = 0.0, step: float = 0.15) -> Mesh:
+    """Loose blocks filling each ledge void, one per plate level it spans.
+
+    A ledge otherwise leaves the slicer to raise a tall thin fin under the
+    overhanging rib, which is the least printable thing in the arrangement. These
+    stand in for the plates missing under that area: one block per level, taking
+    that plate's own z range and inset by `gap` in XY so it touches nothing
+    sideways. The stack's gaps already separate the levels vertically, so each
+    block ends up clear on all six sides and lifts out with the support.
+    """
+    mesh: list = []
+    for i, x0, y0, x1, y1, base in ledge_regions(placements, gap):
+        if x1 - x0 <= 2 * gap or y1 - y0 <= 2 * gap:
+            continue
+        spans = solid_spans(placements[i], x0 + gap, y0 + gap, x1 - gap, y1 - gap,
+                            step=step, grow=grow)
+        for level in placements[:i]:
+            if level.z0 < base - 1e-9:
+                continue
+            for sx0, sy0, sx1, sy1 in spans:
+                # only genuinely degenerate rectangles; a fixed 0.5 mm floor
+                # silently deleted most of the projection at a finer sampling
+                # step, leaving just the thick parts of the lattice
+                if sx1 - sx0 < 1e-9 or sy1 - sy0 < 1e-9:
+                    continue
+                mesh.extend(box(sx0, sy0, level.z0, sx1, sy1, level.z1))
+    return tuple(mesh)
+
+
 def stl_bounds(pl: Placement) -> tuple[float, float, float, float]:
     b = bounds_of(pl.placed_mesh())
     return b.x0, b.y0, b.x1, b.y1
@@ -803,6 +957,16 @@ def main(argv: list[str] | None = None) -> int:
                     help="also emit support blockers. Measured to make no "
                          "difference with snug support; kept for grid, or for "
                          "plate profiles this tool has not seen")
+    ap.add_argument("--no-fillers", action="store_true",
+                    help="omit the loose blocks that stand in under a ledge")
+    ap.add_argument("--filler-step", type=float, default=0.15,
+                    help="resolution the filler outline is traced at, mm. Finer is "
+                         "smoother and slower (default 0.15, below what a 0.4 mm "
+                         "nozzle can render)")
+    ap.add_argument("--filler-grow", type=float, default=0.0,
+                    help="dilate the filler footprint by this much, mm. Off by "
+                         "default: the plate face is a lattice of thin webs, so "
+                         "any dilation doubles them and squares off the corners")
     ap.add_argument("--split", action="store_true",
                     help="emit several stacks, each one in which every plate rests "
                          "fully on the one below. Avoids the tall thin support wall "
@@ -848,10 +1012,16 @@ def main(argv: list[str] | None = None) -> int:
         print(report_text)
 
         out = args.out_dir
+        body = tuple(f for pl in placements for f in pl.placed_mesh())
+        fillers = (() if args.no_fillers
+                   else ledge_fillers(placements, gap, args.filler_grow,
+                                      args.filler_step))
         stl_path = out / f"{name}.stl"
-        write_stl(stl_path, tuple(f for pl in placements for f in pl.placed_mesh()),
+        write_stl(stl_path, body + fillers,
                   f"gridfinity stack of {len(placements)} plates")
-        print(f"\nwrote {stl_path}")
+        print(f"\nwrote {stl_path}"
+              + (f" (with {len(split_shells(fillers))} ledge filler blocks)"
+                 if fillers else ""))
 
         blocker_path = out / f"{name}-blockers.stl"
         if args.blockers:

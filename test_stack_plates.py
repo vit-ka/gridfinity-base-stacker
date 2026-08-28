@@ -369,6 +369,86 @@ class TestNestingGroups(unittest.TestCase):
                              max(p.bounds.footprint for p in group))
 
 
+class TestLedgeFillers(unittest.TestCase):
+    def stack(self):
+        # 5x3 and 4x4 are incomparable, so this set always leaves a ledge
+        plates = tuple(sp.build_plate(perforated_plate(w, d))
+                       for w, d in ((5, 4), (5, 3), (4, 4), (4, 3)))
+        return sp.plan(plates, 0.2, flip=True, register=True)
+
+    def test_a_ledge_produces_fillers(self):
+        pl = self.stack()
+        self.assertTrue(sp.ledges(pl, 0.2))
+        self.assertTrue(sp.ledge_fillers(pl, 0.2))
+
+    def test_no_ledge_produces_none(self):
+        plates = tuple(sp.build_plate(perforated_plate(w, d))
+                       for w, d in ((5, 4), (4, 4), (4, 3)))
+        pl = sp.plan(plates, 0.2, flip=True, register=True)
+        self.assertEqual(sp.ledges(pl, 0.2), ())
+        self.assertEqual(sp.ledge_fillers(pl, 0.2), ())
+
+    def test_fillers_clear_every_plate(self):
+        """The whole point: nothing may fuse to a plate."""
+        pl = self.stack()
+        mesh = sp.ledge_fillers(pl, 0.2)
+        boxes = [mesh[i:i + 12] for i in range(0, len(mesh), 12)]
+        plates = [stl_io.bounds_of(p.placed_mesh()) for p in pl]
+        for b in (stl_io.bounds_of(x) for x in boxes):
+            for pb in plates:
+                overlap = (min(b.z1, pb.z1) - max(b.z0, pb.z0) > 1e-6
+                           and min(b.x1, pb.x1) - max(b.x0, pb.x0) > 1e-6
+                           and min(b.y1, pb.y1) - max(b.y0, pb.y0) > 1e-6)
+                self.assertFalse(overlap, "a filler intersects a plate")
+
+    def test_fillers_take_whole_plate_levels(self):
+        """Each block occupies one plate's z range, so the stack gaps clear it."""
+        pl = self.stack()
+        levels = {(round(p.z0, 6), round(p.z1, 6)) for p in pl}
+        mesh = sp.ledge_fillers(pl, 0.2)
+        for i in range(0, len(mesh), 12):
+            b = stl_io.bounds_of(mesh[i:i + 12])
+            self.assertIn((round(b.z0, 6), round(b.z1, 6)), levels)
+
+    def test_projects_the_face_directly_above_the_filler(self):
+        """The near face, not the plate's widest section.
+
+        The socket tapers, so projecting the wide end makes a filler broader than
+        both the face it carries and the one it stands on, and its own footprint
+        then needs bridging support: measured 6.0 g of support against 5.6 g.
+        """
+        for p in self.stack():
+            b = stl_io.bounds_of(p.placed_mesh())
+            spans = sp.solid_spans(p, b.x0, b.y0, b.x1, b.y1, step=1.0)
+            covered = sum((x1 - x0) * (y1 - y0) for x0, y0, x1, y1 in spans)
+            self.assertLess(abs(covered - p.down_area), abs(covered - p.up_area),
+                            f"{p.plate.label} did not follow its down face")
+
+    def test_projection_is_faithful_by_default(self):
+        """grow defaults to off.
+
+        The face is a lattice of ~1.5 mm webs, so even 0.8 mm of dilation doubles
+        every web and swallows the rounded socket corners.
+        """
+        pl = self.stack()
+        plain = sp.ledge_fillers(pl, 0.2)
+        grown = sp.ledge_fillers(pl, 0.2, grow=0.8)
+        self.assertGreater(stl_io.signed_volume(grown),
+                           stl_io.signed_volume(plain) * 1.2)
+
+    def test_fillers_are_absent_when_asked(self):
+        mesh = (perforated_plate(5, 4) + perforated_plate(5, 3, origin=(500.0, 0.0))
+                + perforated_plate(4, 4, origin=(0.0, 500.0)))
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "in.stl"
+            stl_io.write_stl(src, mesh)
+            a, b = Path(td) / "a", Path(td) / "b"
+            sp.main([str(src), "-o", str(a)])
+            sp.main([str(src), "-o", str(b), "--no-fillers"])
+            self.assertGreater((a / "gf-stack-3.stl").stat().st_size,
+                               (b / "gf-stack-3.stl").stat().st_size)
+
+
 class TestUnsupported(unittest.TestCase):
     def test_fully_covered_is_free(self):
         rect = (0.0, 0.0, 10.0, 10.0)
