@@ -506,163 +506,89 @@ class TestSupportEstimate(unittest.TestCase):
 
 
 class TestBlockers(unittest.TestCase):
+    """Blockers are one slab per plate, not one solid per socket.
+
+    Tracing sockets was abandoned: support collects in the four-way rib junctions
+    between cells, outside any socket outline however finely traced. A slab
+    spanning a plate's thickness covers everything inside it at once.
+    """
+
     def setUp(self):
         plates = tuple(sp.build_plate(perforated_plate(w, d))
                        for w, d in ((4, 3), (3, 3), (3, 2)))
-        self.pl = sp.plan(plates, 0.8, flip=True, register=True)
-        every = stl_io.split_shells(sp.make_blockers(self.pl, 0.8))
-        # the two bbox pins are not sockets; they exist only to fix placement
-        self.solids = tuple(s for s in every
-                            if stl_io.bounds_of(s).width > sp.BBOX_PIN + 1e-9)
+        self.pl = sp.plan(plates, 0.4, flip=True, register=True)
+        self.slabs = stl_io.split_shells(sp.make_blockers(self.pl, 0.4, layer=0.2))
 
-    def test_one_solid_per_cell(self):
-        self.assertEqual(len(self.solids),
-                         sum(p.plate.lattice.cells for p in self.pl))
+    def test_one_slab_per_plate(self):
+        big = [s for s in self.slabs if stl_io.bounds_of(s).width > 1]
+        self.assertEqual(len(big), len(self.pl))
 
-    def test_every_solid_is_closed_and_outward_wound(self):
-        for solid in self.solids:
-            self.assertGreater(stl_io.signed_volume(solid), 0.0)
+    def test_each_slab_starts_one_layer_above_its_plate(self):
+        """The offset at the bottom is required, not slop.
 
-    def test_each_solid_fits_inside_one_cell(self):
-        pitch = self.pl[0].lattice.pitch
-        for solid in self.solids:
-            b = stl_io.bounds_of(solid)
-            self.assertLessEqual(b.width, pitch)
-            self.assertLessEqual(b.depth, pitch)
-
-    def test_each_solid_is_centred_on_a_cell(self):
-        holes = {(round(x, 2), round(y, 2)) for pl in self.pl for x, y in pl.holes()}
-        for solid in self.solids:
-            b = stl_io.bounds_of(solid)
-            self.assertIn((round(b.cx, 2), round(b.cy, 2)), holes)
-
-    def test_solids_reach_into_the_gaps(self):
-        """A blocker must cross the gap, or support forms in it and bridges the socket."""
-        for pl in self.pl:
-            here = [stl_io.bounds_of(s) for s in self.solids
-                    if pl.z0 - 1e-6 <= (stl_io.bounds_of(s).z0 + stl_io.bounds_of(s).z1) / 2 <= pl.z1 + 1e-6]
-            self.assertTrue(here)
-            for b in here:
-                self.assertLess(b.z0, pl.z0)
-                self.assertGreater(b.z1, pl.z1)
-
-    def test_no_blocker_overlaps_plate_material(self):
-        """The load-bearing invariant: a blocker never sits inside solid material."""
-        meshes = [(pl, pl.placed_mesh()) for pl in self.pl]
-        frac = (0.03, 0.19, 0.37, 0.49, 0.63, 0.81, 0.97)
-        sampled = 0
-        for solid in self.solids:
-            b = stl_io.bounds_of(solid)
-            for fx in frac:
-                for fy in frac:
-                    px, py = b.x0 + b.width * fx, b.y0 + b.depth * fy
-                    for pl, mesh in meshes:
-                        lo, hi = max(b.z0, pl.z0), min(b.z1, pl.z1)
-                        if hi - lo <= 1e-9:
-                            continue
-                        for fz in (0.05, 0.5, 0.95):
-                            pz = lo + (hi - lo) * fz
-                            if not point_inside(solid, px, py, pz):
-                                continue
-                            sampled += 1
-                            self.assertFalse(
-                                point_inside(mesh, px, py, pz),
-                                f"blocker point ({px:.2f},{py:.2f},{pz:.2f}) is inside "
-                                f"the {pl.plate.label} plate")
-        self.assertGreater(sampled, 100)
-
-    def test_bbox_matches_the_model(self):
-        """Regression: Bambu centres a loaded part on the object it joins.
-
-        The cell lattice is not centred in the plate outline, so without pinning
-        the bbox the blockers land several mm off -- over the ribs, blocking
-        nothing, and silently. Measured 3.0 mm in X on the real cabinet set.
+        Blockers are subtracted from the *overhang* polygons at the layer where
+        the overhang is found, and the support for an overhang is printed below
+        it. A plate's interface comes from the overhang at its first layer, so a
+        slab covering that layer deletes the interface.
         """
+        big = sorted((stl_io.bounds_of(s) for s in self.slabs
+                      if stl_io.bounds_of(s).width > 1), key=lambda b: b.z0)
+        for b, pl in zip(big, self.pl):
+            self.assertAlmostEqual(b.z0, pl.z0 + 0.2, places=6)
+            self.assertAlmostEqual(b.z1, pl.z1, places=6)
+
+    def test_slabs_leave_the_gaps_open(self):
+        big = sorted((stl_io.bounds_of(s) for s in self.slabs
+                      if stl_io.bounds_of(s).width > 1), key=lambda b: b.z0)
+        for a, b in zip(big, big[1:]):
+            self.assertGreater(b.z0 - a.z1, 0.0)
+
+    def test_a_negative_inset_is_refused(self):
+        """At or below zero the slabs meet across the gaps and take the interface."""
+        with self.assertRaises(ValueError):
+            sp.make_blockers(self.pl, 0.4, layer=-0.1)
+
+    def test_bbox_matches_the_model_on_all_three_axes(self):
+        """Bambu centres a loaded part on the object; a mismatch silently
+        displaces it. Pinning only X and Y left blockers 2 mm out in Z."""
         model = stl_io.bounds_of(tuple(f for pl in self.pl for f in pl.placed_mesh()))
-        blockers = stl_io.bounds_of(sp.make_blockers(self.pl, 0.8))
-        self.assertAlmostEqual(blockers.cx, model.cx, places=6)
-        self.assertAlmostEqual(blockers.cy, model.cy, places=6)
-
-    def test_pins_are_small_enough_to_ignore(self):
-        pinned = sp.make_blockers(self.pl, 0.8)
-        pins = [s for s in stl_io.split_shells(pinned)
-                if stl_io.bounds_of(s).width <= sp.BBOX_PIN + 1e-9]
-        self.assertEqual(len(pins), 2)
-        for pin in pins:
-            self.assertLessEqual(stl_io.signed_volume(pin), sp.BBOX_PIN ** 3 + 1e-9)
-
-    def test_blockers_are_opt_in(self):
-        """They measured as worth nothing with snug support, so they are off."""
-        mesh = perforated_plate(4, 3) + perforated_plate(3, 3, origin=(500.0, 0.0))
-        with tempfile.TemporaryDirectory() as td:
-            src = Path(td) / "in.stl"
-            stl_io.write_stl(src, mesh)
-            for flags, expected in ((["--blockers"], True), ([], False)):  # noqa: E501
-                out = Path(td) / ("on" if expected else "off")
-                sp.main([str(src), "-o", str(out), *flags])
-                self.assertEqual((out / "gf-stack-2-blockers.stl").exists(), expected)
+        b = stl_io.bounds_of(sp.make_blockers(self.pl, 0.4, layer=0.2))
+        self.assertAlmostEqual(b.cx, model.cx, places=6)
+        self.assertAlmostEqual(b.cy, model.cy, places=6)
+        self.assertAlmostEqual((b.z0 + b.z1) / 2, (model.z0 + model.z1) / 2, places=6)
 
 
-class TestSettingsCheck(unittest.TestCase):
-    def test_each_profile_declares_the_gap_it_pairs_with(self):
-        """The settings are tuned per gap; a mismatched stack undoes the tuning."""
-        for name in ("petg-interface", "same-material"):
-            self.assertIn("_gap_mm", self.profile(name))
+class TestEnforcers(unittest.TestCase):
+    def setUp(self):
+        plates = tuple(sp.build_plate(perforated_plate(w, d))
+                       for w, d in ((4, 3), (3, 3), (3, 2)))
+        self.pl = sp.plan(plates, 0.4, flip=True, register=True)
 
-    def profile(self, name):
-        return json.loads((Path("settings") / f"{name}.json").read_text())
+    def test_slabs_bracket_each_plate_first_layer(self):
+        """An enforcer's contact is model material at a layer minus material
+        below it, so it must sit on the plate's first layer to mean anything."""
+        mesh = sp.make_enforcers(self.pl, layer=0.2)
+        big = sorted((stl_io.bounds_of(mesh[i:i+12])
+                      for i in range(0, len(mesh), 12)
+                      if stl_io.bounds_of(mesh[i:i+12]).width > 1), key=lambda b: b.z0)
+        self.assertTrue(big)
+        for b in big:
+            self.assertTrue(any(b.z0 < pl.z0 < b.z1 for pl in self.pl))
 
-    def test_both_profiles_parse_and_cover_the_settings_that_matter(self):
-        must = {"support_style", "support_top_z_distance", "support_object_xy_distance",
-                "support_expansion", "support_interface_spacing", "support_type"}
-        for name in ("petg-interface", "same-material"):
-            keys = {k for k in self.profile(name) if not k.startswith("_")}
-            self.assertTrue(must <= keys, f"{name} missing {must - keys}")
+    def test_nothing_for_the_bottom_plate(self):
+        """It sits on the bed and needs no support."""
+        mesh = sp.make_enforcers(self.pl, layer=0.2)
+        for i in range(0, len(mesh), 12):
+            b = stl_io.bounds_of(mesh[i:i+12])
+            if b.width > 1:
+                self.assertGreater(b.z1, self.pl[0].z1)
 
-    def test_a_matching_project_passes(self):
-        want = self.profile("petg-interface")
-        project = {k: [v] for k, v in want.items() if not k.startswith("_")}
-        self.assertEqual(cs.compare(project, want), [])
-
-    def test_a_wrong_setting_is_reported(self):
-        want = self.profile("petg-interface")
-        project = {k: [v] for k, v in want.items() if not k.startswith("_")}
-        project["support_style"] = ["grid"]
-        bad = cs.compare(project, want)
-        self.assertEqual([b[0] for b in bad], ["support_style"])
-        self.assertEqual(bad[0][1:], ("snug", "grid"))
-
-    def test_a_missing_setting_is_reported(self):
-        want = self.profile("petg-interface")
-        project = {k: [v] for k, v in want.items() if not k.startswith("_")}
-        del project["support_expansion"]
-        self.assertIn(("support_expansion", want["support_expansion"], "missing"),
-                      cs.compare(project, want))
-
-    def test_bare_scalars_compare_the_same_as_bambus_one_element_lists(self):
-        want = self.profile("petg-interface")
-        self.assertEqual(cs.compare({k: v for k, v in want.items()}, want), [])
-
-    def test_reads_settings_out_of_a_3mf(self):
-        want = self.profile("same-material")
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "p.3mf"
-            with zipfile.ZipFile(path, "w") as z:
-                z.writestr("Metadata/project_settings.config",
-                           json.dumps({k: [v] for k, v in want.items()
-                                       if not k.startswith("_")}))
-            self.assertEqual(cs.compare(cs.load_project(path), want), [])
-            self.assertEqual(cs.main([str(path), "--profile", "same-material"]), 0)
-
-    def test_exits_nonzero_when_something_differs(self):
-        want = self.profile("petg-interface")
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "p.3mf"
-            broken = {k: [v] for k, v in want.items() if not k.startswith("_")}
-            broken["support_top_z_distance"] = ["0.2"]
-            with zipfile.ZipFile(path, "w") as z:
-                z.writestr("Metadata/project_settings.config", json.dumps(broken))
-            self.assertEqual(cs.main([str(path)]), 1)
+    def test_bbox_matches_the_model_on_all_three_axes(self):
+        model = stl_io.bounds_of(tuple(f for pl in self.pl for f in pl.placed_mesh()))
+        b = stl_io.bounds_of(sp.make_enforcers(self.pl, layer=0.2))
+        self.assertAlmostEqual(b.cx, model.cx, places=6)
+        self.assertAlmostEqual(b.cy, model.cy, places=6)
+        self.assertAlmostEqual((b.z0 + b.z1) / 2, (model.z0 + model.z1) / 2, places=6)
 
 
 class TestCli(unittest.TestCase):

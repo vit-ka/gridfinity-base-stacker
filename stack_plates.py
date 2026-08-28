@@ -104,17 +104,26 @@ def flipped_mesh(mesh: Mesh, axis: str | None) -> Mesh:
 
 
 SKIN = 0.01     # how far inside a face or step to sample the cell outline
+SECTION_DZ = 0.2    # vertical spacing of cell-outline samples
 
 
-def section_heights(levels: tuple[float, ...]) -> tuple[float, ...]:
-    """Sample heights that capture the socket exactly, steps included.
+def section_heights(levels: tuple[float, ...], dz: float = SECTION_DZ) -> tuple[float, ...]:
+    """Sample heights that follow the socket as a surface, not as a few sections.
 
-    Just inside each face, and just either side of every internal step, so a
-    vertical jump in the opening is reproduced as a jump rather than smeared into
-    a taper -- a loft straight through a step is wider than the hole it sits in.
+    Just inside each face, just either side of every internal step so a vertical
+    jump stays a jump, and then every `dz` in between. The sparse version -- one
+    section per level -- is a 2D outline extruded: it interpolates straight
+    through the taper, and the socket's corner radius changes continuously with
+    height, so the chords cut across the corners. Support collects in exactly
+    those gaps.
     """
-    inner = [z for L in levels[1:-1] for z in (L - SKIN, L + SKIN)]
-    return (levels[0] + SKIN, *inner, levels[-1] - SKIN)
+    out = {round(levels[0] + SKIN, 4), round(levels[-1] - SKIN, 4)}
+    for L in levels[1:-1]:
+        out.add(round(L - SKIN, 4)); out.add(round(L + SKIN, 4))
+    lo, hi = levels[0] + SKIN, levels[-1] - SKIN
+    n = int((hi - lo) / dz)
+    out.update(round(lo + i * dz, 4) for i in range(1, n + 1))
+    return tuple(sorted(out))
 
 
 def build_plate(mesh: Mesh) -> Plate:
@@ -127,8 +136,12 @@ def build_plate(mesh: Mesh) -> Plate:
     # Profile a mid-plate cell: edge cells can be clipped by the plate outline.
     hx, hy = lat.xs[len(lat.xs) // 2], lat.ys[len(lat.ys) // 2]
     zs = section_heights(levels)
+    # sampled finely: a blocker built from these traces the socket outline with
+    # chords, and at 24 samples the chords cut across the rounded corners, leaving
+    # notches the slicer fills with exactly the support the blocker is there to stop
     profiles = tuple(gf.hole_profile(mesh, hx, hy, z,
-                                     gf._opening_at(mesh, hx, hy, z) or lat.top_opening)
+                                     gf._opening_at(mesh, hx, hy, z) or lat.top_opening,
+                                     samples=64, span=0.995)
                      for z in zs)
     return Plate(mesh, b, lat,
                  gf.horizontal_area(mesh, b.z0),
@@ -497,13 +510,13 @@ def ledge_fillers(placements: tuple[Placement, ...], gap: float,
             continue
         spans = solid_spans(placements[i], x0 + gap, y0 + gap, x1 - gap, y1 - gap,
                             step=step, grow=grow)
+        # One block per plate level, aligned exactly to that level's z range, so
+        # the columns take the same gaps the plates do and print on the interface
+        # below them like everything else.
         for level in placements[:i]:
             if level.z0 < base - 1e-9:
                 continue
             for sx0, sy0, sx1, sy1 in spans:
-                # only genuinely degenerate rectangles; a fixed 0.5 mm floor
-                # silently deleted most of the projection at a finer sampling
-                # step, leaving just the thick parts of the lattice
                 if sx1 - sx0 < 1e-9 or sy1 - sy0 < 1e-9:
                     continue
                 mesh.extend(box(sx0, sy0, level.z0, sx1, sy1, level.z1))
@@ -554,9 +567,18 @@ def steepest_overhang(plate: Plate) -> float:
     Sets the ceiling for the slicer's support threshold. Measured between true z
     levels -- the sampling heights sit a hair inside them and would flatter it.
     """
-    return overhang_from_sections(
-        gf.z_levels(plate.mesh),
-        tuple(max(w for _, w in prof) for prof in plate.profiles))
+    levels = gf.z_levels(plate.mesh)
+    radius = {z: max(w for _, w in prof)
+              for z, prof in zip(plate.section_zs, plate.profiles)}
+
+    def nearest(z):
+        return radius[min(radius, key=lambda s: abs(s - z))]
+
+    # two samples per level interval, just inside each end -- the sections in
+    # between are for the blockers and would confuse the taper measurement
+    radii = tuple(v for lo, hi in zip(levels, levels[1:])
+                  for v in (nearest(lo + SKIN), nearest(hi - SKIN)))
+    return overhang_from_sections(levels, radii)
 
 
 def is_full_cell(plate: Plate, hx: float, hy: float) -> bool:
@@ -596,56 +618,115 @@ def cell_sections(plate: Plate, hx: float, hy: float, clearance: float):
     )
 
 
-def make_blockers(placements: tuple[Placement, ...], gap: float,
-                  clearance: float = 0.25) -> Mesh:
-    """One blocker per socket, lofted to that socket's own void.
-
-    Built in each plate's own frame and then put through exactly the same flip
-    and translation as the plate, so a blocker cannot drift out of its socket.
-    Each one runs a little way into the gaps above and below; those are empty, and
-    the facing plate always presents an opening at least as wide.
-    """
-    mesh: list = []
-    reach = gap * 0.95
-    for pl in placements:
-        plate = pl.plate
-        b = plate.bounds
-        local: list = []
-        for hx in plate.lattice.xs:
-            for hy in plate.lattice.ys:
-                sections = cell_sections(plate, hx, hy, clearance)
-                if sections is None:
-                    continue
-                local.extend(loft((
-                    (sections[0][0] - reach, sections[0][1]),
-                    *sections,
-                    (sections[-1][0] + reach, sections[-1][1]),
-                )))
-        oriented = flipped_mesh(tuple(local), pl.flip_axis)
-        offset = bounds_of(flipped_mesh(plate.mesh, pl.flip_axis)).z0
-        mesh.extend(translate(oriented, pl.dx, pl.dy, pl.dz - offset))
-    return match_bbox(tuple(mesh),
-                      bounds_of(tuple(f for pl in placements for f in pl.placed_mesh())))
-
-
 BBOX_PIN = 0.1      # mm; large enough that the slicer keeps it, small enough to ignore
 
 
 def match_bbox(mesh: Mesh, target: Bounds) -> Mesh:
     """Pad a blocker mesh so its bounding box matches the model's.
 
-    Bambu Studio centres a loaded part on the object it joins. The cell lattice is
-    not centred in the plate outline, so the blockers' own bbox centre sits a few
-    mm off the model's -- and every blocker lands that far out, over the ribs
-    instead of the chimneys, silently doing nothing. Two pin-sized cubes at
-    opposite corners make the centres agree, so the placement is a no-op.
+    Bambu Studio centres a loaded part on the object it joins, so a part whose
+    bbox centre differs lands that far out and silently does the wrong thing.
+
+    All three axes, Z included. Pinning only X and Y is enough for a part that
+    already spans the model vertically, and wrong for one that does not -- a set
+    of thin slabs ending at the last plate's bottom face has its centre 2 mm low,
+    and every slab arrives 2 mm off its target layer.
     """
-    b = bounds_of(mesh)
-    pins = (
-        box(target.x0, target.y0, b.z0, target.x0 + BBOX_PIN, target.y0 + BBOX_PIN, b.z0 + BBOX_PIN),
-        box(target.x1 - BBOX_PIN, target.y1 - BBOX_PIN, b.z1 - BBOX_PIN, target.x1, target.y1, b.z1),
-    )
-    return mesh + pins[0] + pins[1]
+    return (mesh
+            + box(target.x0, target.y0, target.z0,
+                  target.x0 + BBOX_PIN, target.y0 + BBOX_PIN, target.z0 + BBOX_PIN)
+            + box(target.x1 - BBOX_PIN, target.y1 - BBOX_PIN, target.z1 - BBOX_PIN,
+                  target.x1, target.y1, target.z1))
+
+
+def make_enforcers(placements: tuple[Placement, ...], layer: float = 0.2,
+                   shrink: float = 0.4, step: float = 0.5) -> Mesh:
+    """One box over the whole stack, to be loaded as a support *enforcer*.
+
+    Paired with support type "normal(manual)", which skips automatic overhang
+    detection entirely (SupportMaterial.cpp gates it on
+    `auto_normal_support = support_type == stNormalAuto`), so contacts come from
+    enforcers alone.
+
+    An enforcer's contact is computed as
+
+        diff(intersection(layer.lslices, enforcer), expand(lower_layer_polygons))
+
+    -- model material at this layer with nothing under it. So the enforcer must be
+    a thin slab over each plate's *first layer* only. A box enclosing the whole
+    stack instead reproduces every overhang in the model at a 90 degree
+    threshold, which is more support than automatic detection gives, not less.
+
+    The socket walls are 45 degrees and carry themselves, so dropping automatic
+    detection costs nothing and takes every balcony with it.
+    """
+    b = bounds_of(tuple(f for pl in placements for f in pl.placed_mesh()))
+    mesh: list = []
+    for lower, upper in interfaces(placements):
+        # Trim to where the upper plate actually rests on the lower one. A contact
+        # over solid ground terminates as a bottom contact; one hanging past it is
+        # projected downward and becomes a balcony. Interfaces here are always
+        # land-to-land or rib-to-rib on a registered lattice, so the upper plate's
+        # own down face, clipped to the lower plate's footprint, is that region.
+        lo = stl_bounds(lower)
+        up = stl_bounds(upper)
+        x0, y0 = max(lo[0], up[0]) + shrink, max(lo[1], up[1]) + shrink
+        x1, y1 = min(lo[2], up[2]) - shrink, min(lo[3], up[3]) - shrink
+        if x1 - x0 < 1 or y1 - y0 < 1:
+            continue
+        for sx0, sy0, sx1, sy1 in solid_spans(upper, x0, y0, x1, y1,
+                                              step=step, grow=-shrink):
+            if sx1 - sx0 < 1e-9 or sy1 - sy0 < 1e-9:
+                continue
+            mesh.extend(box(sx0, sy0, upper.z0 - layer / 2,
+                            sx1, sy1, upper.z0 + layer / 2))
+    # The slabs stop at the last plate's bottom, so their bounding box centre sits
+    # below the model's, and Bambu -- which centres a loaded part on the object --
+    # would shift every slab off its first layer.
+    return match_bbox(tuple(mesh), b)
+
+
+def make_blockers(placements: tuple[Placement, ...], gap: float,
+                  layer: float = 0.2, margin: float = 2.0) -> Mesh:
+    """One solid slab per plate: its whole footprint, inset in Z from both faces.
+
+    Everything a plate needs support for is in the gaps around it, not inside its
+    own height -- the socket walls are 45 degrees and carry themselves. So the
+    blocker does not need to trace sockets at all: a slab spanning a plate's
+    thickness, held `inset` clear of each face, deletes every balcony and every
+    column inside that plate and leaves the gap interfaces alone.
+
+    Tracing the socket surface instead is the thing that kept leaking: support
+    collects in the four-way rib junctions between cells, which are outside any
+    socket outline however finely it is traced.
+
+    Each slab runs from one layer above its plate's bottom face to its top face.
+    The offset at the bottom is not slop, it is required, and the reason is in
+    the slicer: SupportMaterial.cpp subtracts blockers from the *overhang*
+    polygons at the layer where the overhang is detected --
+
+        auto blocker = expand(union_(annotations.blockers_layers[layer_id]), ...);
+        diff_polygons = diff(diff_polygons, blocker);
+
+    -- and the support for an overhang is laid down in the layers *below* it. The
+    interface carrying a plate is generated from the overhang detected at that
+    plate's first layer. A slab starting at the plate's bottom face covers that
+    layer and deletes the interface; starting one layer higher leaves it, while
+    still blocking every overhang inside the plate's own body.
+    """
+    if layer <= 0:
+        raise ValueError("blocker layer offset must be positive: at zero the slab "
+                         "covers the plate's first layer, whose overhang generates "
+                         "the interface below it")
+    b = bounds_of(tuple(f for pl in placements for f in pl.placed_mesh()))
+    mesh: list = []
+    for pl in placements:
+        lo, hi = pl.z0 + layer, pl.z1
+        if hi - lo < layer:
+            continue
+        mesh.extend(box(b.x0 - margin, b.y0 - margin, lo,
+                        b.x1 + margin, b.y1 + margin, hi))
+    return match_bbox(tuple(mesh), b)
 
 
 def registration_error(lower: Placement, upper: Placement) -> tuple[float, float]:
@@ -957,6 +1038,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="keep every plate the same way up")
     ap.add_argument("--no-register", action="store_true",
                     help="centre plates instead of aligning their cell lattices")
+
+    ap.add_argument("--enforcers", action="store_true",
+                    help="emit a support enforcer box. Load it as a support "
+                         "enforcer and set support type to normal(manual): "
+                         "contacts then come only from it, which is exactly the "
+                         "plate interfaces, with no in-plate support at all")
     ap.add_argument("--blockers", action="store_true",
                     help="also emit support blockers. Measured to make no "
                          "difference with snug support; kept for grid, or for "
@@ -1030,9 +1117,15 @@ def main(argv: list[str] | None = None) -> int:
 
         blocker_path = out / f"{name}-blockers.stl"
         if args.blockers:
-            blockers = make_blockers(placements, gap)
+            blockers = make_blockers(placements, gap, args.layer_height)
             write_stl(blocker_path, blockers, "support blockers")
             print(f"wrote {blocker_path} ({len(blockers)} facets)")
+
+        if args.enforcers:
+            enf = out / f"{name}-enforcers.stl"
+            write_stl(enf, make_enforcers(placements, args.layer_height),
+                      "support enforcer")
+            print(f"wrote {enf}")
 
         notes = out / f"{name}-PRINTING.md"
         write_printing_notes(notes, placements, gap, args.layer_height, report_text,

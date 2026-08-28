@@ -85,6 +85,34 @@ face.
 --name STEM           output basename
 ```
 
+## Tuning support
+
+Two settings do all the work, and they are model-dependent -- sweep them rather
+than copying a number. See [ADR 0003](docs/adr/0003-support-generation-findings.md)
+for why nothing else reaches the problem.
+
+| | what it does |
+|---|---|
+| `support_expansion` | slightly negative shrinks the contact before it is snapped to the support grid, so less of it hangs past the rib it lands on. Past -0.25 it starts eating the interface itself |
+| `support_object_xy_distance` | large squeezes out support running alongside model material. Interface coverage is flat in this, so it is free to push |
+
+Measured on the nine-plate drawer stack: 12.2 g of unwanted support at stock
+settings, 3.2 g at `xy 1.6` / `expansion -0.25`, with the interfaces untouched.
+
+The unwanted support -- ribbons hugging the socket walls inside a plate's own
+height -- is the downward projection of interface that is wider than the rib
+beneath it, because contacts are snapped to a ~2.9 mm grid and a land is 1.5 mm.
+It cannot be removed entirely, and what remains sits loose inside open
+through-shafts.
+
+To see it in Bambu Studio: Preview, Colour Scheme **Line Type**. Anything drawn
+as `Support` rather than `Support interface`, inside a plate's own z range, is
+the unwanted kind -- everything legitimate lives in the gaps.
+
+`--blockers` and `--enforcers` emit modifier parts to experiment with. Neither
+helps, for reasons the ADR records; they are kept because they are correct and
+the next idea in that direction can start from them.
+
 ## Reusing the slicer settings
 
 The settings that matter are in `settings/`, distilled to the twelve that this
