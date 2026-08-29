@@ -161,52 +161,6 @@ def split_shells(mesh: Mesh, tol: float = 1e-3) -> tuple[Mesh, ...]:
     return tuple(tuple(g) for g in sorted(groups.values(), key=len, reverse=True))
 
 
-def loft(sections: tuple[tuple[float, tuple[tuple[float, float], ...]], ...]) -> Mesh:
-    """Solid through a stack of (z, polygon) sections, all with equal point counts.
-
-    Polygons are CCW in XY and ordered by ascending z; caps are fan-triangulated
-    from the section centroid.
-    """
-    zs = [z for z, _ in sections]
-    rings = [poly for _, poly in sections]
-    n = len(rings[0])
-    if any(len(r) != n for r in rings) or len(rings) < 2:
-        raise ValueError("loft needs 2+ sections with equal point counts")
-
-    def norm(ax, ay, az):
-        m = (ax * ax + ay * ay + az * az) ** 0.5
-        return (ax / m, ay / m, az / m) if m > 1e-12 else (0.0, 0.0, 1.0)
-
-    def tri(a, b, c):
-        u = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
-        v = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
-        nrm = norm(u[1] * v[2] - u[2] * v[1],
-                   u[2] * v[0] - u[0] * v[2],
-                   u[0] * v[1] - u[1] * v[0])
-        return (*nrm, *a, *b, *c)
-
-    out: list[Facet] = []
-    for (z0, r0), (z1, r1) in zip(sections, sections[1:]):
-        for i in range(n):
-            j = (i + 1) % n
-            a = (r0[i][0], r0[i][1], z0)
-            b = (r0[j][0], r0[j][1], z0)
-            c = (r1[j][0], r1[j][1], z1)
-            d = (r1[i][0], r1[i][1], z1)
-            out.append(tri(a, b, c))
-            out.append(tri(a, c, d))
-    for ring, z, flip in ((rings[0], zs[0], True), (rings[-1], zs[-1], False)):
-        cx = sum(p[0] for p in ring) / n
-        cy = sum(p[1] for p in ring) / n
-        for i in range(n):
-            j = (i + 1) % n
-            a = (cx, cy, z)
-            b = (ring[i][0], ring[i][1], z)
-            c = (ring[j][0], ring[j][1], z)
-            out.append(tri(a, c, b) if flip else tri(a, b, c))
-    return tuple(out)
-
-
 def box(x0: float, y0: float, z0: float, x1: float, y1: float, z1: float) -> Mesh:
     """Axis-aligned box as 12 outward-wound triangles."""
     p = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),

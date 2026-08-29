@@ -10,7 +10,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import check_settings as cs
 import gridfinity as gf
 import stack_plates as sp
 import verify
@@ -533,92 +532,6 @@ class TestSupportEstimate(unittest.TestCase):
         self.assertAlmostEqual(grams, (iface + cols * sp.SPARSE) * sp.PLA_DENSITY)
 
 
-class TestBlockers(unittest.TestCase):
-    """Blockers are one slab per plate, not one solid per socket.
-
-    Tracing sockets was abandoned: support collects in the four-way rib junctions
-    between cells, outside any socket outline however finely traced. A slab
-    spanning a plate's thickness covers everything inside it at once.
-    """
-
-    def setUp(self):
-        plates = tuple(sp.build_plate(perforated_plate(w, d))
-                       for w, d in ((4, 3), (3, 3), (3, 2)))
-        self.pl = sp.plan(plates, 0.4, flip=True, register=True)
-        self.slabs = stl_io.split_shells(sp.make_blockers(self.pl, 0.4, layer=0.2))
-
-    def test_one_slab_per_plate(self):
-        big = [s for s in self.slabs if stl_io.bounds_of(s).width > 1]
-        self.assertEqual(len(big), len(self.pl))
-
-    def test_each_slab_starts_one_layer_above_its_plate(self):
-        """The offset at the bottom is required, not slop.
-
-        Blockers are subtracted from the *overhang* polygons at the layer where
-        the overhang is found, and the support for an overhang is printed below
-        it. A plate's interface comes from the overhang at its first layer, so a
-        slab covering that layer deletes the interface.
-        """
-        big = sorted((stl_io.bounds_of(s) for s in self.slabs
-                      if stl_io.bounds_of(s).width > 1), key=lambda b: b.z0)
-        for b, pl in zip(big, self.pl):
-            self.assertAlmostEqual(b.z0, pl.z0 + 0.2, places=6)
-            self.assertAlmostEqual(b.z1, pl.z1, places=6)
-
-    def test_slabs_leave_the_gaps_open(self):
-        big = sorted((stl_io.bounds_of(s) for s in self.slabs
-                      if stl_io.bounds_of(s).width > 1), key=lambda b: b.z0)
-        for a, b in zip(big, big[1:]):
-            self.assertGreater(b.z0 - a.z1, 0.0)
-
-    def test_a_negative_inset_is_refused(self):
-        """At or below zero the slabs meet across the gaps and take the interface."""
-        with self.assertRaises(ValueError):
-            sp.make_blockers(self.pl, 0.4, layer=-0.1)
-
-    def test_bbox_matches_the_model_on_all_three_axes(self):
-        """Bambu centres a loaded part on the object; a mismatch silently
-        displaces it. Pinning only X and Y left blockers 2 mm out in Z."""
-        model = stl_io.bounds_of(tuple(f for pl in self.pl for f in pl.placed_mesh()))
-        b = stl_io.bounds_of(sp.make_blockers(self.pl, 0.4, layer=0.2))
-        self.assertAlmostEqual(b.cx, model.cx, places=6)
-        self.assertAlmostEqual(b.cy, model.cy, places=6)
-        self.assertAlmostEqual((b.z0 + b.z1) / 2, (model.z0 + model.z1) / 2, places=6)
-
-
-class TestEnforcers(unittest.TestCase):
-    def setUp(self):
-        plates = tuple(sp.build_plate(perforated_plate(w, d))
-                       for w, d in ((4, 3), (3, 3), (3, 2)))
-        self.pl = sp.plan(plates, 0.4, flip=True, register=True)
-
-    def test_slabs_bracket_each_plate_first_layer(self):
-        """An enforcer's contact is model material at a layer minus material
-        below it, so it must sit on the plate's first layer to mean anything."""
-        mesh = sp.make_enforcers(self.pl, layer=0.2)
-        big = sorted((stl_io.bounds_of(mesh[i:i+12])
-                      for i in range(0, len(mesh), 12)
-                      if stl_io.bounds_of(mesh[i:i+12]).width > 1), key=lambda b: b.z0)
-        self.assertTrue(big)
-        for b in big:
-            self.assertTrue(any(b.z0 < pl.z0 < b.z1 for pl in self.pl))
-
-    def test_nothing_for_the_bottom_plate(self):
-        """It sits on the bed and needs no support."""
-        mesh = sp.make_enforcers(self.pl, layer=0.2)
-        for i in range(0, len(mesh), 12):
-            b = stl_io.bounds_of(mesh[i:i+12])
-            if b.width > 1:
-                self.assertGreater(b.z1, self.pl[0].z1)
-
-    def test_bbox_matches_the_model_on_all_three_axes(self):
-        model = stl_io.bounds_of(tuple(f for pl in self.pl for f in pl.placed_mesh()))
-        b = stl_io.bounds_of(sp.make_enforcers(self.pl, layer=0.2))
-        self.assertAlmostEqual(b.cx, model.cx, places=6)
-        self.assertAlmostEqual(b.cy, model.cy, places=6)
-        self.assertAlmostEqual((b.z0 + b.z1) / 2, (model.z0 + model.z1) / 2, places=6)
-
-
 class TestCli(unittest.TestCase):
     def test_end_to_end_writes_all_three_outputs(self):
         mesh = (perforated_plate(4, 3, origin=(0.0, 0.0))
@@ -627,50 +540,25 @@ class TestCli(unittest.TestCase):
             src = Path(td) / "in.stl"
             stl_io.write_stl(src, mesh)
             out = Path(td) / "out"
-            self.assertEqual(sp.main([str(src), "-o", str(out), "--blockers"]), 0)
+            self.assertEqual(sp.main([str(src), "-o", str(out)]), 0)
             self.assertTrue((out / "gf-stack-2.stl").exists())
-            self.assertTrue((out / "gf-stack-2-blockers.stl").exists())
+            self.assertTrue((out / "gf-stack-2-interface.stl").exists())
+            self.assertTrue((out / "gf-stack-2.plates.json").exists())
             notes = (out / "gf-stack-2-PRINTING.md").read_text()
             self.assertIn("land-to-land", notes)
-            self.assertIn("Threshold angle", notes)
+            self.assertIn("no support at all", notes)
 
     def test_notes_have_no_unrendered_placeholders(self):
-        """Regression: a section substituted as a value keeps its own braces.
-
-        PETG_FILAMENT is inserted into the template as a value, so its {layer}
-        never went through .format() and shipped literally.
-        """
-        mesh = perforated_plate(4, 3) + perforated_plate(3, 3, origin=(500.0, 0.0))
+        """A section substituted as a value keeps its own braces."""
+        mesh = perforated_plate(5, 4) + perforated_plate(4, 4, origin=(500.0, 0.0))
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "in.stl"
             stl_io.write_stl(src, mesh)
-            for i, iface in enumerate(("same", "petg")):
-                out = Path(td) / f"o{i}"
-                sp.main([str(src), "-o", str(out), "--interface", iface,
-                         "--gap", "0.2" if iface == "petg" else "0.8"])
-                notes = (out / "gf-stack-2-PRINTING.md").read_text()
-                leftover = re.findall(r"\{[a-z_]+(?::[^}]*)?\}", notes)
-                self.assertEqual(leftover, [], f"{iface}: unrendered {leftover}")
-
-    def test_petg_gets_zero_z_distance_and_same_material_does_not(self):
-        mesh = perforated_plate(4, 3) + perforated_plate(3, 3, origin=(500.0, 0.0))
-        with tempfile.TemporaryDirectory() as td:
-            src = Path(td) / "in.stl"
-            stl_io.write_stl(src, mesh)
-            sp.main([str(src), "-o", str(Path(td) / "p"), "--interface", "petg", "--gap", "0.2"])
-            sp.main([str(src), "-o", str(Path(td) / "s"), "--interface", "same", "--gap", "0.8"])
-            petg = (Path(td) / "p/gf-stack-2-PRINTING.md").read_text()
-            same = (Path(td) / "s/gf-stack-2-PRINTING.md").read_text()
-            self.assertIn("| Top Z distance | **0** |", petg)
-            self.assertIn("| Top Z distance | **0.2 mm** |", same)
-
-    def test_interface_layers_fit_the_gap(self):
-        # 0.2 mm gap at 0.2 mm layers holds exactly one layer, not two
-        self.assertEqual(sp.iface_layers(0.2, 0.2, petg=True), 1)
-        self.assertEqual(sp.support_layers(0.2, 0.2, petg=True), 1)
-        # same-material loses a layer to each clearance
-        self.assertEqual(sp.support_layers(0.8, 0.2, petg=False), 2)
-        self.assertEqual(sp.support_layers(0.6, 0.2, petg=False), 1)
+            out = Path(td) / "o"
+            sp.main([str(src), "-o", str(out)])
+            notes = (out / "gf-stack-2-PRINTING.md").read_text()
+            leftover = re.findall(r"\{[a-z_]+\}", notes)
+            self.assertEqual(leftover, [], f"unrendered {leftover}")
 
     def test_variants_keep_their_own_notes(self):
         """Regression: a fixed notes filename leaves instructions for the wrong STL."""

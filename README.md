@@ -32,7 +32,7 @@ with tapered sockets, no magnet holes required.
 ## Use
 
 ```
-python3 stack_plates.py path/to/multiplate.stl --interface-part
+python3 stack_plates.py path/to/multiplate.stl
 python3 make3mf.py --template templates/stack-template.3mf \
     --model out/NAME.stl --plates out/NAME.plates.json \
     --interface out/NAME-interface.stl --out out/NAME.3mf
@@ -101,11 +101,13 @@ python3 stack_plates.py --help
 `--split` emits one stack per chain of the containment order, so nothing
 overhangs anything -- fewer pillars, at the cost of one print job per stack.
 
-`--blockers`, `--enforcers` and `--decoy` belong to superseded approaches. They
-are correct and kept so the next idea in those directions can start from them;
-[ADR 0003](docs/adr/0003-support-generation-findings.md) and
-[ADR 0004](docs/adr/0004-strip-balconies-in-gcode.md) record why none of them are
-needed now that the slicer generates no support.
+Earlier versions carried machinery for three approaches that no longer exist
+here: support blockers and enforcers, a decoy column to provoke filament changes,
+and a G-code pass to delete support the slicer insisted on generating. All of it
+is gone, because the slicer now generates no support at all. What was learned
+from each is in [ADR 0003](docs/adr/0003-support-generation-findings.md) and
+[ADR 0004](docs/adr/0004-strip-balconies-in-gcode.md), which is the part worth
+keeping; git history has the code.
 
 ## The template
 
