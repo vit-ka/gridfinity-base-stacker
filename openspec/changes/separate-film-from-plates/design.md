@@ -43,11 +43,14 @@ of the film was never being printed. Interface filament on the model goes from
 growing. No earlier timing taken against a zero-clearance film is a valid
 comparison.
 
-**Layer alignment is not worth chasing.** Offset by 0.1 mm from the layer grid,
-the film falls across three printed layers rather than two. Aligning it -- a
-0.8 mm gap with 0.2 mm of clearance, so the film sits exactly on two layer
-boundaries -- was measured and is worse on both counts: 42.4 mm and 12.52 h, for
-the same 9,915 mm of filament. The offset costs nothing that alignment recovers.
+**Layer alignment is not worth chasing.** The worry was that a film offset
+0.1 mm from the layer grid would be sliced across three printed layers instead of
+two. Counted in the G-code, it is not: the film appears on exactly 16 layers over
+eight gaps, two apiece, as intended. The offset costs nothing.
+
+Aligning it anyway -- a 0.8 mm gap with 0.2 mm of clearance, so the film sits on
+two layer boundaries exactly -- was measured and is worse on both counts: 42.4 mm
+and 12.52 h against 40.8 mm and 10.42 h, for the same filament.
 
 **Clearance stays a parameter with zero permitted.** Zero was the previous
 default and is a legitimate configuration; the generator should not refuse it.
