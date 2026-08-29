@@ -127,6 +127,14 @@ the model printed into air. Note also that a CLI slice is evidence only where th
 geometry is unambiguous -- ADR 0007 records a case where the CLI and the GUI gave
 opposite answers on the same file.
 
+## Licence
+
+MIT -- see [LICENSE](LICENSE).
+
+The baseplate geometry itself is not this project's work: plates come from
+[Gridfinity Extended](https://gridfinity.perplexinglabs.com/pr/gridfinity-extended/0/1),
+and Gridfinity is Zack Freedman's design.
+
 ## Working on this
 
 Changes go through OpenSpec (`openspec/`): `/opsx:propose` to write one,
