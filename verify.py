@@ -23,6 +23,27 @@ def inside(mesh, px, py, pz) -> bool:
     return votes >= 2
 
 
+def non_manifold(mesh) -> list[tuple[tuple, int]]:
+    """Edges not shared by exactly two facets, with how many use them.
+
+    Slicers reject a mesh that fails this and offer it for third-party repair,
+    and one the slicer considers broken cannot be relied on to slice as intended.
+    Nothing in this project looked for it, which is why Bambu found it first.
+
+    The count distinguishes the causes. One means a boundary -- an actual hole in
+    the surface. Four means two closed shells meeting along an edge, which is what
+    two boxes touching edge to edge produce, and is a different problem entirely.
+    """
+    used: dict[tuple, int] = {}
+    for f in mesh:
+        v = [(round(f[3 + k * 3], 5), round(f[4 + k * 3], 5), round(f[5 + k * 3], 5))
+             for k in range(3)]
+        for a, b in ((v[0], v[1]), (v[1], v[2]), (v[2], v[0])):
+            e = (a, b) if a <= b else (b, a)
+            used[e] = used.get(e, 0) + 1
+    return [(e, n) for e, n in used.items() if n != 2]
+
+
 def main(src: Path, stack: Path, blockers: Path, gap: float = 0.8) -> int:
     orig = stl_io.read_stl(src)
     out = stl_io.read_stl(stack)

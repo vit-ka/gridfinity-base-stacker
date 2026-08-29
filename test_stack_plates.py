@@ -13,6 +13,7 @@ from pathlib import Path
 import check_settings as cs
 import gridfinity as gf
 import stack_plates as sp
+import verify
 import stl_io
 
 
@@ -806,6 +807,85 @@ class TestGapFilm(unittest.TestCase):
         reach = max(b.x1 for b in highs) - max(b.x1 for b in lows)
         self.assertGreaterEqual(reach, 0.0, "the upper layer must not be narrower")
         self.assertLessEqual(reach, self.LAYER + 1e-6, "steeper than 45 degrees")
+
+
+class TestManifold(unittest.TestCase):
+    """Every edge shared by exactly two facets.
+
+    Slicers reject anything else and offer it for repair. Nothing in this
+    project checked it, so the defect lived for the whole life of the box
+    decomposition and Bambu found it first.
+    """
+
+    def test_a_single_box_is_manifold(self):
+        self.assertEqual(verify.non_manifold(stl_io.box(0, 0, 0, 1, 1, 1)), [])
+
+    def test_boxes_touching_edge_to_edge_are_not(self):
+        mesh = tuple(stl_io.box(0, 0, 0, 1, 1, 1)) + tuple(stl_io.box(1, 1, 0, 2, 2, 1))
+        bad = verify.non_manifold(mesh)
+        self.assertTrue(bad)
+        self.assertTrue(all(n == 4 for _, n in bad),
+                        "four faces on an edge means two shells, not a hole")
+
+    def test_boxes_sharing_a_whole_face_are_not_either(self):
+        """Which is why the fix cannot be to align the boxes better."""
+        mesh = tuple(stl_io.box(0, 0, 0, 1, 1, 1)) + tuple(stl_io.box(0, 0, 1, 1, 1, 2))
+        self.assertTrue(verify.non_manifold(mesh))
+
+    def test_a_hole_reads_as_a_boundary_not_as_extra_shells(self):
+        """One face on an edge is torn geometry; four is not. The count is the
+        diagnosis, and it is what ruled out repair as the fix here."""
+        mesh = tuple(stl_io.box(0, 0, 0, 1, 1, 1))[:-1]      # drop a facet
+        self.assertTrue(any(n == 1 for _, n in verify.non_manifold(mesh)))
+
+    def test_a_region_with_a_hole_keeps_the_hole(self):
+        loops = sp.contours([0b111111, 0b100001, 0b100001, 0b111111], 6, 4)
+        m = sp.prism(loops, 0.0, 0.0, 1.0, 0.0, 1.0)
+        self.assertEqual(verify.non_manifold(m), [])
+        self.assertAlmostEqual(stl_io.signed_volume(m), 16.0, places=6)
+
+    def test_a_region_touching_itself_corner_to_corner(self):
+        """Two cells meeting diagonally pinch, and tracing cannot express it:
+        the two loops meeting at the corner put four facets on one edge. The
+        guarantee is at region_solid, which checks the trace and falls back."""
+        pinch = [0b01, 0b10]
+        self.assertTrue(verify.non_manifold(
+            sp.prism(sp.contours(pinch, 2, 2), 0.0, 0.0, 1.0, 0.0, 1.0)),
+            "if tracing handles this, the fallback is no longer justified")
+        self.assertEqual(verify.non_manifold(
+            sp.region_solid(pinch, 0.0, 0.0, 2, 2, 1.0, 0.0, 1.0)), [])
+
+    def test_a_traced_region_is_one_solid(self):
+        """However many rectangles it would have taken."""
+        ring = [0b111111, 0b100001, 0b100001, 0b111111]
+        m = sp.region_solid(ring, 0.0, 0.0, 6, 4, 1.0, 0.0, 1.0)
+        self.assertEqual(len(stl_io.split_shells(m)), 1)
+        self.assertGreater(len(sp.grid_rects(ring, 0.0, 0.0, 6, 4, 1.0)), 1,
+                           "a decomposition would have taken several boxes")
+
+    def test_film_pieces_overlap_rather_than_touch(self):
+        """Overlapping solids share no edge; abutting ones put four facets on it."""
+        plates = tuple(sp.build_plate(perforated_plate(w, d))
+                       for w, d in ((5, 4), (5, 3), (4, 4), (4, 3)))
+        pl = sp.plan(plates, 0.6, flip=True, register=True)
+        self.assertEqual(verify.non_manifold(sp.interface_slabs(pl, 0.6)), [])
+        touching = sp.interface_slabs(pl, 0.6, weld=0.0)
+        self.assertTrue(verify.non_manifold(touching),
+                        "without the overlap this test proves nothing")
+
+    def test_generated_pillars_are_manifold(self):
+        plates = tuple(sp.build_plate(perforated_plate(w, d))
+                       for w, d in ((5, 4), (5, 3), (4, 4), (4, 3)))
+        pl = sp.plan(plates, 0.6, flip=True, register=True)
+        bad = verify.non_manifold(sp.support_fillers(pl, 0.6))
+        self.assertEqual(bad, [], f"{len(bad)} non-manifold edges in the pillars")
+
+    def test_generated_film_is_manifold(self):
+        plates = tuple(sp.build_plate(perforated_plate(w, d))
+                       for w, d in ((5, 4), (5, 3), (4, 4), (4, 3)))
+        pl = sp.plan(plates, 0.6, flip=True, register=True)
+        bad = verify.non_manifold(sp.interface_slabs(pl, 0.6))
+        self.assertEqual(bad, [], f"{len(bad)} non-manifold edges in the film")
 
 
 if __name__ == "__main__":

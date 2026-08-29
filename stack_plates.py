@@ -551,6 +551,303 @@ def grid_rects(rows: list[int], x0: float, y0: float, w: int, h: int,
     return tuple(out)
 
 
+def contours(rows: list[int], w: int, h: int
+              ) -> tuple[tuple[tuple[int, int], ...], ...]:
+    """Closed loops around every filled region, walking the cell boundaries.
+
+    The alternative to decomposing a region into rectangles. Boxes cannot be made
+    manifold by arranging them better: two that share only an edge put four
+    facets on it, and two that share a whole face put four on five edges, so any
+    touching pair fails. One region has to become one solid, and that starts with
+    its outline.
+
+    Loops are traced on the lattice of cell corners, so a loop is a sequence of
+    integer points and the geometry is exact rather than fitted. Each unit edge
+    between a filled cell and an empty one is walked once, keeping filled cells
+    to the left, which yields outer boundaries counter-clockwise and holes
+    clockwise -- the winding a prism needs to know which is which.
+    """
+    def filled(x: int, y: int) -> bool:
+        return 0 <= x < w and 0 <= y < h and (rows[y] >> x) & 1
+
+    # Directed boundary edges: for each filled cell, any side facing an empty
+    # neighbour. Stored as start -> end so the walk is a lookup.
+    nxt: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for y in range(h):
+        row = rows[y]
+        if not row:
+            continue
+        for x in range(w):
+            if not (row >> x) & 1:
+                continue
+            if not filled(x, y - 1):
+                nxt.setdefault((x, y), []).append((x + 1, y))
+            if not filled(x + 1, y):
+                nxt.setdefault((x + 1, y), []).append((x + 1, y + 1))
+            if not filled(x, y + 1):
+                nxt.setdefault((x + 1, y + 1), []).append((x, y + 1))
+            if not filled(x - 1, y):
+                nxt.setdefault((x, y + 1), []).append((x, y))
+
+    loops = []
+    for start in list(nxt):
+        while nxt.get(start):
+            loop = [start]
+            cur = nxt[start].pop()
+            while cur != start:
+                loop.append(cur)
+                opts = nxt.get(cur)
+                if not opts:
+                    loop = None
+                    break
+                # At a pinch point four edges meet; take the one that turns most
+                # sharply left, which keeps each loop simple instead of letting
+                # two of them merge into a figure of eight.
+                px, py = loop[-2]
+                dx, dy = cur[0] - px, cur[1] - py
+                opts.sort(key=lambda n: -(dx * (n[1] - cur[1]) - dy * (n[0] - cur[0])))
+                cur = opts.pop(0)
+            if loop:
+                loops.append(tuple(simplify(loop)))
+    return tuple(loops)
+
+
+def simplify(loop: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Drop points that continue in the same direction."""
+    out = []
+    n = len(loop)
+    for i, pt in enumerate(loop):
+        a, b = loop[i - 1], loop[(i + 1) % n]
+        if (pt[0] - a[0]) * (b[1] - pt[1]) != (pt[1] - a[1]) * (b[0] - pt[0]):
+            out.append(pt)
+    return out or loop
+
+
+def area2(loop) -> int:
+    """Twice the signed area: positive counter-clockwise, so outer, not a hole."""
+    n = len(loop)
+    return sum(loop[i][0] * loop[(i + 1) % n][1] - loop[(i + 1) % n][0] * loop[i][1]
+               for i in range(n))
+
+
+def _visible_vertex(ring: list, m: tuple[int, int]) -> int:
+    """Index of a ring vertex mutually visible from `m`, looking along +x.
+
+    Eberly's construction. Cast the ray, take the nearest edge it crosses, and
+    consider the endpoint P of that edge with the greater x. P is visible unless
+    some reflex vertex of the ring falls inside the triangle (m, hit, P) and
+    blocks it; of those that do, the one subtending the smallest angle to the ray
+    is visible.
+
+    Choosing a nearby vertex by distance instead -- which is what this did before
+    -- lets two bridges cross once a region has many holes. A self-intersecting
+    ring has no valid ear anywhere, so the clipper stops early and leaves the cap
+    with a hole in it: measured, 230 triangles short of 2,172 on one film region
+    with 20 holes.
+    """
+    mx, my = m
+    n = len(ring)
+    best_x, best_i = None, None
+    for i in range(n):
+        ax, ay = ring[i]
+        bx, by = ring[(i + 1) % n]
+        if (ay > my) == (by > my):
+            continue                      # edge does not straddle the ray
+        t = ax + (my - ay) * (bx - ax) / (by - ay)
+        if t < mx:
+            continue                      # behind the hole
+        if best_x is None or t < best_x:
+            best_x, best_i = t, i
+    if best_i is None:
+        return 0
+
+    a, b = ring[best_i], ring[(best_i + 1) % n]
+    p_i = best_i if a[0] > b[0] else (best_i + 1) % n
+    hit = (best_x, my)
+
+    def cross(o, u, v):
+        return (u[0] - o[0]) * (v[1] - o[1]) - (u[1] - o[1]) * (v[0] - o[0])
+
+    def in_tri(q, t0, t1, t2):
+        d1, d2, d3 = cross(t0, t1, q), cross(t1, t2, q), cross(t2, t0, q)
+        return not ((d1 < 0 or d2 < 0 or d3 < 0) and (d1 > 0 or d2 > 0 or d3 > 0))
+
+    tri = (m, hit, ring[p_i])
+    blocking = []
+    for i in range(n):
+        if i == p_i:
+            continue
+        prv, cur, nxt = ring[i - 1], ring[i], ring[(i + 1) % n]
+        if cross(prv, cur, nxt) >= 0:
+            continue                      # convex, cannot block
+        if in_tri(cur, *tri):
+            blocking.append(i)
+    if not blocking:
+        return p_i
+    # Smallest angle to the ray; nearer wins a tie.
+    def key(i):
+        dx, dy = ring[i][0] - mx, ring[i][1] - my
+        return (abs(dy) / (dx if dx else 1e-9), dx * dx + dy * dy)
+    return min(blocking, key=key)
+
+
+def _bridge_holes(outer: list, holes: list) -> list:
+    """Cut each hole into the outer loop, giving one simply-connected ring.
+
+    Ear clipping cannot see a hole. The standard remedy is to slice a channel
+    from the hole to the boundary and walk in and back out along it, which turns
+    a ring with holes into a single loop tracing the same region. The seam is two
+    coincident edges and vanishes once triangulated.
+
+    Rightmost hole first, and each bridge is cut against the ring as it stands --
+    holes already merged included -- so a later bridge cannot cross an earlier
+    one.
+    """
+    ring = list(outer)
+    for hole in sorted(holes, key=lambda hl: -max(p[0] for p in hl)):
+        hi = max(range(len(hole)), key=lambda i: (hole[i][0], hole[i][1]))
+        pick = _visible_vertex(ring, hole[hi])
+        ring = ring[:pick + 1] + hole[hi:] + hole[:hi + 1] + ring[pick:]
+    return ring
+
+
+def _ear_clip(loop: list) -> list[tuple[int, int, int]]:
+    """Triangulate a simple polygon by clipping ears. Indices into `loop`."""
+    n = len(loop)
+    idx = list(range(n))
+    if area2(loop) < 0:
+        idx.reverse()
+
+    def cross(a, b, c):
+        return ((loop[b][0] - loop[a][0]) * (loop[c][1] - loop[a][1])
+                - (loop[b][1] - loop[a][1]) * (loop[c][0] - loop[a][0]))
+
+    def inside(p, a, b, c):
+        d1, d2, d3 = cross(a, b, p), cross(b, c, p), cross(c, a, p)
+        return not ((d1 < 0 or d2 < 0 or d3 < 0) and (d1 > 0 or d2 > 0 or d3 > 0))
+
+    tris = []
+    while len(idx) > 3:
+        cut = None
+        for k in range(len(idx)):
+            a, b, c = idx[k - 1], idx[k], idx[(k + 1) % len(idx)]
+            if cross(a, b, c) <= 0:
+                continue                       # reflex, or degenerate
+            # Compared by position, not by index. Bridging a hole duplicates two
+            # vertices, and a duplicate sits exactly on the candidate ear's edge,
+            # where the containment test says "inside" and blocks every ear in
+            # the polygon.
+            # Compared by position, not by index. Bridging a hole duplicates two
+            # vertices, and a duplicate sits exactly on the candidate ear's edge,
+            # where the containment test says "inside" and blocks every ear in
+            # the polygon.
+            if any(inside(p, a, b, c) for p in idx
+                   if p not in (a, b, c)
+                   and loop[p] not in (loop[a], loop[b], loop[c])):
+                continue                       # another vertex is in the ear
+            tris.append((a, b, c))
+            cut = k
+            break
+        if cut is None:
+            # No convex ear anywhere. A bridge seam leaves vertices whose
+            # triangle has zero area -- the channel doubles back on itself -- and
+            # no convex-ear test will ever accept one, so the clip stalls with
+            # them still in the ring. They enclose nothing, so drop one without
+            # emitting a triangle and carry on. Without this the largest film
+            # region finished 106 triangles short of 2,172, and the shortfall is
+            # a hole in the cap.
+            for k in range(len(idx)):
+                a, b, c = idx[k - 1], idx[k], idx[(k + 1) % len(idx)]
+                if cross(a, b, c) == 0:
+                    cut = k
+                    break
+        if cut is None:
+            break                              # genuinely stuck; leave the rest
+        idx.pop(cut)
+    if len(idx) == 3:
+        tris.append(tuple(idx))
+    return tris
+
+
+def prism(loops: tuple, x0: float, y0: float, step: float,
+          z0: float, z1: float) -> Mesh:
+    """One closed solid from a region's outlines: walls, and a cap at each end.
+
+    Loops arrive in cell coordinates; the caps are the triangulated footprint and
+    the walls are a quad per boundary edge. Every edge then belongs to exactly two
+    facets -- one cap triangle and one wall quad half, or two wall halves -- which
+    is the whole point of building it this way rather than from boxes.
+    """
+    outer = [l for l in loops if area2(l) > 0]
+    holes = [l for l in loops if area2(l) < 0]
+    out: list = []
+    for ring_outer in outer:
+        mine = [h for h in holes if _contains(ring_outer, h[0])]
+        ring = _bridge_holes(list(ring_outer), [list(h) for h in mine])
+        pts = [(x0 + px * step, y0 + py * step) for px, py in ring]
+        for a, b, c in _ear_clip(ring):
+            out.append((0.0, 0.0, -1.0, *pts[a], z0, *pts[c], z0, *pts[b], z0))
+            out.append((0.0, 0.0, 1.0, *pts[a], z1, *pts[b], z1, *pts[c], z1))
+        for loop in [ring_outer] + mine:
+            q = [(x0 + px * step, y0 + py * step) for px, py in loop]
+            for i, (ax, ay) in enumerate(q):
+                bx, by = q[(i + 1) % len(q)]
+                out.append((0.0, 0.0, 0.0, ax, ay, z0, bx, by, z0, bx, by, z1))
+                out.append((0.0, 0.0, 0.0, ax, ay, z0, bx, by, z1, ax, ay, z1))
+    return tuple(out)
+
+
+def _contains(loop, pt) -> bool:
+    """Even-odd test of a point against a loop, in cell coordinates."""
+    x, y = pt
+    inside = False
+    n = len(loop)
+    for i in range(n):
+        ax, ay = loop[i]
+        bx, by = loop[(i + 1) % n]
+        if (ay > y) != (by > y) and x < ax + (y - ay) / (by - ay) * (bx - ax):
+            inside = not inside
+    return inside
+
+
+def region_solid(rows: list[int], x0: float, y0: float, w: int, h: int,
+                 step: float, z0: float, z1: float, weld: float = 0.001) -> Mesh:
+    """One solid per connected region, checked, with a fallback that always holds.
+
+    Tracing the outline gives what a pillar wants: one solid, following the
+    socket's curve rather than stepping around it. It does not survive every
+    shape. A region that touches itself corner to corner pinches, and the two
+    loops meeting there put four facets on one edge -- the very defect this is
+    meant to remove.
+
+    So the traced solid is checked, and anything that fails falls back to boxes
+    overlapping by `weld`. Overlapping solids share no edge and slicers union
+    them regardless, so the manifold guarantee holds unconditionally rather than
+    holding only for shapes the tracer happens to manage.
+    """
+    traced = prism(contours(rows, w, h), x0, y0, step, z0, z1)
+    if traced and not _has_bad_edge(traced):
+        return traced
+    # Welded in x and y only. Pieces of one region meet each other sideways;
+    # in z the region has a face the caller measures clearance against, and
+    # overhanging it by even a micron makes that measurement a lie.
+    return tuple(f for rx0, ry0, rx1, ry1 in grid_rects(rows, x0, y0, w, h, step)
+                 for f in box(rx0 - weld, ry0 - weld, z0,
+                              rx1 + weld, ry1 + weld, z1))
+
+
+def _has_bad_edge(mesh: Mesh) -> bool:
+    """Whether any edge is used by other than two facets."""
+    used: dict[tuple, int] = {}
+    for f in mesh:
+        v = [(round(f[3 + k * 3], 5), round(f[4 + k * 3], 5), round(f[5 + k * 3], 5))
+             for k in range(3)]
+        for a, b in ((v[0], v[1]), (v[1], v[2]), (v[2], v[0])):
+            e = (a, b) if a <= b else (b, a)
+            used[e] = used.get(e, 0) + 1
+    return any(n != 2 for n in used.values())
+
+
 def support_regions(placements: tuple[Placement, ...], gap: float,
                     grow: float = 0.4, step: float = 0.15,
                     min_width: float = 0.42) -> tuple:
@@ -688,15 +985,15 @@ def support_fillers(placements: tuple[Placement, ...], gap: float,
     out: list = []
     for j, rows in regions.items():
         lo, hi = placements[j].z0, placements[j].z1
-        for rx0, ry0, rx1, ry1 in grid_rects(rows, x0, y0, w, h, step):
-            out.extend(box(rx0, ry0, lo, rx1, ry1, hi))
+        out.extend(region_solid(rows, x0, y0, w, h, step, lo, hi))
     return tuple(out)
 
 
 def interface_slabs(placements: tuple[Placement, ...], gap: float,
                     layer: float = 0.2, grow: float = 0.4,
                     step: float = 0.15, min_width: float = 0.42,
-                    flare: float = 0.2, clearance: float = 0.1) -> Mesh:
+                    flare: float = 0.2, clearance: float = 0.1,
+                    weld: float = 0.001) -> Mesh:
     """The film filling each gap, as a solid printed in its own filament.
 
     This is what the slicer used to make as support interface, made deliberately
@@ -748,8 +1045,20 @@ def interface_slabs(placements: tuple[Placement, ...], gap: float,
             zlo = lo + (hi - lo) * k / n
             zhi = lo + (hi - lo) * (k + 1) / n
             rows = dilate(base, k * flare / step, w, h) if k else base
+            # Boxes, overlapping by `weld` rather than abutting. Two closed
+            # solids that touch put four facets on the shared edge; two that
+            # interpenetrate share no edge at all, and the slicer unions them
+            # either way. Tracing the film's outline instead is what a pillar
+            # gets, and it defeats the triangulation here -- twenty interlocking
+            # holes in a two-thousand-point loop (see ADR and the change's
+            # design). A micron is 1/200th of the clearance the pillars hold.
+            # Welded sideways between neighbours, and upward into the band
+            # above -- but not past the film's own top, which is what holds it
+            # clear of the plate. The last band therefore ends exactly at zhi.
+            top = zhi + (weld if k < n - 1 else 0.0)
             for rx0, ry0, rx1, ry1 in grid_rects(rows, x0, y0, w, h, step):
-                out.extend(box(rx0, ry0, zlo, rx1, ry1, zhi))
+                out.extend(box(rx0 - weld, ry0 - weld, zlo,
+                               rx1 + weld, ry1 + weld, top))
     return tuple(out)
 
 

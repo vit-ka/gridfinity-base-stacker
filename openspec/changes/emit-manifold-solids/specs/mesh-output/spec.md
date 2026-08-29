@@ -34,14 +34,37 @@ is caught by the project rather than by the slicer.
 - **WHEN** a mesh with an edge used by other than two facets is checked
 - **THEN** verification fails and names the offending edge
 
-### Requirement: One connected region is one solid
+### Requirement: Pieces of one region overlap rather than touch
 
-A region of support or film that is connected SHALL be written as a single closed
-solid rather than as a collection of touching pieces. Fragmentation is what
-creates the shared edges, and a column split into hundreds of loose pieces is
-also weaker and slower to slice.
+Where a region is written as several solids, they SHALL overlap rather than abut.
+Two closed solids that touch share edges between four facets; two that
+interpenetrate share none, and every slicer unions overlapping solids as a matter
+of course -- it is already doing so with these.
+
+#### Scenario: Adjacent pieces interpenetrate
+
+- **WHEN** a region is written as more than one solid
+- **THEN** no facet of one is coincident with a facet of another
+- **AND** the overlap is far below the printer's resolution, so the geometry it
+  describes is unchanged
+
+### Requirement: A pillar is one solid
+
+A pillar occupying a connected region SHALL be written as a single closed solid,
+traced from the region's outline. Pillars are structural and visible: a column
+split into hundreds of loose pieces is weaker, slower to slice, and stair-steps
+where the socket curves.
+
+The film is exempt. Its regions are lattices of twenty-odd interlocking holes,
+and triangulating a two-thousand-point outline with that many holes defeated
+three attempts -- proper hole bridging, degenerate-ear handling, and reflex-only
+containment -- each leaving the caps partly uncovered. The film is sacrificial and
+peeled off, so it is written as overlapping pieces until that is worth another
+attempt.
 
 #### Scenario: A column is one solid
 
 - **WHEN** a pillar occupies a connected region across a plate's height
 - **THEN** that pillar is one closed solid in the output
+- **AND** its outline follows the region's boundary rather than a decomposition
+  into rectangles
