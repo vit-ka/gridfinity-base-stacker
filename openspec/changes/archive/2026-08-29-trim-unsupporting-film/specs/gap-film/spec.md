@@ -1,4 +1,4 @@
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: The film exists only where something rests on it
 
@@ -6,8 +6,10 @@ The film SHALL be generated only where it carries something: the downward face o
 the plate above, or a pillar standing at the level above. Film beneath an empty
 socket carries nothing and is printed, paid for, and thrown away.
 
-This narrows the previous behaviour, which generated film wherever there was
-something to rest on without regard to whether anything rested on it.
+This narrows the behaviour the film had before, which generated it wherever
+there was something to rest on without regard to whether anything rested on it.
+That behaviour was never written down as a requirement, so this adds one rather
+than modifying one.
 
 #### Scenario: Film under an empty socket is not generated
 
