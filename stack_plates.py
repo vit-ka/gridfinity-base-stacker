@@ -17,6 +17,7 @@ from pathlib import Path
 
 import gridfinity as gf
 from stl_io import (Bounds, Mesh, bounds_of, box, loft, read_stl, rotate_x180,
+                    signed_volume,
                     rotate_y180, split_shells, translate, write_stl)
 
 LAND, RIB = "land", "rib"
@@ -550,9 +551,9 @@ def grid_rects(rows: list[int], x0: float, y0: float, w: int, h: int,
     return tuple(out)
 
 
-def support_fillers(placements: tuple[Placement, ...], gap: float,
+def support_regions(placements: tuple[Placement, ...], gap: float,
                     grow: float = 0.4, step: float = 0.15,
-                    min_width: float = 0.42, slab: float = 0.4) -> Mesh:
+                    min_width: float = 0.42) -> tuple:
     """Blocks standing in wherever a plate has material and nothing beneath it.
 
     This asks the question directly rather than comparing footprints. Comparing
@@ -643,7 +644,7 @@ def support_fillers(placements: tuple[Placement, ...], gap: float,
     clear_r = float(max(1, math.ceil(gap / step + 0.5)))
     thin = max(1.0, min_width / 2 / step)
 
-    out: list = []
+    regions: dict[int, list[int]] = {}
     for i in range(1, len(placements)):
         # Not dilated. What needs carrying is where the plate actually has
         # material; growing this before the descent walks it off the plate edge
@@ -671,10 +672,76 @@ def support_fillers(placements: tuple[Placement, ...], gap: float,
             here = [x & ~bl & full for x, bl in zip(wide, blocked(j))]
             here = opened(here, thin, w, h)
 
-            lo, hi = placements[j].z0, placements[j].z1
-            for rx0, ry0, rx1, ry1 in grid_rects(here, x0, y0, w, h, step):
-                out.extend(box(rx0, ry0, lo, rx1, ry1, hi))
+            prev = regions.get(j)
+            regions[j] = (here if prev is None
+                          else [a | b for a, b in zip(prev, here)])
             need = still
+    return x0, y0, w, h, step, regions
+
+
+def support_fillers(placements: tuple[Placement, ...], gap: float,
+                    grow: float = 0.4, step: float = 0.15,
+                    min_width: float = 0.42) -> Mesh:
+    """The pillars themselves: one block per level a column passes through."""
+    x0, y0, w, h, step, regions = support_regions(placements, gap, grow, step,
+                                                  min_width)
+    out: list = []
+    for j, rows in regions.items():
+        lo, hi = placements[j].z0, placements[j].z1
+        for rx0, ry0, rx1, ry1 in grid_rects(rows, x0, y0, w, h, step):
+            out.extend(box(rx0, ry0, lo, rx1, ry1, hi))
+    return tuple(out)
+
+
+def interface_slabs(placements: tuple[Placement, ...], gap: float,
+                    layer: float = 0.2, grow: float = 0.4,
+                    step: float = 0.15, min_width: float = 0.42,
+                    flare: float = 0.2, clearance: float = 0.0) -> Mesh:
+    """The film filling each gap, as a solid printed in its own filament.
+
+    This is what the slicer used to make as support interface, made deliberately
+    instead. As part of the model it gets ordinary perimeters and solid infill,
+    so it comes out a continuous sheet rather than the stub-ridden lattice a
+    support pattern leaves -- and no support machinery is involved at all, so
+    there are no balconies to remove and nothing to post-process.
+
+    It carries the pillars as well as the plates. Pillars occupy the plates' own
+    z bands, so the same gaps fall between them, and an empty gap above a pillar
+    leaves its next segment standing on nothing.
+
+    Built a layer at a time, each stepping `flare` further out than the one
+    below, so the bottom layer matches exactly what it rests on and the stack
+    leans outward at 45 degrees -- 0.2 mm out for 0.2 mm up is precisely the
+    angle a printer bridges unaided. That widening is what lets a 0.3 mm rib of
+    pillar carry a bead more than a millimetre across.
+
+    `clearance` shrinks the film away from the plates above and below. Zero fills
+    the gap exactly and touches both, which is what the support interface already
+    did at a Z distance of zero: PETG does not bond to PLA, and that is the whole
+    separation mechanism.
+    """
+    x0, y0, w, h, step, regions = support_regions(placements, gap, grow, step,
+                                                  min_width)
+    meshes = {i: pl.placed_mesh() for i, pl in enumerate(placements)}
+    out: list = []
+    for j in range(len(placements) - 1):
+        lower, upper = placements[j], placements[j + 1]
+        # What the film rests on: the plate below, plus any pillar at that level.
+        base = face_grid(meshes[j], lower.z1 - SKIN, x0, y0, w, h, step)
+        r = regions.get(j)
+        if r is not None:
+            base = [a | b for a, b in zip(base, r)]
+        lo, hi = lower.z1 + clearance, upper.z0 - clearance
+        if hi - lo < 1e-9:
+            raise ValueError(f"clearance {clearance} mm leaves no room in a "
+                             f"{gap} mm gap")
+        n = max(1, int(round((hi - lo) / layer)))
+        for k in range(n):
+            zlo = lo + (hi - lo) * k / n
+            zhi = lo + (hi - lo) * (k + 1) / n
+            rows = dilate(base, k * flare / step, w, h) if k else base
+            for rx0, ry0, rx1, ry1 in grid_rects(rows, x0, y0, w, h, step):
+                out.extend(box(rx0, ry0, zlo, rx1, ry1, zhi))
     return tuple(out)
 
 
@@ -1359,6 +1426,14 @@ def main(argv: list[str] | None = None) -> int:
                          "(default 0.5, about two perimeters). A faithful "
                          "projection reproduces webs the slicer then drops as too "
                          "thin; much more than this doubles them")
+    ap.add_argument("--interface-part", action="store_true",
+                    help="also emit the gap film as its own solid, to be printed "
+                         "in the interface filament. With it the slicer needs no "
+                         "support at all: no blocker, no decoy, no post-processing")
+    ap.add_argument("--interface-clearance", type=float, default=0.0,
+                    help="shrink the film away from the plates it sits between, "
+                         "mm (default 0: it fills the gap and touches both, as "
+                         "the support interface already did at Z distance 0)")
     ap.add_argument("--decoy", action="store_true",
                     help="also emit a decoy column and a whole-model support "
                          "blocker: the column is supported so the slicer changes "
@@ -1421,6 +1496,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nwrote {stl_path}"
               + (f" (with {len(split_shells(fillers))} ledge filler blocks)"
                  if fillers else ""))
+
+        if args.interface_part:
+            ipath = out / f"{name}-interface.stl"
+            film = interface_slabs(placements, gap, args.layer_height,
+                                   args.filler_grow, args.filler_step,
+                                   clearance=args.interface_clearance)
+            write_stl(ipath, film, "gap film, printed in the interface filament")
+            print(f"wrote {ipath} ({len(film) // 12} blocks, "
+                  f"{signed_volume(film) / 1000:.1f} cm3)")
 
         plates_path = out / f"{name}.plates.json"
         plates_path.write_text(json.dumps(

@@ -54,6 +54,7 @@ HDR = ('<?xml version="1.0" encoding="UTF-8"?>\n'
 
 MODEL_XML = "3D/3dmodel.model"
 SETTINGS = "Metadata/model_settings.config"
+PROJECT = "Metadata/project_settings.config"
 
 
 def mesh_xml(mesh: Mesh, oid: int) -> str:
@@ -144,6 +145,12 @@ def main(argv=None) -> int:
                     help="the stack's plates.json; the decoy and blocker are "
                          "derived from it")
     ap.add_argument("--out", type=Path, required=True, help="3mf to write")
+    ap.add_argument("--interface", type=Path,
+                    help="the gap film STL, added as a part in its own filament. "
+                         "With it the plate needs no blocker and no decoy: the "
+                         "slicer generates no support at all")
+    ap.add_argument("--interface-extruder", type=int, default=5,
+                    help="filament slot for the film (default 5)")
     ap.add_argument("--decoy-size", type=float, default=7.0,
                     help="side of the decoy column, mm (default 7)")
     ap.add_argument("--blocker-margin", type=float, default=1.0)
@@ -165,6 +172,7 @@ def main(argv=None) -> int:
         stem = args.model.stem
     mb = bounds_of(model)
 
+    film = read_stl(args.interface) if args.interface else None
     decoy = decoy_column(doc["plates"], args.decoy_size)
     blocker = blocker_box(mb, args.blocker_margin)
     db = bounds_of(decoy)
@@ -197,7 +205,11 @@ def main(argv=None) -> int:
     dcx, dcy, dcz = (db.x0 + db.x1) / 2, (db.y0 + db.y1) / 2, (db.z0 + db.z1) / 2
 
     m_xml, m_faces = mesh_xml(centred(model, mcx, mcy, mcz), 1)
-    b_xml, b_faces = mesh_xml(centred(blocker, mcx, mcy, mcz), 2)
+    if film is not None:
+        # The film replaces the blocker: nothing to block, because support is off.
+        b_xml, b_faces = mesh_xml(centred(film, mcx, mcy, mcz), 2)
+    else:
+        b_xml, b_faces = mesh_xml(centred(blocker, mcx, mcy, mcz), 2)
     d_xml, d_faces = mesh_xml(centred(decoy, dcx, dcy, dcz), 4)
 
     obj_main = (HDR + ' <metadata name="BambuStudio:3mfVersion">1</metadata>\n'
@@ -226,15 +238,17 @@ def main(argv=None) -> int:
                  + comp("/3D/Objects/object_20.model", 1, "00140000-b206-40ff-9872-83e8017abed1")
                  + comp("/3D/Objects/object_20.model", 2, "00140001-b206-40ff-9872-83e8017abed1")
                  + '   </components>\n  </object>\n'
-                 + f'  <object id="{dec_id}" p:UUID="00000015-61cb-4c03-9d28-80fed5dfa1dc" type="model">\n   <components>\n'
-                 + comp("/3D/Objects/object_21.model", 4, "00150000-b206-40ff-9872-83e8017abed1")
-                 + '   </components>\n  </object>\n'
+                 + ('' if film is not None else
+                    f'  <object id="{dec_id}" p:UUID="00000015-61cb-4c03-9d28-80fed5dfa1dc" type="model">\n   <components>\n'
+                    + comp("/3D/Objects/object_21.model", 4, "00150000-b206-40ff-9872-83e8017abed1")
+                    + '   </components>\n  </object>\n')
                  + ' </resources>\n'
                  + ' <build p:UUID="2c7c17d8-22b5-4d84-8835-1976022ea369">\n'
                  + f'  <item objectid="{main_id}" p:UUID="00000003-b1ec-4553-aec9-835e5b724bb4" '
                    f'transform="1 0 0 0 1 0 0 0 1 {mx:.6f} {my:.6f} {mcz:.6f}" printable="1"/>\n'
-                 + f'  <item objectid="{dec_id}" p:UUID="00000005-b1ec-4553-aec9-835e5b724bb4" '
-                   f'transform="1 0 0 0 1 0 0 0 1 {dx:.6f} {dy:.6f} {dcz:.6f}" printable="1"/>\n'
+                 + ('' if film is not None else
+                    f'  <item objectid="{dec_id}" p:UUID="00000005-b1ec-4553-aec9-835e5b724bb4" '
+                    f'transform="1 0 0 0 1 0 0 0 1 {dx:.6f} {dy:.6f} {dcz:.6f}" printable="1"/>\n')
                  + ' </build>\n</model>\n')
 
     # Reuse the template's per-object extruder assignments verbatim: they are the
@@ -262,27 +276,40 @@ def main(argv=None) -> int:
                 f'degenerate_facets="0" facets_removed="0" facets_reversed="0" '
                 f'backwards_edges="0"/>\n    </part>\n')
 
+    second = (part(2, f"{stem}-interface.stl", "normal_part", b_faces,
+                   str(args.interface_extruder), mcz) if film is not None
+              else part(2, f"{stem}-noSupport.stl", "support_blocker", b_faces,
+                        "0", mcz))
+    decoy_block = ("" if film is not None else
+                   f'  <object id="{dec_id}">\n'
+                   f'    <metadata key="name" value="{stem}-decoy.stl"/>\n'
+                   f'    <metadata key="extruder" value="{e_dec}"/>\n'
+                   f'    <metadata face_count="{d_faces}"/>\n'
+                   + part(4, f"{stem}-decoy.stl", "normal_part", d_faces, None, dcz)
+                   + '  </object>\n')
+    decoy_inst = ("" if film is not None else
+                  f'    <model_instance>\n'
+                  f'      <metadata key="object_id" value="{dec_id}"/>\n'
+                  f'      <metadata key="instance_id" value="0"/>\n'
+                  f'    </model_instance>\n')
+
     new_set = ('<?xml version="1.0" encoding="UTF-8"?>\n<config>\n'
-               + f'  <object id="{dec_id}">\n'
-               + f'    <metadata key="name" value="{stem}-decoy.stl"/>\n'
-               + f'    <metadata key="extruder" value="{e_dec}"/>\n'
-               + f'    <metadata face_count="{d_faces}"/>\n'
-               + part(4, f"{stem}-decoy.stl", "normal_part", d_faces, None, dcz)
-               + '  </object>\n'
+               + decoy_block
                + f'  <object id="{main_id}">\n'
                + f'    <metadata key="name" value="{stem}.stl"/>\n'
                + f'    <metadata key="extruder" value="{e_main}"/>\n'
                + f'    <metadata face_count="{m_faces}"/>\n'
                + part(1, f"{stem}.stl", "normal_part", m_faces, None, mcz)
-               + part(2, f"{stem}-noSupport.stl", "support_blocker", b_faces, "0", mcz)
+               + second
                + '  </object>\n'
                + '  <plate>\n    <metadata key="plater_id" value="1"/>\n'
                + '    <metadata key="plater_name" value=""/>\n'
                + '    <metadata key="locked" value="false"/>\n'
-               + f'    <model_instance>\n      <metadata key="object_id" value="{main_id}"/>\n'
-                 f'      <metadata key="instance_id" value="0"/>\n    </model_instance>\n'
-               + f'    <model_instance>\n      <metadata key="object_id" value="{dec_id}"/>\n'
-                 f'      <metadata key="instance_id" value="0"/>\n    </model_instance>\n'
+               + f'    <model_instance>\n'
+                 f'      <metadata key="object_id" value="{main_id}"/>\n'
+                 f'      <metadata key="instance_id" value="0"/>\n'
+                 f'    </model_instance>\n'
+               + decoy_inst
                + '  </plate>\n</config>\n')
 
     replace = {
@@ -291,6 +318,13 @@ def main(argv=None) -> int:
         "3D/Objects/object_20.model": obj_main.encode(),
         "3D/Objects/object_21.model": obj_dec.encode(),
     }
+    if film is not None:
+        # Nothing left for the slicer to support: every overhang is carried by a
+        # pillar and every gap is filled by the film, both of them model parts.
+        cfg = json.loads(next(d for i, d in entries
+                              if i.filename == PROJECT))
+        cfg["enable_support"] = "0"
+        replace[PROJECT] = json.dumps(cfg, indent=4).encode()
     # Thumbnails and plate_1.json describe the template's geometry, not ours.
     # Bambu regenerates them on slice; leaving stale ones in is only cosmetic,
     # but plate_1.json carries bounding boxes that would be wrong.
@@ -307,11 +341,16 @@ def main(argv=None) -> int:
     print(f"  model    {stem}  {m_faces} facets, "
           f"{mb.width:.1f} x {mb.depth:.1f} x {mb.height:.1f} mm  "
           f"at ({mx:.1f}, {my:.1f}), extruder {e_main}")
-    print(f"  blocker  whole-stack box, {b_faces} facets, support_blocker part")
-    print(f"  decoy    {args.decoy_size:g} mm square, {len(doc['plates'])} slabs, "
-          f"at ({dx:.1f}, {dy:.1f}), extruder {e_dec}")
-    print("  gap layers the decoy forces a filament change at: "
-          + ", ".join(f"{p['z0']:.2f}" for p in doc["plates"][1:]))
+    if film is not None:
+        print(f"  film     {args.interface.name}  {b_faces} facets, "
+              f"extruder {args.interface_extruder}, support disabled")
+    else:
+        print(f"  blocker  whole-stack box, {b_faces} facets, support_blocker part")
+        print(f"  decoy    {args.decoy_size:g} mm square, "
+              f"{len(doc['plates'])} slabs, at ({dx:.1f}, {dy:.1f}), "
+              f"extruder {e_dec}")
+        print("  gap layers the decoy forces a filament change at: "
+              + ", ".join(f"{p['z0']:.2f}" for p in doc["plates"][1:]))
     return 0
 
 
