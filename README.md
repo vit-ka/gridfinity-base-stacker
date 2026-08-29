@@ -130,6 +130,67 @@ at every turn. Measured across all interfaces of a nine-plate stack: 6,214
 separate extrusion paths against 38,686, and 4 g less material. Leave
 `support_interface_loop_pattern` off.
 
+## Printing it: the 3mf
+
+The interface is a second filament, and the slicer only changes filament for
+something it knows about. So the plate carries three things, and `make3mf.py`
+assembles them:
+
+```
+python3 make3mf.py --template templates/stack-template.3mf \
+    --model out/NAME.stl --plates out/NAME.plates.json --out out/NAME.3mf
+```
+
+- **the stack**, in the object filament
+- **a support blocker** over the whole stack, so the slicer generates nothing on
+  it -- every gap gets its interface from us instead
+- **a decoy column** beside it, with the stack's exact z profile. It exists to be
+  supported: the slicer fills its gaps with interface, which is what puts the
+  interface filament in the nozzle at each of the stack's gap layers.
+
+The decoy and blocker are derived from `plates.json`, so they cannot drift from
+the stack they belong to. Everything else -- plate layout, wipe tower position,
+per-object filament assignments, all 581 settings keys -- comes from the template
+verbatim, so a different stack never means re-arranging the plate by hand.
+
+`templates/stack-template.3mf` ships a placeholder block where the stack goes,
+sized to the space a stack gets, so no one's model lives in this repository. Save
+your own from Bambu Studio with File > Save Project As and point `--template` at
+it to change the layout or the filaments.
+
+Verified on the nine-plate drawer stack: 0.0 mm of slicer support anywhere on the
+model, and PETG present at all 8 gap layers.
+
+**One trap.** Bambu refuses to slice a 3mf whose `3D/3dmodel.model` is missing the
+`<metadata>` block after the `<model>` element -- it fails with a bare "slicing or
+export error" naming nothing. An otherwise byte-identical file carrying only
+`3mfVersion` fails; restoring the block fixes it. `make3mf.py` copies the
+template's header verbatim for this reason.
+
+## Removing the balconies
+
+The support ribbon along the socket walls is the one defect no setting reaches
+(ADR 0003 has the source and the measurements). `postprocess.py` deletes it from
+the sliced G-code, where the slicer gets no vote. Install it into the project once:
+
+```
+python3 postprocess.py out/NAME.plates.json --install PROJECT.3mf
+```
+
+That writes the script's own source, plus the plate boxes, into the project's
+`post_process` setting as a single self-contained command -- so the 3mf carries
+everything, nothing has to remain on disk, and no path points anywhere
+machine-specific. Re-run it whenever the stack is regenerated. `--embed` prints
+the same line for pasting by hand, and passing a `.gcode` path instead runs it
+directly on an exported file.
+
+It strips support inside each plate's own footprint and height, which is exactly
+the balconies; the ledge columns stand outside those footprints and survive, and
+`Support interface` is never touched. On the nine-plate drawer stack: 26,329 moves, about
+6 g, in 1.3 s, with the interface measurably unchanged. It refuses to run if the
+plate heights do not match the sliced object, which is what a stale `plates.json`
+looks like. See ADR 0004.
+
 ## Reusing the slicer settings
 
 The settings that matter are in `settings/`, distilled to the twelve that this

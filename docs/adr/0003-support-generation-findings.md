@@ -131,6 +131,32 @@ exactly this arrangement.
 Leave `support_interface_loop_pattern` off: it nearly doubled the path count on
 concentric, and the slice failed outright with interlaced.
 
+**`rectilinear_interlaced` crashes the slicer at two interface layers.** Isolated:
+one interface layer slices fine, two exits 133 (SIGTRAP) straight after config
+init, with nothing in the log. Interlacing offsets alternate layers, so with a
+single layer there is nothing to interlace and the bug never fires. This matters
+because the 0.4 mm gap exists precisely to get two layers, so the Bambu default
+pattern cannot be used with it.
+
+Concentric is also the right pattern for the teeth -- the fringe of interface
+overhanging the rib, which prints as unsupported stubs and is where a one-layer
+film tears. Counting interface extrusion runs shorter than 2 mm on the nine-plate
+stack at a 0.4 mm gap:
+
+| interface pattern | paths | stubs < 2 mm | longest run |
+|---|---|---|---|
+| concentric | 2274 | **5** (0.2%) | 1420 mm |
+| rectilinear | 1266 | 65 (5.1%) | 8214 mm |
+| rectilinear_interlaced | crash | -- | -- |
+
+Concentric absorbs each tooth into a loop around the whole region instead of
+leaving it as an isolated stub, despite tracing more paths overall.
+
+`support_base_pattern_spacing` does not reach the teeth, and reducing it makes
+things worse -- balcony 7.6 g at 2.5, 8.7 g at 1.5, 12.5 g at 0.5, with interface
+time identical at 38.6 m throughout. The interface region's shape does not depend
+on it.
+
 ## Ruled out, with evidence
 
 - **Support blockers.** `blocker` appears once in 3308 lines, subtracting from

@@ -9,6 +9,7 @@ socket funnels never fill with support.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 from dataclasses import dataclass
@@ -729,6 +730,70 @@ def make_blockers(placements: tuple[Placement, ...], gap: float,
     return match_bbox(tuple(mesh), b)
 
 
+def decoy_column(placements: tuple[Placement, ...], size: float = 15.0) -> Mesh:
+    """A miniature of the stack's z profile, to stand beside it on the plate.
+
+    The real stack has all of its support blocked, because we lay the interface
+    down ourselves. But the interface is a second filament, and the slicer only
+    changes filament for something it knows about -- so this column exists purely
+    to be supported. Its slabs sit at exactly the stack's plate heights, so the
+    gaps the slicer fills fall on exactly the stack's gap layers, and the
+    interface material is in the nozzle at the moment we need it.
+
+    Flat, fully-overhanging faces at every level: nothing subtle for overhang
+    detection to decide, and far too big for remove-small-overhang to discard.
+    """
+    h = size / 2
+    return tuple(f for pl in placements
+                 for f in box(-h, -h, pl.z0, h, h, pl.z1))
+
+
+def full_blocker(placements: tuple[Placement, ...], margin: float = 1.0) -> Mesh:
+    """One box over the whole stack: no slicer support on the model at all.
+
+    A single slab covering everything is the one blocker arrangement measured to
+    work exactly as documented (ADR 0003) -- per-plate slabs and traced socket
+    profiles both leaked. Here we want the blunt version: nothing generated
+    anywhere, because every gap gets its interface from us instead.
+    """
+    b = bounds_of(tuple(f for pl in placements for f in pl.placed_mesh()))
+    return box(b.x0 - margin, b.y0 - margin, b.z0 - margin,
+               b.x1 + margin, b.y1 + margin, b.z1 + margin)
+
+
+def plates_json(placements: tuple[Placement, ...], mesh: Mesh, gap: float,
+                layer_height: float) -> dict:
+    """Where every plate ended up, for the G-code post-processor.
+
+    A balcony is support inside a plate's own footprint within its own height.
+    Legitimate support at those same heights -- the column under a plate that
+    overhangs from above -- is *outside* that footprint. So one box per plate is
+    the whole discriminator, and it is the same reasoning make_blockers uses,
+    just applied where the slicer does not get a vote.
+
+    The overall bbox is the mesh as written, fillers included: postprocess.py
+    matches it against the sliced outer walls to recover where the slicer put
+    the object on the bed, so it has to describe the same solid.
+    """
+    b = bounds_of(mesh)
+    return {
+        "version": 1,
+        "gap_mm": round(gap, 4),
+        "layer_height": round(layer_height, 4),
+        "bbox": {k: round(getattr(b, k), 4)
+                 for k in ("x0", "x1", "y0", "y1", "z0", "z1")},
+        "plates": [
+            {"index": i,
+             "size": f"{pb.width:.0f}x{pb.depth:.0f}",
+             "flipped": pl.flipped,
+             **{k: round(getattr(pb, k), 4)
+                for k in ("x0", "x1", "y0", "y1", "z0", "z1")}}
+            for i, pl in enumerate(placements, 1)
+            for pb in (bounds_of(pl.placed_mesh()),)
+        ],
+    }
+
+
 def registration_error(lower: Placement, upper: Placement) -> tuple[float, float]:
     """How far the two lattices sit apart, in mm, per axis (0 = perfect)."""
     pitch = lower.lattice.pitch
@@ -906,6 +971,42 @@ socket taper at **{angle:.1f} degrees** from horizontal.
   six-plate stack. Left alone, it is loose in an open cell and falls out.
 - Do **not** enable "independent support layer height".
 
+## Removing the balconies (optional)
+
+That ribbon of support along the socket walls is the one thing no setting reaches.
+It is the downward projection of interface that overhangs the rib it lands on --
+contacts snap to a grid of about 2.9 mm, the land under them is {land:.2f} mm --
+and the descent in SupportMaterial.cpp is unconditional. Every setting that looks
+like it should stop it was measured and does not: blockers, enforcers, threshold
+angle, remove-small-overhangs, base pattern spacing, grid alignment, tree support,
+and OrcaSlicer. Pushing support/object XY distance high does clear it, but takes
+the legitimate support under the ledges with it.
+
+So delete the toolpaths after slicing instead, where the slicer gets no vote.
+Install it into the saved project once, and the 3mf carries it from then on:
+
+```
+{postprocess} --install PROJECT.3mf
+```
+
+This writes the script itself into the project's post-processing setting, so
+nothing has to stay on disk and no path points anywhere machine-specific -- the
+3mf keeps working when it is moved or shared. Re-run it whenever the stack is
+regenerated, since the plate positions are baked into what it writes.
+
+To check the result, export the G-code and open it; Bambu Studio reads `.gcode`
+directly. The preview before export still shows the balconies, because
+post-processing runs at export.
+
+It strips support extrusions inside each plate's own footprint and height, which
+is exactly the balconies -- the ledge columns stand *outside* those footprints and
+survive, and `Support interface` is never touched. It is safe because Bambu emits
+M83: extrusion is relative, so dropping an E word changes nothing downstream.
+
+It refuses rather than guesses: if the object on the bed does not match the stack
+this `plates.json` describes -- rotated, rescaled, or simply a different model --
+it exits without touching the file.
+
 ## After printing
 
 The stack comes off as one block. Slide a thin blade into each gap and twist.
@@ -999,9 +1100,21 @@ def gap_advice(gap: float, layer: float, petg: bool) -> str:
     return tmpl.format(gap=gap, layer=layer, n=n)
 
 
+def stable_python() -> str:
+    """An absolute interpreter path that will still be there next month.
+
+    The line goes in a slicer settings box and is not regenerated when the box is
+    not, so a versioned Homebrew path (.../python@3.14/bin/python3.14) is the
+    wrong thing to write down: an upgrade moves it. /usr/bin/python3 does not
+    move, and postprocess.py is stdlib-only and runs on the 3.9 that ships there.
+    """
+    system = Path("/usr/bin/python3")
+    return str(system) if system.exists() else sys.executable
+
+
 def write_printing_notes(path: Path, placements, gap, layer, report_text,
                          stl_name, blocker_name, source, interface="same",
-                         blockers=False) -> None:
+                         blockers=False, plates_path: Path | None = None) -> None:
     lat = placements[0].lattice
     plate = placements[0].plate
     rib = lat.pitch - lat.bottom_opening
@@ -1022,6 +1135,11 @@ def write_printing_notes(path: Path, placements, gap, layer, report_text,
         iface=iface_layers(gap, layer, petg),
         ifacewhy=("every interface layer is solid; at this gap there is only room "
                   "for what is listed"),
+        postprocess=(f"{stable_python()} "
+                     f"{Path(__file__).resolve().parent / 'postprocess.py'} "
+                     f"{plates_path.resolve()}" if plates_path else
+                     "/abs/path/python3 /abs/path/postprocess.py "
+                     "/abs/path/NAME.plates.json"),
     ))
 
 
@@ -1059,6 +1177,13 @@ def main(argv: list[str] | None = None) -> int:
                          "(default 0.5, about two perimeters). A faithful "
                          "projection reproduces webs the slicer then drops as too "
                          "thin; much more than this doubles them")
+    ap.add_argument("--decoy", action="store_true",
+                    help="also emit a decoy column and a whole-model support "
+                         "blocker: the column is supported so the slicer changes "
+                         "to the interface filament at each gap layer, the "
+                         "blocker keeps that support off the stack itself")
+    ap.add_argument("--decoy-size", type=float, default=15.0,
+                    help="side of the decoy column, mm (default 15)")
     ap.add_argument("--split", action="store_true",
                     help="emit several stacks, each one in which every plate rests "
                          "fully on the one below. Avoids the tall thin support wall "
@@ -1115,6 +1240,12 @@ def main(argv: list[str] | None = None) -> int:
               + (f" (with {len(split_shells(fillers))} ledge filler blocks)"
                  if fillers else ""))
 
+        plates_path = out / f"{name}.plates.json"
+        plates_path.write_text(json.dumps(
+            plates_json(placements, body + fillers, gap, args.layer_height),
+            indent=2) + "\n")
+        print(f"wrote {plates_path}")
+
         blocker_path = out / f"{name}-blockers.stl"
         if args.blockers:
             blockers = make_blockers(placements, gap, args.layer_height)
@@ -1127,10 +1258,23 @@ def main(argv: list[str] | None = None) -> int:
                       "support enforcer")
             print(f"wrote {enf}")
 
+        if args.decoy:
+            dpath = out / f"{name}-decoy.stl"
+            write_stl(dpath, decoy_column(placements, args.decoy_size),
+                      "decoy column, supported so the filament changes")
+            bpath = out / f"{name}-noSupport.stl"
+            write_stl(bpath, full_blocker(placements), "whole-model support blocker")
+            print(f"wrote {dpath} ({args.decoy_size:g} mm square, "
+                  f"{len(placements)} slabs)")
+            print(f"wrote {bpath} (load as a support blocker on the stack)")
+            print("  gap layers the decoy forces a filament change at: "
+                  + ", ".join(f"{pl.z0:.2f}" for pl in placements[1:]))
+
         notes = out / f"{name}-PRINTING.md"
         write_printing_notes(notes, placements, gap, args.layer_height, report_text,
                              stl_path.name, blocker_path.name, args.stl.name,
-                             interface=args.interface, blockers=args.blockers)
+                             interface=args.interface, blockers=args.blockers,
+                             plates_path=plates_path)
         print(f"wrote {notes}")
     return 0
 

@@ -1,6 +1,6 @@
 {
-  "_comment": "Support settings for a stacked Gridfinity baseplate printed with a non-bonding interface filament (PETG). Pairs with a 0.4 mm gap stack: two interface layers, so the film peels off in one piece instead of tearing, which one layer tends to do.",
-  "_gap_mm": 0.4,
+  "_comment": "Support settings for a stacked Gridfinity baseplate printed with a non-bonding interface filament (PETG). Pairs with a 0.2 mm gap: one interface layer. The film is then a single layer and tends to tear at the teeth -- the fringe of interface overhanging the rib, which prints as unsupported stubs. A 0.4 mm gap with two layers survives peeling but costs about 25 min. Pattern must stay concentric: it leaves 5 sub-2mm stubs where rectilinear leaves 65, and rectilinear_interlaced crashes the slicer outright at two interface layers. XY distance is the Bambu default 0.35, not the 0.8 measured earlier: 0.8 detaches the balconies from the socket walls, and a loose ribbon in an open cell makes more mess than an attached one. Once balconies are stripped from the G-code (ADR 0004), that trade goes away and 0.8 is worth revisiting.",
+  "_gap_mm": 0.2,
   "enable_support": "1",
   "support_type": "normal(auto)",
   "support_style": "snug",
@@ -11,7 +11,7 @@
   "support_interface_top_layers": "1",
   "support_interface_bottom_layers": "1",
   "support_interface_spacing": "0",
-  "support_object_xy_distance": "0.8",
+  "support_object_xy_distance": "0.35",
   "support_expansion": "-0.25",
-  "support_interface_pattern": "rectilinear_interlaced"
+  "support_interface_pattern": "concentric"
 }
