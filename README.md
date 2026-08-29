@@ -130,6 +130,19 @@ at every turn. Measured across all interfaces of a nine-plate stack: 6,214
 separate extrusion paths against 38,686, and 4 g less material. Leave
 `support_interface_loop_pattern` off.
 
+## Support pillars
+
+Nothing the slicer generates lands on the model, so every overhang has to be
+carried by geometry we put there. `support_fillers` rasterises each plate's
+downward face against what lies beneath it and raises a block wherever material
+has nothing under it, walking down level by level until something solid appears.
+
+This is not the same as finding ledges. A plate hanging past the edge of the one
+below is the easy case; the one that bites is a narrower plate whose solid border
+lands over a wider plate's socket opening, which happens whenever two plates have
+different cell counts. Those shafts are through-holes, so that border can need
+carrying all the way to the bed. See ADR 0005.
+
 ## Printing it: the 3mf
 
 The interface is a second filament, and the slicer only changes filament for

@@ -1,7 +1,7 @@
 # 2. Fill ledge voids with loose blocks copied from the plate above
 
 Date: 2026-08-27
-Status: Accepted
+Status: Superseded by [0005](0005-support-what-has-nothing-under-it.md)
 
 ## Context
 

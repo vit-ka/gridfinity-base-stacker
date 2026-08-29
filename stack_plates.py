@@ -410,6 +410,151 @@ def ledge_regions(placements: tuple[Placement, ...], gap: float
     return tuple(out)
 
 
+def face_grid(mesh: Mesh, z: float, x0: float, y0: float, w: int, h: int,
+              step: float) -> list[bytearray]:
+    """Occupancy of a horizontal slice, one row of cells per Y sample.
+
+    Crossings along a +X ray alternate entering and leaving material, so the
+    solid stretches are the even-indexed pairs and each one can be filled as a
+    slice of the row. Testing every cell against every crossing instead is what
+    the ledge code used to do, and it is quadratic in the sampling resolution
+    for no gain.
+    """
+    rows = [bytearray(w) for _ in range(h)]
+    for iy in range(h):
+        cr = gf._ray_crossings(mesh, y0 + (iy + 0.5) * step, z)
+        row = rows[iy]
+        for k in range(0, len(cr) - 1, 2):
+            a = max(0, int(math.floor((cr[k] - x0) / step - 0.5)) + 1)
+            b = min(w, int(math.ceil((cr[k + 1] - x0) / step - 0.5)))
+            if b > a:
+                row[a:b] = b"\x01" * (b - a)
+    return rows
+
+
+def disc(radius_cells: float) -> tuple[tuple[int, int], ...]:
+    """Offsets within a disc. A square would square off the socket's round corners."""
+    r = int(math.ceil(radius_cells - 1e-9))
+    return tuple((dx, dy) for dx in range(-r, r + 1) for dy in range(-r, r + 1)
+                 if dx * dx + dy * dy <= radius_cells * radius_cells)
+
+
+def dilate(rows: list[bytearray], radius_cells: float, w: int, h: int
+           ) -> list[bytearray]:
+    if radius_cells < 1e-9:
+        return rows
+    off = disc(radius_cells)
+    out = [bytearray(w) for _ in range(h)]
+    for iy in range(h):
+        row = rows[iy]
+        for ix in range(w):
+            if not row[ix]:
+                continue
+            for dx, dy in off:
+                ny, nx = iy + dy, ix + dx
+                if 0 <= ny < h and 0 <= nx < w:
+                    out[ny][nx] = 1
+    return out
+
+
+def grid_rects(rows: list[bytearray], x0: float, y0: float, w: int, h: int,
+               step: float) -> tuple[tuple[float, float, float, float], ...]:
+    """Maximal horizontal runs, merged across rows that share one."""
+    out = []
+    open_runs: dict[tuple[int, int], list[int]] = {}
+    for iy in range(h):
+        row = rows[iy]
+        runs, start = [], None
+        for ix in range(w):
+            if row[ix] and start is None:
+                start = ix
+            elif not row[ix] and start is not None:
+                runs.append((start, ix)); start = None
+        if start is not None:
+            runs.append((start, w))
+        seen = set(runs)
+        for run in runs:
+            if run in open_runs:
+                open_runs[run][1] = iy + 1
+            else:
+                open_runs[run] = [iy, iy + 1]
+        for run in [k for k in open_runs if k not in seen]:
+            a, b = open_runs.pop(run)
+            out.append((x0 + run[0] * step, y0 + a * step,
+                        x0 + run[1] * step, y0 + b * step))
+    for run, (a, b) in open_runs.items():
+        out.append((x0 + run[0] * step, y0 + a * step,
+                    x0 + run[1] * step, y0 + b * step))
+    return tuple(out)
+
+
+def support_fillers(placements: tuple[Placement, ...], gap: float,
+                    grow: float = 0.0, step: float = 0.3) -> Mesh:
+    """Blocks standing in wherever a plate has material and nothing beneath it.
+
+    This asks the question directly rather than comparing footprints. Comparing
+    footprints only finds a plate hanging past the edge of the one below, and
+    misses the case that actually bites: a plate whose solid border lands over a
+    lower plate's socket opening. Plates in a set have different cell counts, so
+    once the lattices are registered a narrower plate's frame can sit squarely
+    over a wider plate's shaft -- and since those shafts are through-holes, that
+    material may have nothing under it the whole way to the bed.
+
+    It matters more than it used to. While the slicer still generated support it
+    quietly caught these; with the whole model under a blocker (see make3mf.py)
+    nothing does.
+
+    Each level is checked in turn going down, so a block is emitted at every
+    level a column has to pass through, and the descent stops as soon as
+    something solid appears underneath.
+    """
+    meshes = {i: pl.placed_mesh() for i, pl in enumerate(placements)}
+    b = bounds_of(tuple(f for m in meshes.values() for f in m))
+    x0, y0 = b.x0, b.y0
+    w = max(1, int(round(b.width / step)))
+    h = max(1, int(round(b.depth / step)))
+
+    # A plate blocks a filler anywhere it has material at that level, and the
+    # socket tapers, so both faces are taken: the narrower opening wins.
+    solid_at: dict[int, list[bytearray]] = {}
+    def material(i: int) -> list[bytearray]:
+        if i not in solid_at:
+            pl, m = placements[i], meshes[i]
+            up = face_grid(m, pl.z1 - SKIN, x0, y0, w, h, step)
+            dn = face_grid(m, pl.z0 + SKIN, x0, y0, w, h, step)
+            solid_at[i] = [bytearray(a | c for a, c in zip(r1, r2))
+                           for r1, r2 in zip(up, dn)]
+        return solid_at[i]
+
+    tops: dict[int, list[bytearray]] = {}
+    def top(i: int) -> list[bytearray]:
+        if i not in tops:
+            tops[i] = face_grid(meshes[i], placements[i].z1 - SKIN,
+                                x0, y0, w, h, step)
+        return tops[i]
+
+    out: list = []
+    for i in range(1, len(placements)):
+        # Not dilated. Growing the region outward was right when it was a ledge
+        # projection whose thinnest webs the slicer would drop, but here it walks
+        # the region off the edge of the plate and a millimetre into every shaft,
+        # putting blocks in mid-air where nothing is overhead. What needs
+        # carrying is where the plate actually has material.
+        need = face_grid(meshes[i], placements[i].z0 + SKIN, x0, y0, w, h, step)
+        for j in range(i - 1, -1, -1):
+            supported = top(j)
+            blocked = dilate(material(j), gap / step, w, h)
+            still = [bytearray(n & ~s & ~bl for n, s, bl in zip(rn, rs, rb))
+                     for rn, rs, rb in zip(need, supported, blocked)]
+            if not any(any(r) for r in still):
+                break
+            lo, hi = placements[j].z0, placements[j].z1
+            for rx0, ry0, rx1, ry1 in grid_rects(still, x0, y0, w, h, step):
+                out.extend(box(rx0, ry0, lo, rx1, ry1, hi))
+            need = still
+    return tuple(out)
+
+
 def solid_spans(pl: Placement, x0: float, y0: float, x1: float, y1: float,
                 step: float = 0.15, grow: float = 0.5
                 ) -> tuple[tuple[float, float, float, float], ...]:
@@ -1168,7 +1313,7 @@ def main(argv: list[str] | None = None) -> int:
                          "plate profiles this tool has not seen")
     ap.add_argument("--no-fillers", action="store_true",
                     help="omit the loose blocks that stand in under a ledge")
-    ap.add_argument("--filler-step", type=float, default=0.15,
+    ap.add_argument("--filler-step", type=float, default=0.3,
                     help="resolution the filler outline is traced at, mm. Finer is "
                          "smoother and slower (default 0.15, below what a 0.4 mm "
                          "nozzle can render)")
@@ -1231,8 +1376,8 @@ def main(argv: list[str] | None = None) -> int:
         out = args.out_dir
         body = tuple(f for pl in placements for f in pl.placed_mesh())
         fillers = (() if args.no_fillers
-                   else ledge_fillers(placements, gap, args.filler_grow,
-                                      args.filler_step))
+                   else support_fillers(placements, gap, args.filler_grow,
+                                        args.filler_step))
         stl_path = out / f"{name}.stl"
         write_stl(stl_path, body + fillers,
                   f"gridfinity stack of {len(placements)} plates")
