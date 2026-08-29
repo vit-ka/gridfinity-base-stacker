@@ -941,6 +941,89 @@ class TestFilmRegions(unittest.TestCase):
         self.assertLessEqual(sum(on.values()), sum(off.values()))
 
 
+class TestFilmTrim(unittest.TestCase):
+    """Film is generated where it can rest on something; the trim asks the other
+    question -- whether anything rests on it."""
+
+    def stack(self):
+        plates = tuple(sp.build_plate(perforated_plate(w, d))
+                       for w, d in ((5, 4), (5, 3), (4, 4), (4, 3)))
+        return sp.plan(plates, 0.6, flip=True, register=True)
+
+    def boxes(self, mesh):
+        return [stl_io.bounds_of(mesh[i:i + 12]) for i in range(0, len(mesh), 12)]
+
+    def test_the_trim_removes_something(self):
+        pl = self.stack()
+        full = stl_io.signed_volume(sp.interface_slabs(pl, 0.6, trim=False))
+        cut = stl_io.signed_volume(sp.interface_slabs(pl, 0.6, trim=True))
+        self.assertLess(cut, full, "the trim removed nothing at all")
+
+    def test_film_carrying_only_a_pillar_is_kept(self):
+        """The dangerous case. Film under a pillar has no plate material
+        overhead, so a trim against the plate alone would delete exactly it and
+        strand the pillar's next segment in mid-air."""
+        pl = self.stack()
+        film = self.boxes(sp.interface_slabs(pl, 0.6))
+        pillars = self.boxes(sp.support_fillers(pl, 0.6))
+        for col in pillars:
+            rests_on_plate = any(abs(p.z1 - col.z0) < 1e-6 for p in pl)
+            if rests_on_plate:
+                continue
+            under = [f for f in film if f.z1 <= col.z0 + 1e-6
+                     and f.x1 > col.x0 and f.x0 < col.x1
+                     and f.y1 > col.y0 and f.y0 < col.y1]
+            self.assertTrue(under, "a pillar segment lost the film beneath it")
+
+    def test_every_pillar_segment_still_has_something_under_it(self):
+        pl = self.stack()
+        film = self.boxes(sp.interface_slabs(pl, 0.6))
+        for col in self.boxes(sp.support_fillers(pl, 0.6)):
+            on_plate = any(abs(p.z1 - col.z0) < 1e-6 for p in pl)
+            on_film = any(abs(f.z1 - col.z0) < 0.2 and f.x1 > col.x0
+                          and f.x0 < col.x1 and f.y1 > col.y0 and f.y0 < col.y1
+                          for f in film)
+            self.assertTrue(on_plate or on_film,
+                            "a pillar segment has neither plate nor film beneath it")
+
+    def test_film_under_an_empty_socket_is_dropped(self):
+        """Asserted with bridging off, so the trim is what is being measured --
+        a bridge span deliberately carries nothing, so it would mask this."""
+        pl = self.stack()
+        x0, y0, w, h, step, regions, extent = sp.support_regions(pl, 0.6, grow=0.5,
+                                                                 margin=8.0)
+        meshes = {i: p.placed_mesh() for i, p in enumerate(pl)}
+        mesh = sp.interface_slabs(pl, 0.6, grow=0.5, bridge_span=0.0)
+        boxes = self.boxes(mesh)
+        dropped = 0
+        for j in range(len(pl) - 1):
+            must = sp.face_grid(meshes[j + 1], pl[j + 1].z0 + sp.SKIN,
+                                x0, y0, w, h, step)
+            above = regions.get(j + 1)
+            if above is not None:
+                must = [a | b for a, b in zip(must, above)]
+            lo = pl[j].z1
+            for b in (x for x in boxes if lo < (x.z0 + x.z1) / 2 < pl[j + 1].z0):
+                cx = int(((b.x0 + b.x1) / 2 - x0) / step)
+                cy = int(((b.y0 + b.y1) / 2 - y0) / step)
+                if 0 <= cy < h and 0 <= cx < w and not (must[cy] >> cx) & 1:
+                    dropped += 1
+        # The flare widens each layer past what it carries, so the top layer
+        # legitimately overhangs; the bottom layer is the one the trim governs.
+        self.assertLess(dropped, len(boxes) // 2,
+                        "film remains over regions that carry nothing")
+
+    def test_the_trim_does_not_delete_bridges(self):
+        """Ordering: trim first, bridge last. Reversed, the trim deletes every
+        bridge -- a bridge span carries nothing by construction."""
+        pl = self.stack()
+        gaps = [(round(a.z1, 2), round(b.z0, 2)) for a, b in zip(pl, pl[1:])]
+        untrimmed = verify.film_regions(sp.interface_slabs(pl, 0.6, trim=False), gaps)
+        trimmed = verify.film_regions(sp.interface_slabs(pl, 0.6, trim=True), gaps)
+        self.assertEqual(trimmed, untrimmed,
+                         "the trim changed the film's connectivity")
+
+
 class TestManifold(unittest.TestCase):
     """Every edge shared by exactly two facets.
 
