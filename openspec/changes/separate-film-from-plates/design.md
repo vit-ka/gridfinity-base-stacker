@@ -31,9 +31,23 @@ rejected because the tearing it causes is documented and visible; the alternativ
 of 0.05 mm clearance was rejected for now because nothing has measured whether it
 is enough, and guessing at the number that just failed is how this bug arrived.
 
-**Cost is accepted explicitly.** Eight gaps at +0.2 mm is 1.6 mm of height and
-eight further layers of print time on the nine-plate drawer stack. Worth stating
-in the printing notes rather than discovering from the slicer.
+**Cost is accepted explicitly, and it is larger than it first looked.** Measured
+on the nine-plate drawer stack: 39.2 mm and 7.39 h before, 40.8 mm and 10.42 h
+after.
+
+Three hours, not the eight layers this design first estimated. The estimate was
+wrong because the 7.39 h baseline was itself measured on a slice where the film
+was partly merged into the plates -- the very defect being fixed -- so a good deal
+of the film was never being printed. Interface filament on the model goes from
+6,940 mm to 10,011 mm, and that increase is the film appearing, not the film
+growing. No earlier timing taken against a zero-clearance film is a valid
+comparison.
+
+**Layer alignment is not worth chasing.** Offset by 0.1 mm from the layer grid,
+the film falls across three printed layers rather than two. Aligning it -- a
+0.8 mm gap with 0.2 mm of clearance, so the film sits exactly on two layer
+boundaries -- was measured and is worse on both counts: 42.4 mm and 12.52 h, for
+the same 9,915 mm of filament. The offset costs nothing that alignment recovers.
 
 **Clearance stays a parameter with zero permitted.** Zero was the previous
 default and is a legitimate configuration; the generator should not refuse it.

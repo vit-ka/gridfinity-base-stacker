@@ -722,5 +722,91 @@ class TestCli(unittest.TestCase):
             self.assertAlmostEqual(gaps.height, 4.0 + 0.8 + 4.0, places=6)
 
 
+class TestGapFilm(unittest.TestCase):
+    """The film must be separated from the plates, not merely a different filament.
+
+    At zero clearance its surfaces are coincident with theirs, the slicer merges
+    the volumes instead of seeing two, and the sliced result carries no interface
+    filament at all -- there is nothing to peel because nothing was laid down.
+    This fails at slicing, so bonding does not enter into it.
+    """
+
+    GAP, LAYER, CLEAR = 0.6, 0.2, 0.1
+
+    def stack(self, gap=None):
+        plates = tuple(sp.build_plate(perforated_plate(w, d))
+                       for w, d in ((5, 4), (5, 3), (4, 4), (4, 3)))
+        return sp.plan(plates, gap or self.GAP, flip=True, register=True)
+
+    def boxes(self, mesh):
+        return [stl_io.bounds_of(mesh[i:i + 12]) for i in range(0, len(mesh), 12)]
+
+    def test_film_is_clear_of_both_plates(self):
+        pl = self.stack()
+        film = self.boxes(sp.interface_slabs(pl, self.GAP, self.LAYER))
+        self.assertTrue(film)
+        for b in film:
+            below = [p for p in pl if p.z1 <= b.z0 + 1e-9]
+            above = [p for p in pl if p.z0 >= b.z1 - 1e-9]
+            self.assertGreaterEqual(b.z0 - max(p.z1 for p in below), self.CLEAR - 1e-9,
+                                    "film sits within the clearance of the plate below")
+            self.assertGreaterEqual(min(p.z0 for p in above) - b.z1, self.CLEAR - 1e-9,
+                                    "film sits within the clearance of the plate above")
+
+    def test_no_film_surface_is_coincident_with_a_plate(self):
+        """The specific geometry the slicer merges on."""
+        pl = self.stack()
+        film = self.boxes(sp.interface_slabs(pl, self.GAP, self.LAYER))
+        faces = {round(p.z0, 6) for p in pl} | {round(p.z1, 6) for p in pl}
+        for b in film:
+            self.assertNotIn(round(b.z0, 6), faces)
+            self.assertNotIn(round(b.z1, 6), faces)
+
+    def test_film_is_two_layers_by_default(self):
+        pl = self.stack()
+        film = self.boxes(sp.interface_slabs(pl, self.GAP, self.LAYER))
+        gap0 = [b for b in film if b.z0 < pl[1].z0]
+        span = max(b.z1 for b in gap0) - min(b.z0 for b in gap0)
+        self.assertAlmostEqual(span, 2 * self.LAYER, places=6)
+
+    def test_a_gap_too_small_is_refused(self):
+        pl = self.stack(gap=0.2)
+        with self.assertRaises(ValueError) as e:
+            sp.interface_slabs(pl, 0.2, self.LAYER, clearance=self.CLEAR)
+        msg = str(e.exception)
+        self.assertIn("0.2", msg)      # names the gap
+        self.assertIn("0.1", msg)      # and the clearance
+
+    def test_zero_clearance_is_still_permitted(self):
+        """It was the previous default and is a legitimate thing to ask for."""
+        pl = self.stack()
+        film = self.boxes(sp.interface_slabs(pl, self.GAP, self.LAYER, clearance=0.0))
+        self.assertTrue(film)
+        self.assertAlmostEqual(min(b.z0 for b in film), pl[0].z1, places=6)
+
+    def test_film_covers_the_pillars(self):
+        """A gap left empty above a pillar strands its next segment."""
+        pl = self.stack()
+        film = self.boxes(sp.interface_slabs(pl, self.GAP, self.LAYER))
+        pillars = self.boxes(sp.support_fillers(pl, self.GAP))
+        for col in pillars:
+            below = [f for f in film if f.z1 <= col.z0 + 1e-9
+                     and f.x1 > col.x0 and f.x0 < col.x1
+                     and f.y1 > col.y0 and f.y0 < col.y1]
+            rests_on_plate = any(abs(p.z1 - col.z0) < 1e-9 for p in pl)
+            self.assertTrue(below or rests_on_plate,
+                            "a pillar segment has neither film nor a plate beneath it")
+
+    def test_each_layer_overhangs_the_one_below_by_at_most_a_layer(self):
+        pl = self.stack()
+        film = self.boxes(sp.interface_slabs(pl, self.GAP, self.LAYER))
+        lows = [b for b in film if abs(b.z0 - (pl[0].z1 + self.CLEAR)) < 1e-9]
+        highs = [b for b in film if abs(b.z0 - (pl[0].z1 + self.CLEAR + self.LAYER)) < 1e-9]
+        self.assertTrue(lows and highs)
+        reach = max(b.x1 for b in highs) - max(b.x1 for b in lows)
+        self.assertGreaterEqual(reach, 0.0, "the upper layer must not be narrower")
+        self.assertLessEqual(reach, self.LAYER + 1e-6, "steeper than 45 degrees")
+
+
 if __name__ == "__main__":
     unittest.main()

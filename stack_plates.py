@@ -696,7 +696,7 @@ def support_fillers(placements: tuple[Placement, ...], gap: float,
 def interface_slabs(placements: tuple[Placement, ...], gap: float,
                     layer: float = 0.2, grow: float = 0.4,
                     step: float = 0.15, min_width: float = 0.42,
-                    flare: float = 0.2, clearance: float = 0.0) -> Mesh:
+                    flare: float = 0.2, clearance: float = 0.1) -> Mesh:
     """The film filling each gap, as a solid printed in its own filament.
 
     This is what the slicer used to make as support interface, made deliberately
@@ -715,10 +715,14 @@ def interface_slabs(placements: tuple[Placement, ...], gap: float,
     angle a printer bridges unaided. That widening is what lets a 0.3 mm rib of
     pillar carry a bead more than a millimetre across.
 
-    `clearance` shrinks the film away from the plates above and below. Zero fills
-    the gap exactly and touches both, which is what the support interface already
-    did at a Z distance of zero: PETG does not bond to PLA, and that is the whole
-    separation mechanism.
+    `clearance` holds the film clear of the plates above and below. It has to:
+    at zero the film's surfaces are coincident with theirs, the slicer merges the
+    volumes rather than seeing two, and the result carries no interface filament
+    anywhere -- there is nothing to peel because nothing was laid down. Bonding
+    does not enter into it; this fails at slicing, not at printing.
+
+    Zero is still permitted. It was the previous default and is a reasonable
+    thing to ask for deliberately.
     """
     x0, y0, w, h, step, regions = support_regions(placements, gap, grow, step,
                                                   min_width)
@@ -732,9 +736,13 @@ def interface_slabs(placements: tuple[Placement, ...], gap: float,
         if r is not None:
             base = [a | b for a, b in zip(base, r)]
         lo, hi = lower.z1 + clearance, upper.z0 - clearance
-        if hi - lo < 1e-9:
-            raise ValueError(f"clearance {clearance} mm leaves no room in a "
-                             f"{gap} mm gap")
+        if hi - lo < layer - 1e-9:
+            raise ValueError(
+                f"a {gap:g} mm gap cannot hold {clearance:g} mm of clearance at "
+                f"each face and still leave a layer of film: "
+                f"{gap:g} - 2 x {clearance:g} = {gap - 2 * clearance:g} mm, and "
+                f"a layer is {layer:g} mm. Widen the gap to at least "
+                f"{2 * clearance + layer:g} mm, or lower the clearance.")
         n = max(1, int(round((hi - lo) / layer)))
         for k in range(n):
             zlo = lo + (hi - lo) * k / n
@@ -1220,6 +1228,18 @@ socket taper at **{angle:.1f} degrees** from horizontal.
   six-plate stack. Left alone, it is loose in an open cell and falls out.
 - Do **not** enable "independent support layer height".
 
+## The gap film
+
+Each gap is filled by a solid printed in a second filament, added to the 3mf as
+its own part. It is held {clearance:g} mm clear of the plate above and the plate
+below, which is not optional: with its surfaces flush against theirs the slicer
+merges the volumes and lays down no interface filament anywhere, so there is
+nothing to peel. That failure happens at slicing, not at printing.
+
+A {gap:g} mm gap is {clearance:g} clear, {film:g} of film, {clearance:g} clear.
+The film is {filmlayers} layers, each stepping 0.2 mm further out than the one
+below so it leans at 45 degrees and bridges unaided.
+
 ## Removing the balconies (optional)
 
 That ribbon of support along the socket walls is the one thing no setting reaches.
@@ -1384,6 +1404,9 @@ def write_printing_notes(path: Path, placements, gap, layer, report_text,
         iface=iface_layers(gap, layer, petg),
         ifacewhy=("every interface layer is solid; at this gap there is only room "
                   "for what is listed"),
+        clearance=0.1,
+        film=max(0.0, gap - 0.2),
+        filmlayers=max(1, round((gap - 0.2) / layer)),
         postprocess=(f"{stable_python()} "
                      f"{Path(__file__).resolve().parent / 'postprocess.py'} "
                      f"{plates_path.resolve()}" if plates_path else
@@ -1398,7 +1421,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("stl", type=Path, help="multi-plate Gridfinity baseplate STL")
     ap.add_argument("-o", "--out-dir", type=Path, default=Path("out"))
     ap.add_argument("--name", default=None, help="output basename (default: derived)")
-    ap.add_argument("--gap", type=float, default=0.8, help="separation gap in mm")
+    ap.add_argument("--gap", type=float, default=0.6,
+                    help="separation gap in mm (default 0.6: interface clearance "
+                         "at both faces plus two layers of film between them)")
     ap.add_argument("--layer-height", type=float, default=0.2)
     ap.add_argument("--bed", default="256x256x256", help="build volume WxDxH in mm")
     ap.add_argument("--no-flip", action="store_true",
@@ -1430,10 +1455,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="also emit the gap film as its own solid, to be printed "
                          "in the interface filament. With it the slicer needs no "
                          "support at all: no blocker, no decoy, no post-processing")
-    ap.add_argument("--interface-clearance", type=float, default=0.0,
-                    help="shrink the film away from the plates it sits between, "
-                         "mm (default 0: it fills the gap and touches both, as "
-                         "the support interface already did at Z distance 0)")
+    ap.add_argument("--interface-clearance", type=float, default=0.1,
+                    help="hold the film clear of the plates it sits between, mm "
+                         "per face (default 0.1). Zero makes it fill the gap and "
+                         "touch both, which the slicer then merges into the "
+                         "plates and prints in one filament -- there is no film "
+                         "at all in the result. Not refused, because it was the "
+                         "previous default and is a legitimate thing to ask for")
     ap.add_argument("--decoy", action="store_true",
                     help="also emit a decoy column and a whole-model support "
                          "blocker: the column is supported so the slicer changes "
@@ -1452,7 +1480,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="support interface material, for the printing notes")
     args = ap.parse_args(argv)
 
-    gap = round(args.gap / args.layer_height) * args.layer_height
+    # Rounded to a sane number of decimals as well as to the layer: the plain
+    # product lands on 0.6000000000000001 and that reaches the printing notes.
+    gap = round(round(args.gap / args.layer_height) * args.layer_height, 6)
     if abs(gap - args.gap) > 1e-9:
         print(f"note: gap {args.gap} snapped to {gap:.3f} mm "
               f"({round(gap / args.layer_height)} x {args.layer_height} mm layers)")
