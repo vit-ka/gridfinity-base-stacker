@@ -1887,15 +1887,17 @@ def main(argv: list[str] | None = None) -> int:
                          "value to use if that matters")
     ap.add_argument("--interface-clearance", type=float, default=0.1,
                     help="hold the film clear of the plates it sits between, mm "
-                         "per face (default 0.1). The default is the smallest "
-                         "value measured to work, and it is bounded on both "
-                         "sides: at 0 the slicer merges the film into the plates "
-                         "and lays down no interface filament at all, and at 0.05 "
-                         "it prints but welds shut and the stack will not come "
-                         "apart. Note that clearance costs no height -- that "
-                         "follows the gap, which snaps to a whole layer -- so a "
-                         "smaller value buys a thicker film, not a shorter stack. "
-                         "Zero is still permitted, being the previous default")
+                         "per face (default 0.1). It has to be enough to leave "
+                         "one layer with no model material on it: the slicer "
+                         "calls a surface a top only where the layer above is "
+                         "empty of every region, so without that layer the plate "
+                         "gets no top and the film no bottom, and they print as "
+                         "one welded body. Measured at a 0.2 mm layer height: 0 "
+                         "merges them outright, 0.05 welds, 0.1 leaves the layer "
+                         "and separates. The number follows the layer height and "
+                         "does not travel -- at 0.1 mm layers, 0.1 mm would weld "
+                         "too. Costs no height either way, since that follows the "
+                         "gap, which snaps to a whole layer")
     ap.add_argument("--decoy", action="store_true",
                     help="also emit a decoy column and a whole-model support "
                          "blocker: the column is supported so the slicer changes "

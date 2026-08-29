@@ -62,8 +62,13 @@ film has to be physically separated, not merely assigned another filament.
   224.6 g of PLA against 257.5 g. Worth a third of a kilo of filament and an hour
   and a quarter.
 
-  **0.05 mm welds shut.** Tested: the film prints, but the stack does not come
-  apart. So the saving is not available, 40.8 mm and 8.71 h stand, and 0.1 mm is
+  **0.05 mm welds shut**, and the reason is exact rather than empirical: the
+  clearance has to leave one layer with no model material on it. The slicer calls
+  a surface a top only where the layer above is empty of *every* region
+  (`detect_surfaces_type` diffs against `upper_layer->lslices`), so without that
+  layer the plate gets no top surface and the film no bottom, and they are one
+  body. Measured on a plate's top layer: 29% top surface at 0.05 mm against 79.5%
+  at 0.1 mm, with sparse infill and a floating vertical shell in its place. So the saving is not available, 40.8 mm and 8.71 h stand, and 0.1 mm is
   now bounded on both sides rather than merely chosen -- 0 merges at slicing,
   0.05 welds at printing, 0.1 separates. There is nothing left to tune here.
 

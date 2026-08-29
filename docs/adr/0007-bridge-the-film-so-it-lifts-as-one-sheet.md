@@ -86,21 +86,64 @@ the only case in which the two have been seen to differ, and the generator no
 longer emits any: the film is held clear of the plates, and pieces of one region
 overlap rather than touch.
 
-## The clearance is bounded, not chosen
+## The clearance must leave an empty layer, not merely a distance
 
-0.1 mm per face, and each neighbouring value has been tried:
+0.1 mm per face, and the criterion behind it is exact rather than empirical: the
+clearance has to be enough that at least one layer ends up with no model material
+on it at all.
 
-| clearance | what happens |
-|---|---|
-| 0 | the slicer merges the film into the plates; no interface filament at all |
-| 0.05 mm | prints, but welds shut -- the stack does not come apart |
-| 0.1 mm | separates |
+`PrintObject::detect_surfaces_type` says why. Its own comment states the rule --
 
-It also costs nothing to hold it there. Height follows the gap, the gap snaps to
-a whole layer, so the only stack heights on offer are 39.2 mm and 40.8 mm
-whatever the clearance; a smaller value buys a thicker film, not a shorter stack.
-The 0.4 mm gap at 0.05 mm clearance would have saved an hour and a quarter and a
-third of a kilo of filament, and it is the value that welds.
+    // stTop - Part of a region, which is not covered by any upper layer.
+    //         This surface will be filled with a top solid infill.
+
+-- and the implementation compares against the layer above:
+
+    // comparison happens against the *full* slices (considering all regions)
+    // unless internal shells are requested
+    ExPolygons upper_slices = interface_shells ?
+        diff_ex(layerm_slices_surfaces, upper_layer->m_regions[region_id]->slices.surfaces, ...) :
+        diff_ex(layerm_slices_surfaces, upper_layer->lslices, ...);
+    surfaces_append(top, opening_ex(upper_slices, offset), stTop);
+
+`upper_layer->lslices` is the layer's slices across *all* regions. The film is a
+different region -- its own extruder -- but the same object, so it is in there and
+it subtracts. Where film sits on the layer directly above a plate, that plate's
+top is not a top: it is `stInternal`, and gets sparse infill.
+
+Which is what a weld looks like from outside, and it was spotted in the preview
+before any of it was measured: infill on what should have been the top layer of a
+base. Measured on that layer:
+
+| | 0.05 mm clearance | 0.1 mm clearance |
+|---|---|---|
+| Top surface | 160 mm (29%) | 640 mm (79.5%) |
+| Sparse infill | 68 mm | none |
+| Floating vertical shell | 115 mm | none |
+
+At 0.05 mm the layers run consecutively -- plate, film, film, plate -- with
+material on every one, so the slicer reads a single continuous body: no top on
+the plate, no bottom on the film. At 0.1 mm the layer between carries nothing on
+the model (57.7 mm of extrusion, all wipe tower), and that emptiness is the whole
+mechanism.
+
+So the number is a consequence and does not travel: at a 0.2 mm layer height
+0.05 mm cannot leave an empty layer and 0.1 mm just does. At a 0.1 mm layer
+height, 0.1 mm of clearance would weld for the same reason.
+
+Shaving it buys nothing anyway. Height follows the gap, the gap snaps to a whole
+layer, so the only stack heights on offer are 39.2 mm and 40.8 mm whatever the
+clearance; a smaller value buys a thicker film, not a shorter stack. The 0.4 mm
+gap at 0.05 mm clearance would have saved an hour and a quarter and a third of a
+kilo of filament, and it is the value that welds.
+
+`interface_shells` would defeat the mechanism directly -- it switches that diff to
+the region's own slices, so every part gets its own top and bottom shells even
+where parts touch, and the slicer's comment gives the intent as "useful if one of
+the parts is to be dissolved", which is this arrangement almost word for word.
+Recorded and not used: it is a whole-object setting touching every part boundary
+in the model, where an empty layer costs nothing and configures nothing. If the
+clearance ever has to go, that is where to look, and it wants measuring.
 
 ## What was measured wrong first
 
