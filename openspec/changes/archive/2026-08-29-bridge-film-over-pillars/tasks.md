@@ -61,7 +61,7 @@
       appear over the pillar tops
 - [x] 4.3 Verify no slicer support appeared anywhere on the model, the check the
       whole arrangement depends on
-- [ ] 4.4 Open the sliced result in Bambu Studio and confirm by eye in Preview
+- [x] 4.4 Open the sliced result in Bambu Studio and confirm by eye in Preview
       (Colour Scheme: Line Type) that the film in each gap reads as one sheet.
       The CLI and the GUI have already disagreed once on this model, so a CLI
       slice alone is not evidence
