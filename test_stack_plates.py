@@ -369,46 +369,70 @@ class TestNestingGroups(unittest.TestCase):
                              max(p.bounds.footprint for p in group))
 
 
-class TestLedgeFillers(unittest.TestCase):
+class TestSupportFillers(unittest.TestCase):
     def stack(self):
         # 5x3 and 4x4 are incomparable, so this set always leaves a ledge
         plates = tuple(sp.build_plate(perforated_plate(w, d))
                        for w, d in ((5, 4), (5, 3), (4, 4), (4, 3)))
         return sp.plan(plates, 0.2, flip=True, register=True)
 
-    def test_a_ledge_produces_fillers(self):
+    def test_an_overhang_produces_fillers(self):
         pl = self.stack()
         self.assertTrue(sp.ledges(pl, 0.2))
-        self.assertTrue(sp.ledge_fillers(pl, 0.2))
+        self.assertTrue(sp.support_fillers(pl, 0.2))
 
-    def test_no_ledge_produces_none(self):
-        plates = tuple(sp.build_plate(perforated_plate(w, d))
-                       for w, d in ((5, 4), (4, 4), (4, 3)))
+    def test_identical_plates_need_nothing(self):
+        """Every face lands on its own shape, so there is nothing to carry."""
+        plates = tuple(sp.build_plate(perforated_plate(4, 4)) for _ in range(3))
         pl = sp.plan(plates, 0.2, flip=True, register=True)
-        self.assertEqual(sp.ledges(pl, 0.2), ())
-        self.assertEqual(sp.ledge_fillers(pl, 0.2), ())
+        self.assertEqual(sp.support_fillers(pl, 0.2), ())
 
-    def test_fillers_clear_every_plate(self):
-        """The whole point: nothing may fuse to a plate."""
+    def test_fillers_keep_their_distance_from_every_plate(self):
+        """The whole point: nothing may fuse to a plate.
+
+        Asserted as a real distance, not merely as non-overlap. Clearance was
+        applied by dilating the plate's occupancy grid, and dilating by less than
+        one cell rounded to no dilation at all -- a 0.2 mm gap sampled at 0.3 mm
+        is 0.667 cells -- so pillars sat flush against the plate beside them and
+        an overlap test still passed.
+        """
+        gap, step = 0.2, 0.3
         pl = self.stack()
-        mesh = sp.ledge_fillers(pl, 0.2)
-        boxes = [mesh[i:i + 12] for i in range(0, len(mesh), 12)]
-        plates = [stl_io.bounds_of(p.placed_mesh()) for p in pl]
-        for b in (stl_io.bounds_of(x) for x in boxes):
-            for pb in plates:
-                overlap = (min(b.z1, pb.z1) - max(b.z0, pb.z0) > 1e-6
-                           and min(b.x1, pb.x1) - max(b.x0, pb.x0) > 1e-6
-                           and min(b.y1, pb.y1) - max(b.y0, pb.y0) > 1e-6)
-                self.assertFalse(overlap, "a filler intersects a plate")
+        mesh = sp.support_fillers(pl, gap, step=step)
+        boxes = [stl_io.bounds_of(mesh[i:i + 12]) for i in range(0, len(mesh), 12)]
+        self.assertTrue(boxes)
+        for b in boxes:
+            zc = (b.z0 + b.z1) / 2
+            for p in pl:
+                if not (p.z0 - 1e-9 <= zc <= p.z1 + 1e-9):
+                    continue
+                for y in (b.y0 + 0.05, (b.y0 + b.y1) / 2, b.y1 - 0.05):
+                    for c in gf._ray_crossings(p.placed_mesh(), y, zc):
+                        if b.x0 - 2 < c < b.x1 + 2:
+                            d = min(abs(c - b.x0), abs(c - b.x1))
+                            self.assertGreaterEqual(
+                                d, gap, "a filler came within the gap of a plate")
 
     def test_fillers_take_whole_plate_levels(self):
         """Each block occupies one plate's z range, so the stack gaps clear it."""
         pl = self.stack()
         levels = {(round(p.z0, 6), round(p.z1, 6)) for p in pl}
-        mesh = sp.ledge_fillers(pl, 0.2)
+        mesh = sp.support_fillers(pl, 0.2)
         for i in range(0, len(mesh), 12):
             b = stl_io.bounds_of(mesh[i:i + 12])
             self.assertIn((round(b.z0, 6), round(b.z1, 6)), levels)
+
+    def test_rectangles_can_be_pulled_back_to_cell_centres(self):
+        """A cell is marked when its centre is inside, so only the centres are
+        vouched for. Claiming the whole cell spends half a step at each end,
+        which is how a 0.2 mm clearance measured 0.113 mm."""
+        rows = [0b0110]        # cells 1 and 2 of a 4-wide row
+        whole = sp.grid_rects(rows, 0.0, 0.0, 4, 1, 1.0)
+        centred = sp.grid_rects(rows, 0.0, 0.0, 4, 1, 1.0, inset=0.5)
+        self.assertEqual(whole[0][0], 1.0)
+        self.assertEqual(whole[0][2], 3.0)
+        self.assertEqual(centred[0][0], 1.5)
+        self.assertEqual(centred[0][2], 2.5)
 
     def test_projects_the_face_directly_above_the_filler(self):
         """The near face, not the plate's widest section.
@@ -424,26 +448,29 @@ class TestLedgeFillers(unittest.TestCase):
             self.assertLess(abs(covered - p.down_area), abs(covered - p.up_area),
                             f"{p.plate.label} did not follow its down face")
 
-    def test_grown_slightly_by_default(self):
-        """A faithful projection reproduces webs the slicer drops as too thin.
+    def test_a_projection_can_be_grown(self):
+        """solid_spans still thickens, for the enforcer projection.
 
-        0.5 mm, about two perimeters, keeps them. Much more and the webs double
-        and the rounded socket corners fill in.
+        The fillers no longer do: growing their region walks it off the plate
+        edge and into the sockets, leaving blocks under nothing (ADR 0005).
         """
-        pl = self.stack()
-        faithful = sp.ledge_fillers(pl, 0.2, grow=0.0)
-        default = sp.ledge_fillers(pl, 0.2)
-        self.assertGreater(stl_io.signed_volume(default),
-                           stl_io.signed_volume(faithful))
+        p = self.stack()[0]
+        b = stl_io.bounds_of(p.placed_mesh())
+        faithful = sp.solid_spans(p, b.x0, b.y0, b.x1, b.y1, step=0.5, grow=0.0)
+        grown = sp.solid_spans(p, b.x0, b.y0, b.x1, b.y1, step=0.5, grow=1.0)
+        area = lambda sp_: sum((x1 - x0) * (y1 - y0) for x0, y0, x1, y1 in sp_)
+        self.assertGreater(area(grown), area(faithful))
 
     def test_dilation_is_a_disc_not_a_square(self):
         """A square element offsets corners by r on both axes at once, squaring
         off the sockets; a disc offsets every direction equally."""
-        pl = self.stack()
-        grown = sp.ledge_fillers(pl, 0.2, grow=1.0)
-        square_area = stl_io.signed_volume(sp.ledge_fillers(pl, 0.2, grow=0.0))
-        # a disc adds less than the square of the same radius would
-        self.assertLess(stl_io.signed_volume(grown), square_area * 4)
+        d = sp.disc(2.0)
+        self.assertIn((2, 0), d)
+        self.assertNotIn((2, 2), d)      # a square would reach the corner
+
+    def test_a_sub_cell_radius_does_not_dilate(self):
+        """Which is why clearance rounds out to a whole cell at its call site."""
+        self.assertEqual(sp.disc(0.667), ((0, 0),))
 
     def test_fillers_are_absent_when_asked(self):
         mesh = (perforated_plate(5, 4) + perforated_plate(5, 3, origin=(500.0, 0.0))

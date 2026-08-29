@@ -411,67 +411,129 @@ def ledge_regions(placements: tuple[Placement, ...], gap: float
 
 
 def face_grid(mesh: Mesh, z: float, x0: float, y0: float, w: int, h: int,
-              step: float) -> list[bytearray]:
-    """Occupancy of a horizontal slice, one row of cells per Y sample.
+              step: float) -> list[int]:
+    """Occupancy of a horizontal slice, one integer per Y sample.
+
+    A row is a bitmask, one bit per cell. Everything downstream is then a
+    bitwise operation on a w-bit integer, which Python does in C: dilating a
+    1173 x 1387 grid by a disc costs a few thousand integer operations instead of
+    fifty million element-at-a-time ones.
 
     Crossings along a +X ray alternate entering and leaving material, so the
-    solid stretches are the even-indexed pairs and each one can be filled as a
-    slice of the row. Testing every cell against every crossing instead is what
-    the ledge code used to do, and it is quadratic in the sampling resolution
-    for no gain.
+    solid stretches are the even-indexed pairs, and each is a contiguous run of
+    bits.
     """
-    rows = [bytearray(w) for _ in range(h)]
+    rows = [0] * h
     for iy in range(h):
         cr = gf._ray_crossings(mesh, y0 + (iy + 0.5) * step, z)
-        row = rows[iy]
+        m = 0
         for k in range(0, len(cr) - 1, 2):
             a = max(0, int(math.floor((cr[k] - x0) / step - 0.5)) + 1)
             b = min(w, int(math.ceil((cr[k + 1] - x0) / step - 0.5)))
             if b > a:
-                row[a:b] = b"\x01" * (b - a)
+                m |= ((1 << (b - a)) - 1) << a
+        rows[iy] = m
     return rows
 
 
 def disc(radius_cells: float) -> tuple[tuple[int, int], ...]:
-    """Offsets within a disc. A square would square off the socket's round corners."""
+    """Offsets within a disc of this many cells.
+
+    A disc rather than a square: a square offsets corners by r on both axes at
+    once, squaring off the sockets' rounded corners.
+
+    A radius under one cell yields the centre alone, which is no dilation. That
+    is right for thickening a projection -- there is nothing to add -- and wrong
+    for clearance, where it silently means no clearance at all. Callers wanting
+    clearance must round the radius out to at least one whole cell of *reach*:
+    disc(1.83) stops at one cell, because two cells away is a distance of two.
+    """
     r = int(math.ceil(radius_cells - 1e-9))
     return tuple((dx, dy) for dx in range(-r, r + 1) for dy in range(-r, r + 1)
                  if dx * dx + dy * dy <= radius_cells * radius_cells)
 
 
-def dilate(rows: list[bytearray], radius_cells: float, w: int, h: int
-           ) -> list[bytearray]:
-    if radius_cells < 1e-9:
-        return rows
-    off = disc(radius_cells)
-    out = [bytearray(w) for _ in range(h)]
-    for iy in range(h):
-        row = rows[iy]
-        for ix in range(w):
-            if not row[ix]:
-                continue
-            for dx, dy in off:
-                ny, nx = iy + dy, ix + dx
-                if 0 <= ny < h and 0 <= nx < w:
-                    out[ny][nx] = 1
+def _reach(radius_cells: float) -> dict[int, int]:
+    """How far a disc of this radius extends in X, for each Y offset."""
+    r = int(math.ceil(radius_cells - 1e-9))
+    out = {}
+    for dy in range(-r, r + 1):
+        t = radius_cells * radius_cells - dy * dy
+        if t >= 0:
+            out[dy] = int(math.floor(math.sqrt(t)))
     return out
 
 
-def grid_rects(rows: list[bytearray], x0: float, y0: float, w: int, h: int,
-               step: float) -> tuple[tuple[float, float, float, float], ...]:
-    """Maximal horizontal runs, merged across rows that share one."""
+def dilate(rows: list[int], radius_cells: float, w: int, h: int) -> list[int]:
+    if radius_cells < 1e-9:
+        return list(rows)
+    full = (1 << w) - 1
+    reach = _reach(radius_cells)
+    widened: dict[int, list[int]] = {}
+    for k in set(reach.values()):
+        if k == 0:
+            widened[k] = rows
+            continue
+        acc = []
+        for m in rows:
+            e = m
+            for i in range(1, k + 1):
+                e |= (m << i) | (m >> i)
+            acc.append(e & full)
+        widened[k] = acc
+    out = [0] * h
+    for dy, k in reach.items():
+        src = widened[k]
+        lo, hi = max(0, dy), min(h, h + dy)
+        for iy in range(lo, hi):
+            out[iy] |= src[iy - dy]
+    return out
+
+
+def erode(rows: list[int], radius_cells: float, w: int, h: int) -> list[int]:
+    """Dilation of the complement: shrinks a region by the same disc."""
+    full = (1 << w) - 1
+    grown = dilate([full & ~m for m in rows], radius_cells, w, h)
+    return [full & ~m for m in grown]
+
+
+def opened(rows: list[int], radius_cells: float, w: int, h: int) -> list[int]:
+    """Erode then dilate: drops anything thinner than the disc, keeps the rest.
+
+    Applied to the region, never to the rectangles it decomposes into.
+    grid_rects merges only rows whose runs match exactly, so a wide region with a
+    curved edge comes apart into many one-row strips -- and a minimum size
+    applied to those deletes real support. Measured: plate 5's north border came
+    out as a 34.20 x 0.30 mm strip and was discarded whole, leaving the corner
+    hanging in air.
+    """
+    if radius_cells < 1e-9:
+        return list(rows)
+    return dilate(erode(rows, radius_cells, w, h), radius_cells, w, h)
+
+
+def grid_rects(rows: list[int], x0: float, y0: float, w: int, h: int,
+               step: float, inset: float = 0.0
+               ) -> tuple[tuple[float, float, float, float], ...]:
+    """Maximal horizontal runs, merged across rows that share one.
+
+    With `inset` the rectangle is pulled in by that much on every side. Half a
+    step pulls it back to the outermost cell *centres*, which is the only part of
+    the cell the occupancy test vouches for. Beware that inset rectangles no
+    longer share edges, so a region that should be one solid comes apart into
+    loose pieces; paying for clearance in the dilation instead keeps it whole.
+    """
     out = []
     open_runs: dict[tuple[int, int], list[int]] = {}
     for iy in range(h):
-        row = rows[iy]
-        runs, start = [], None
-        for ix in range(w):
-            if row[ix] and start is None:
-                start = ix
-            elif not row[ix] and start is not None:
-                runs.append((start, ix)); start = None
-        if start is not None:
-            runs.append((start, w))
+        m = rows[iy]
+        runs = []
+        while m:
+            lo = (m & -m).bit_length() - 1
+            nt = ~(m >> lo)
+            span = (nt & -nt).bit_length() - 1
+            runs.append((lo, lo + span))
+            m &= ~(((1 << span) - 1) << lo)
         seen = set(runs)
         for run in runs:
             if run in open_runs:
@@ -480,16 +542,17 @@ def grid_rects(rows: list[bytearray], x0: float, y0: float, w: int, h: int,
                 open_runs[run] = [iy, iy + 1]
         for run in [k for k in open_runs if k not in seen]:
             a, b = open_runs.pop(run)
-            out.append((x0 + run[0] * step, y0 + a * step,
-                        x0 + run[1] * step, y0 + b * step))
+            out.append((x0 + run[0] * step + inset, y0 + a * step + inset,
+                        x0 + run[1] * step - inset, y0 + b * step - inset))
     for run, (a, b) in open_runs.items():
-        out.append((x0 + run[0] * step, y0 + a * step,
-                    x0 + run[1] * step, y0 + b * step))
+        out.append((x0 + run[0] * step + inset, y0 + a * step + inset,
+                    x0 + run[1] * step - inset, y0 + b * step - inset))
     return tuple(out)
 
 
 def support_fillers(placements: tuple[Placement, ...], gap: float,
-                    grow: float = 0.0, step: float = 0.3) -> Mesh:
+                    grow: float = 0.4, step: float = 0.15,
+                    min_width: float = 0.42, slab: float = 0.4) -> Mesh:
     """Blocks standing in wherever a plate has material and nothing beneath it.
 
     This asks the question directly rather than comparing footprints. Comparing
@@ -522,8 +585,7 @@ def support_fillers(placements: tuple[Placement, ...], gap: float,
             pl, m = placements[i], meshes[i]
             up = face_grid(m, pl.z1 - SKIN, x0, y0, w, h, step)
             dn = face_grid(m, pl.z0 + SKIN, x0, y0, w, h, step)
-            solid_at[i] = [bytearray(a | c for a, c in zip(r1, r2))
-                           for r1, r2 in zip(up, dn)]
+            solid_at[i] = [a | c for a, c in zip(up, dn)]
         return solid_at[i]
 
     tops: dict[int, list[bytearray]] = {}
@@ -533,23 +595,84 @@ def support_fillers(placements: tuple[Placement, ...], gap: float,
                                 x0, y0, w, h, step)
         return tops[i]
 
+    keep_off: dict[int, list[int]] = {}
+    def blocked(i: int) -> list[int]:
+        if i not in keep_off:
+            keep_off[i] = dilate(material(i), clear_r, w, h)
+        return keep_off[i]
+
+    slice_at: dict[tuple[int, float], list[int]] = {}
+    def between(i: int, zlo: float, zhi: float) -> list[int]:
+        """Where plate i has material anywhere within this band of its height.
+
+        The union of the band's two ends. Socket walls run straight between the
+        profile's z levels, so the widest material in a band is at one end or the
+        other, never in the middle.
+        """
+        out = None
+        for z in (zlo + SKIN, zhi - SKIN):
+            key = (i, round(z, 6))
+            if key not in slice_at:
+                slice_at[key] = face_grid(meshes[i], z, x0, y0, w, h, step)
+            g = slice_at[key]
+            out = g if out is None else [a | b for a, b in zip(out, g)]
+        return out
+
+    def bands(pl: Placement) -> list[tuple[float, float]]:
+        n = max(1, int(round((pl.z1 - pl.z0) / slab)))
+        e = [pl.z0 + (pl.z1 - pl.z0) * k / n for k in range(n + 1)]
+        return list(zip(e, e[1:]))
+
+    full = (1 << w) - 1
+    # Half a cell more than the gap asks for, because a rectangle covers whole
+    # cells while the occupancy test only vouches for their centres: the block's
+    # edge reaches half a step past its outermost centre, and the plate's true
+    # boundary can sit half a step inside its own. Rounded up to a whole cell of
+    # *reach* -- disc(1.83) stops at one cell, because two cells away is a
+    # distance of two, and asking for 1.83 while getting 1 halves the clearance.
+    clear_r = float(max(1, math.ceil(gap / step + 0.5)))
+    thin = max(1.0, min_width / 2 / step)
+
+    full = (1 << w) - 1
+    # Half a cell more than the gap asks for, because a rectangle covers whole
+    # cells while the occupancy test only vouches for their centres: the block's
+    # edge reaches half a step past its outermost centre, and the plate's true
+    # boundary can sit half a step inside its own. Rounded up to a whole cell of
+    # *reach* -- disc(1.83) stops at one cell, because two cells away is a
+    # distance of two, and asking for 1.83 while getting 1 halves the clearance.
+    clear_r = float(max(1, math.ceil(gap / step + 0.5)))
+    thin = max(1.0, min_width / 2 / step)
+
     out: list = []
     for i in range(1, len(placements)):
-        # Not dilated. Growing the region outward was right when it was a ledge
-        # projection whose thinnest webs the slicer would drop, but here it walks
-        # the region off the edge of the plate and a millimetre into every shaft,
-        # putting blocks in mid-air where nothing is overhead. What needs
-        # carrying is where the plate actually has material.
+        # Not dilated. What needs carrying is where the plate actually has
+        # material; growing this before the descent walks it off the plate edge
+        # and into the sockets, leaving blocks under nothing.
         need = face_grid(meshes[i], placements[i].z0 + SKIN, x0, y0, w, h, step)
         for j in range(i - 1, -1, -1):
             supported = top(j)
-            blocked = dilate(material(j), gap / step, w, h)
-            still = [bytearray(n & ~s & ~bl for n, s, bl in zip(rn, rs, rb))
-                     for rn, rs, rb in zip(need, supported, blocked)]
-            if not any(any(r) for r in still):
+            still = [n & ~s & full for n, s in zip(need, supported)]
+            # Thin ribs are kept rather than dropped: the interface laid over a
+            # pillar overhangs it by 0.2 mm a layer on every side, so a 0.3 mm
+            # rib carries a bead more than a millimetre wide -- and there is no
+            # other support anywhere on this model, so anything discarded here is
+            # simply not carried.
+            still = opened(still, thin, w, h)
+            if not any(still):
                 break
+
+            # Grown outward first, then held off the plate only where it would
+            # actually meet one. A pillar cut to exactly the footprint it carries
+            # is far thinner than the hole it stands in, and thin free-standing
+            # columns are the least printable thing here; the socket has room to
+            # spare, so take it. Clearance stays local because dilating the
+            # plate's own occupancy only reaches cells near the plate.
+            wide = dilate(still, grow / step, w, h) if grow > 0 else still
+            here = [x & ~bl & full for x, bl in zip(wide, blocked(j))]
+            here = opened(here, thin, w, h)
+
             lo, hi = placements[j].z0, placements[j].z1
-            for rx0, ry0, rx1, ry1 in grid_rects(still, x0, y0, w, h, step):
+            for rx0, ry0, rx1, ry1 in grid_rects(here, x0, y0, w, h, step):
                 out.extend(box(rx0, ry0, lo, rx1, ry1, hi))
             need = still
     return tuple(out)
@@ -577,96 +700,10 @@ def solid_spans(pl: Placement, x0: float, y0: float, x1: float, y1: float,
     doubling and the corners fill in.
     """
     mesh = pl.placed_mesh()
-    z = pl.z0 + 0.01
     w = max(1, int(round((x1 - x0) / step)))
     h = max(1, int(round((y1 - y0) / step)))
-    grid = [[False] * h for _ in range(w)]
-    for iy in range(h):
-        py = y0 + (iy + 0.5) * step
-        crossings = gf._ray_crossings(mesh, py, z)
-        for ix in range(w):
-            px = x0 + (ix + 0.5) * step
-            grid[ix][iy] = sum(1 for c in crossings if c > px) % 2 == 1
-
-    rr = grow / step
-    r = int(math.ceil(rr - 1e-9))
-    if r:
-        # A disc, not a square: dilating with a square offsets corners by r in
-        # each axis at once, squaring off the socket's rounded corners. A disc
-        # offsets every direction equally, which is what an outward offset means
-        # and what keeps the arcs.
-        # radius from `grow` directly, not the rounded cell count, so the offset
-        # is the millimetres asked for whatever the sampling step
-        disc = [(dx, dy) for dx in range(-r, r + 1) for dy in range(-r, r + 1)
-                if dx * dx + dy * dy <= rr * rr]
-        grown = [[False] * h for _ in range(w)]
-        for ix in range(w):
-            for iy in range(h):
-                if not grid[ix][iy]:
-                    continue
-                for dx, dy in disc:
-                    nx, ny = ix + dx, iy + dy
-                    if 0 <= nx < w and 0 <= ny < h:
-                        grown[nx][ny] = True
-        grid = grown
-
-    # maximal horizontal runs, then merge rows that share a run
-    out: list[tuple[float, float, float, float]] = []
-    open_runs: dict[tuple[int, int], list[int]] = {}
-    for iy in range(h):
-        runs = []
-        start_ix = None
-        for ix in range(w):
-            if grid[ix][iy] and start_ix is None:
-                start_ix = ix
-            elif not grid[ix][iy] and start_ix is not None:
-                runs.append((start_ix, ix)); start_ix = None
-        if start_ix is not None:
-            runs.append((start_ix, w))
-        seen = set(runs)
-        for run in runs:
-            if run in open_runs:
-                open_runs[run][1] = iy + 1
-            else:
-                open_runs[run] = [iy, iy + 1]
-        for run in [k for k in open_runs if k not in seen]:
-            a, b = open_runs.pop(run)
-            out.append((x0 + run[0] * step, y0 + a * step,
-                        x0 + run[1] * step, y0 + b * step))
-    for run, (a, b) in open_runs.items():
-        out.append((x0 + run[0] * step, y0 + a * step,
-                    x0 + run[1] * step, y0 + b * step))
-    return tuple(out)
-
-
-def ledge_fillers(placements: tuple[Placement, ...], gap: float,
-                  grow: float = 0.5, step: float = 0.15) -> Mesh:
-    """Loose blocks filling each ledge void, one per plate level it spans.
-
-    A ledge otherwise leaves the slicer to raise a tall thin fin under the
-    overhanging rib, which is the least printable thing in the arrangement. These
-    stand in for the plates missing under that area: one block per level, taking
-    that plate's own z range and inset by `gap` in XY so it touches nothing
-    sideways. The stack's gaps already separate the levels vertically, so each
-    block ends up clear on all six sides and lifts out with the support.
-    """
-    mesh: list = []
-    for i, x0, y0, x1, y1, base in ledge_regions(placements, gap):
-        if x1 - x0 <= 2 * gap or y1 - y0 <= 2 * gap:
-            continue
-        spans = solid_spans(placements[i], x0 + gap, y0 + gap, x1 - gap, y1 - gap,
-                            step=step, grow=grow)
-        # One block per plate level, aligned exactly to that level's z range, so
-        # the columns take the same gaps the plates do and print on the interface
-        # below them like everything else.
-        for level in placements[:i]:
-            if level.z0 < base - 1e-9:
-                continue
-            for sx0, sy0, sx1, sy1 in spans:
-                if sx1 - sx0 < 1e-9 or sy1 - sy0 < 1e-9:
-                    continue
-                mesh.extend(box(sx0, sy0, level.z0, sx1, sy1, level.z1))
-    return tuple(mesh)
+    rows = face_grid(mesh, pl.z0 + 0.01, x0, y0, w, h, step)
+    return grid_rects(dilate(rows, grow / step, w, h), x0, y0, w, h, step)
 
 
 def stl_bounds(pl: Placement) -> tuple[float, float, float, float]:
@@ -1313,7 +1350,7 @@ def main(argv: list[str] | None = None) -> int:
                          "plate profiles this tool has not seen")
     ap.add_argument("--no-fillers", action="store_true",
                     help="omit the loose blocks that stand in under a ledge")
-    ap.add_argument("--filler-step", type=float, default=0.3,
+    ap.add_argument("--filler-step", type=float, default=0.15,
                     help="resolution the filler outline is traced at, mm. Finer is "
                          "smoother and slower (default 0.15, below what a 0.4 mm "
                          "nozzle can render)")

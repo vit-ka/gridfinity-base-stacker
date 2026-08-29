@@ -48,6 +48,44 @@ Two details are load-bearing:
   blocks in mid-air with nothing overhead. Measured: 89.2 cm3 of filler with the
   dilation, 50.6 cm3 without, and the difference was all artefact.
 
+## How a pillar is shaped
+
+Grown outward, then held off the plate only where it would meet one:
+`dilate(region) & ~dilate(plate material)`. A pillar cut to exactly the footprint
+it carries is far thinner than the hole it stands in, and thin free-standing
+columns are the least printable thing in the arrangement. The pull-back is local
+without any special casing, because dilating the plate's own occupancy cannot
+reach cells that are not near the plate.
+
+The clearance dilation is rounded up to a whole cell of *reach*. A grid cannot
+offset by less than one cell, and `disc(1.83)` stops at one, because two cells
+away is a distance of two. Two separate bugs came out of getting this wrong: at
+0.667 cells it rounded to no dilation at all and pillars fused to the plate
+beside them, and at 1.83 it gave half the clearance asked for. It also carries
+half a cell more than the gap, because a rectangle covers whole cells while the
+occupancy test only vouches for their centres.
+
+Two things were tried and dropped, both recorded so they are not tried again:
+
+- **Filleting the internal corners does nothing.** This region's concave corners
+  are formed by the clearance, so a morphological closing adds exactly the cells
+  the clearance clip takes back. Measured identical at 0.0, 0.6, 1.2 and 2.0 mm.
+  Rounding those corners means emitting the region as an outline rather than as
+  rectangles.
+- **Following the socket taper is redundant.** The socket is a 45 degree funnel
+  and a pillar could widen with it, but once the pillar grows outward until the
+  clearance stops it, the clearance already is the narrowest section. Sampling
+  the plate in bands would have been ten times the raster work for the same
+  geometry.
+
+A minimum feature size is applied to the region, never to the rectangles it
+decomposes into. `grid_rects` merges only rows whose runs match exactly, so a
+wide region with a curved edge comes apart into many one-row strips: plate 5's
+north border came out as a 34.20 x 0.30 mm strip and was discarded whole, leaving
+the corner hanging in air. Thin ribs are kept regardless -- the interface laid
+over a pillar overhangs it by 0.2 mm a layer on every side, so a 0.3 mm rib
+carries a bead more than a millimetre wide.
+
 ## Consequences
 
 Every plate is carried. On the drawer stack: 683 blocks, 50.6 cm3 enclosed,
