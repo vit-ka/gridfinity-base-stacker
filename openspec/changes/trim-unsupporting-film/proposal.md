@@ -30,3 +30,8 @@ nothing: it is printed, paid for in PETG and in time, and peeled off as waste.
   establish.
 - Depends on `separate-film-from-plates` only in that both edit the same
   function; the two are otherwise independent.
+
+**Approved in review.** The measure-first task stands regardless: if the waste
+turns out to be small, this change carries real risk -- stranding a pillar -- for
+little return, and that is worth knowing before the code is written rather than
+after.

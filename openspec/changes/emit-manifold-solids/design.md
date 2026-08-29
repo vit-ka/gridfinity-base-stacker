@@ -34,9 +34,9 @@ instead of hundreds of fragments.
 prism -- is the honest fix and delivers all three at once. It costs contour
 extraction plus cap triangulation with holes, which is real work.
 
-Taking the outline. The nudge is worth keeping in mind only if the outline work
-turns out to be much larger than expected, and it should then be recorded as a
-stopgap rather than a solution.
+**Decided: take the outline.** Confirmed in review. The nudge is worth keeping in
+mind only if the outline work turns out far larger than expected, and would then
+be recorded as a stopgap rather than a solution.
 
 **Verification gains a manifold check.** This defect existed for the whole life
 of the box decomposition and no test noticed, because nothing looked. The check

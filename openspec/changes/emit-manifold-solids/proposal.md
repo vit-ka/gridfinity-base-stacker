@@ -6,9 +6,19 @@ worse: 5,402. The models slice today, but a mesh the slicer calls broken is one
 misjudgement away from slicing wrongly, and it is not something to hand to
 someone else.
 
-Every bad edge is used by exactly four faces, never three. That is the signature
-of two closed boxes meeting along a shared edge -- corner to corner or edge to
-edge -- not of torn or missing geometry. Pillars and film are emitted as many
+Every bad edge is used by exactly four faces. The full distribution is the
+evidence, and it is unambiguous:
+
+| edges used by | stack | film | meaning |
+|---|---|---|---|
+| 1 face | 0 | 0 | a hole in the surface |
+| 2 faces | 112,674 | 103,982 | normal, closed |
+| 3 faces | 0 | 0 | one extra sheet |
+| 4 faces | 165 | 5,402 | two closed shells sharing an edge |
+
+Torn geometry shows up as edges used by a single face -- a boundary, the rim of a
+hole. There are none, in either mesh. Every anomaly is exactly four, which is two
+closed boxes meeting along an edge, corner to corner or edge to edge. Pillars and film are emitted as many
 axis-aligned boxes from a rasterised region, and wherever two of them touch
 without sharing a whole face, four triangles meet on one edge.
 

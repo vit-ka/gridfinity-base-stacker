@@ -2,8 +2,13 @@
 
 The gap film is currently generated flush against the plates above and below it,
 on the reasoning that distinct parts of one object stay distinct volumes and that
-PETG will not bond to PLA anyway. Printed, it fuses to the bases. The film has to
-be physically separated from the plates, not merely assigned a different filament.
+PETG will not bond to PLA anyway. In Bambu Studio the two are merged and no
+interface filament is laid down at all: the failure happens at slicing, not at
+printing, and there is nothing to peel because there is nothing there.
+
+That is a different failure from thermal fusing and it matters, because bonding
+is irrelevant to it. Coincident surfaces stop the slicer seeing two volumes. The
+film has to be physically separated, not merely assigned another filament.
 
 ## What Changes
 
@@ -37,5 +42,16 @@ be physically separated from the plates, not merely assigned a different filamen
 ## Open questions
 
 - Whether 0.1 mm is the smallest clearance that works. It was chosen because it
-  is what the fusing prompted, not because anything smaller was measured. Worth
-  one test print at 0.05 mm before the height cost is accepted permanently.
+  is what the merge prompted, not because anything smaller was measured. Worth
+  one slice at 0.05 mm before the height cost is accepted permanently -- and a
+  slice answers it, since the failure is visible without printing.
+
+- **The CLI and the GUI disagree, and that is unexplained.** Slicing the very
+  same 3mf from the command line produces 6,940 mm of interface filament, present
+  in all eight gaps; the GUI merges the parts and produces none. The file itself
+  is not at fault: it declares the film as its own part with its own extruder,
+  and the copy Bambu re-saved still does. Until this is understood, a CLI slice
+  is not evidence that the GUI will behave, which undercuts how the rest of this
+  project has been verified. Clearance is likely to fix it either way, since
+  coincident geometry is the obvious cause, but the change should confirm the fix
+  in the GUI and not only in the harness.
