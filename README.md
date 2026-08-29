@@ -8,6 +8,12 @@ peeled off afterwards so the stack comes apart into separate plates.
 The slicer generates **no support at all**. Every overhang is carried by geometry
 the tool puts there.
 
+![Nine baseplates stacked into one print, sliced in Bambu Studio](docs/stacked-plates.png)
+
+Nine plates of a drawer set as one job: the brown is the stack and its pillars,
+the white is the film filling each gap. The small block at the back is the wipe
+tower.
+
 Stdlib Python only: no numpy, no trimesh, no mesh kernel. Meshes are flat tuples
 of floats and every geometric question is answered by ray casting or by
 rasterising to a grid.
