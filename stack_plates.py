@@ -908,7 +908,7 @@ def _has_bad_edge(mesh: Mesh) -> bool:
 
 def support_regions(placements: tuple[Placement, ...], gap: float,
                     grow: float = 0.4, step: float = 0.15,
-                    min_width: float = 0.42) -> tuple:
+                    min_width: float = 0.42, margin: float = 8.0) -> tuple:
     """Blocks standing in wherever a plate has material and nothing beneath it.
 
     This asks the question directly rather than comparing footprints. Comparing
@@ -929,12 +929,29 @@ def support_regions(placements: tuple[Placement, ...], gap: float,
     """
     meshes = {i: pl.placed_mesh() for i, pl in enumerate(placements)}
     b = bounds_of(tuple(f for m in meshes.values() for f in m))
-    x0, y0 = b.x0, b.y0
-    w = max(1, int(round(b.width / step)))
-    h = max(1, int(round(b.depth / step)))
+    # Room to dilate into. Sized to the stack exactly, the grid clips every
+    # dilation at the model's own edge -- and a closing that is clipped on the
+    # way out erodes back from the clipped edge rather than the real one, which
+    # squares off the plate's rounded corners and leaves film hanging in the
+    # wedge outside them. The margin only has to exceed the largest radius any
+    # step uses; the cells cost little because the rows are integers.
+    x0, y0 = b.x0 - margin, b.y0 - margin
+    w = max(1, int(round((b.width + 2 * margin) / step)))
+    h = max(1, int(round((b.depth + 2 * margin) / step)))
 
-    # A plate blocks a filler anywhere it has material at that level, and the
-    # socket tapers, so both faces are taken: the narrower opening wins.
+    # The margin is room for the morphology, not licence to grow into it. Every
+    # result is clipped back to the stack's own extent, or a dilation that was
+    # previously stopped by the grid's edge now runs on past the plate and puts
+    # support in open air -- measured, the model grew from 176.0 x 208.0 to
+    # 177.0 x 208.5. Clipping the result rather than the operands is what keeps
+    # both properties: rounded corners survive a closing, and nothing escapes.
+    ix0 = max(0, int(round(margin / step)))
+    ix1 = min(w, ix0 + int(round(b.width / step)) + 1)
+    iy0 = max(0, int(round(margin / step)))
+    iy1 = min(h, iy0 + int(round(b.depth / step)) + 1)
+    span = ((1 << (ix1 - ix0)) - 1) << ix0
+    extent = [span if iy0 <= i < iy1 else 0 for i in range(h)]
+
     solid_at: dict[int, list[bytearray]] = {}
     def material(i: int) -> list[bytearray]:
         if i not in solid_at:
@@ -1024,22 +1041,23 @@ def support_regions(placements: tuple[Placement, ...], gap: float,
             # spare, so take it. Clearance stays local because dilating the
             # plate's own occupancy only reaches cells near the plate.
             wide = dilate(still, grow / step, w, h) if grow > 0 else still
-            here = [x & ~bl & full for x, bl in zip(wide, blocked(j))]
+            here = [x & ~bl & e & full
+                    for x, bl, e in zip(wide, blocked(j), extent)]
             here = opened(here, thin, w, h)
 
             prev = regions.get(j)
             regions[j] = (here if prev is None
                           else [a | b for a, b in zip(prev, here)])
             need = still
-    return x0, y0, w, h, step, regions
+    return x0, y0, w, h, step, regions, extent
 
 
 def support_fillers(placements: tuple[Placement, ...], gap: float,
                     grow: float = 0.4, step: float = 0.15,
                     min_width: float = 0.42) -> Mesh:
     """The pillars themselves: one block per level a column passes through."""
-    x0, y0, w, h, step, regions = support_regions(placements, gap, grow, step,
-                                                  min_width)
+    x0, y0, w, h, step, regions, _ = support_regions(placements, gap, grow, step,
+                                                     min_width)
     out: list = []
     for j, rows in regions.items():
         lo, hi = placements[j].z0, placements[j].z1
@@ -1079,8 +1097,8 @@ def interface_slabs(placements: tuple[Placement, ...], gap: float,
     Zero is still permitted. It was the previous default and is a reasonable
     thing to ask for deliberately.
     """
-    x0, y0, w, h, step, regions = support_regions(placements, gap, grow, step,
-                                                  min_width)
+    x0, y0, w, h, step, regions, extent = support_regions(
+        placements, gap, grow, step, min_width, margin=max(8.0, bridge_span))
     meshes = {i: pl.placed_mesh() for i, pl in enumerate(placements)}
     out: list = []
     for j in range(len(placements) - 1):
@@ -1097,6 +1115,7 @@ def interface_slabs(placements: tuple[Placement, ...], gap: float,
         # wherever the ring is narrower than the span.
         if bridge_span > 0:
             base = closed(base, bridge_span / 2 / step, w, h)
+        base = [b & e for b, e in zip(base, extent)]
         lo, hi = lower.z1 + clearance, upper.z0 - clearance
         if hi - lo < layer - 1e-9:
             raise ValueError(
@@ -1109,6 +1128,11 @@ def interface_slabs(placements: tuple[Placement, ...], gap: float,
         for k in range(n):
             zlo = lo + (hi - lo) * k / n
             zhi = lo + (hi - lo) * (k + 1) / n
+            # Not clipped to the stack's extent. The flare is meant to overhang
+            # by a layer's worth on every side, all the way around, including
+            # past the outer edge -- that lip is the point of it, not spill.
+            # Only the base is held inside the extent, so growth that escapes is
+            # the flare's and nothing else's.
             rows = dilate(base, k * flare / step, w, h) if k else base
             # Boxes, overlapping by `weld` rather than abutting. Two closed
             # solids that touch put four facets on the shared edge; two that

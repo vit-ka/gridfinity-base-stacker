@@ -126,6 +126,27 @@ STRUCTURAL = {"name", "matrix", "source_file", "source_object_id", "source_volum
               "source_offset_x", "source_offset_y", "source_offset_z", "extruder"}
 
 
+OTHER_PARTS = ("interface", "nosupport", "blocker", "decoy")
+
+
+def model_part_settings(xml: str) -> list[tuple[str, str]]:
+    """Per-part print settings from the template's model part.
+
+    The film is not the only part someone configures. Reading only the part named
+    for the film silently dropped everything set on the stack itself -- a bottom
+    shell thickness, in the case that found this -- and dropped it on the next
+    regeneration, when the template had looked correct in the slicer.
+    """
+    for block in re.findall(r"<part\b.*?</part>", xml, re.S):
+        name = re.search(r'<metadata key="name" value="([^"]*)"', block)
+        if not name or any(m in name.group(1).lower() for m in OTHER_PARTS):
+            continue
+        return [(k, v) for k, v in
+                re.findall(r'<metadata key="([^"]+)" value="([^"]*)"', block)
+                if k not in STRUCTURAL]
+    return []
+
+
 def part_settings(xml: str, needle: str) -> list[tuple[str, str]]:
     """Per-part print settings from the template's part whose name contains `needle`.
 
@@ -335,6 +356,7 @@ def main(argv=None) -> int:
                 f'backwards_edges="0"/>\n    </part>\n')
 
     film_settings = part_settings(tmpl_set, "interface")
+    stack_settings = model_part_settings(tmpl_set)
     second = (part(2, f"{stem}-interface.stl", "normal_part", b_faces,
                    str(args.interface_extruder), mcz, film_settings)
               if film is not None
@@ -359,7 +381,8 @@ def main(argv=None) -> int:
                + f'    <metadata key="name" value="{stem}.stl"/>\n'
                + f'    <metadata key="extruder" value="{e_main}"/>\n'
                + f'    <metadata face_count="{m_faces}"/>\n'
-               + part(1, f"{stem}.stl", "normal_part", m_faces, None, mcz)
+               + part(1, f"{stem}.stl", "normal_part", m_faces, None, mcz,
+                      stack_settings)
                + second
                + '  </object>\n'
                + '  <plate>\n    <metadata key="plater_id" value="1"/>\n'
@@ -398,6 +421,9 @@ def main(argv=None) -> int:
             z.writestr(info.filename, replace.get(info.filename, data))
 
     print(f"wrote {args.out}")
+    if stack_settings:
+        print(f"           stack carries {len(stack_settings)} part settings from "
+              f"the template: " + ", ".join(k for k, _ in stack_settings))
     print(f"  model    {stem}  {m_faces} facets, "
           f"{mb.width:.1f} x {mb.depth:.1f} x {mb.height:.1f} mm  "
           f"at ({mx:.1f}, {my:.1f}), extruder {e_main}")
