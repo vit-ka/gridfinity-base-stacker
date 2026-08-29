@@ -181,10 +181,24 @@ the stack they belong to. Everything else -- plate layout, wipe tower position,
 per-object filament assignments, all 581 settings keys -- comes from the template
 verbatim, so a different stack never means re-arranging the plate by hand.
 
-`templates/stack-template.3mf` ships a placeholder block where the stack goes,
-sized to the space a stack gets, so no one's model lives in this repository. Save
-your own from Bambu Studio with File > Save Project As and point `--template` at
-it to change the layout or the filaments.
+`templates/stack-template.3mf` ships placeholder blocks where the stack and the
+film go, so no one's model lives in this repository. Save your own from Bambu
+Studio with File > Save Project As and point `--template` at it to change the
+layout, the filaments, or the film's print settings.
+
+The film's settings are per-*part*, which is worth knowing because they do not
+appear in `project_settings.config` and a diff of the project settings shows
+nothing when someone has configured a part. They are read off whichever part in
+the template has "interface" in its name, and they are what make the film print
+as a film rather than as a small solid object:
+
+    wall_loops 0, top_shell_layers 0, bottom_shell_layers 0
+    sparse_infill_density 100%, sparse_infill_pattern zig-zag
+
+With no walls and no shells the film is entirely sparse infill, so it follows
+`infill_direction` -- which alternates 45 and 135 degrees layer to layer by
+itself. Both film layers come out rectilinear and crossed, in all eight gaps,
+without a bridge-angle override.
 
 Verified on the nine-plate drawer stack: 0.0 mm of slicer support anywhere on the
 model, and PETG present at all 8 gap layers.

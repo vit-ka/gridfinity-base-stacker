@@ -122,6 +122,47 @@ def dummy_block(plates: list[dict], width: float, depth: float) -> Mesh:
                  for f in box(-w, -d, p["z0"], w, d, p["z1"]))
 
 
+STRUCTURAL = {"name", "matrix", "source_file", "source_object_id", "source_volume_id",
+              "source_offset_x", "source_offset_y", "source_offset_z", "extruder"}
+
+
+def part_settings(xml: str, needle: str) -> list[tuple[str, str]]:
+    """Per-part print settings from the template's part whose name contains `needle`.
+
+    Bambu keeps these on the <part>, not in project_settings, which is why a
+    diff of the project settings shows nothing when someone has configured a
+    part. They are what makes the film print as a film: no walls and no shells,
+    so it is entirely sparse infill and therefore follows `infill_direction`,
+    which alternates 45 and 135 degrees layer to layer on its own.
+
+    Read from the template rather than hardcoded, so changing them is the same
+    gesture as changing anything else on the plate: set them on the part in
+    Bambu, save the project, point --template at it.
+    """
+    for block in re.findall(r"<part\b.*?</part>", xml, re.S):
+        name = re.search(r'<metadata key="name" value="([^"]*)"', block)
+        if not name or needle not in name.group(1).lower():
+            continue
+        return [(k, v) for k, v in
+                re.findall(r'<metadata key="([^"]+)" value="([^"]*)"', block)
+                if k not in STRUCTURAL]
+    return []
+
+
+def dummy_film(plates: list[dict], width: float, depth: float,
+               clearance: float = 0.1) -> Mesh:
+    """A placeholder film: one slab per gap, held clear of the plates.
+
+    The template needs a film part so its print settings have somewhere to live,
+    but not the real one -- that is 70,000 facets of lattice and the template is
+    meant to stay small enough to commit.
+    """
+    w, d = width / 2, depth / 2
+    return tuple(f for a, b in zip(plates, plates[1:])
+                 for f in box(-w, -d, a["z1"] + clearance,
+                              w, d, b["z0"] - clearance))
+
+
 def build_items(xml: str) -> dict[int, tuple[float, float, float]]:
     """Bed positions from the template's <build>, keyed by object id."""
     out = {}
@@ -151,6 +192,10 @@ def main(argv=None) -> int:
                          "slicer generates no support at all")
     ap.add_argument("--interface-extruder", type=int, default=5,
                     help="filament slot for the film (default 5)")
+    ap.add_argument("--dummy-film", action="store_true",
+                    help="with --dummy, also stand in a placeholder film, so the "
+                         "template has a part for the film's print settings to "
+                         "live on")
     ap.add_argument("--decoy-size", type=float, default=7.0,
                     help="side of the decoy column, mm (default 7)")
     ap.add_argument("--blocker-margin", type=float, default=1.0)
@@ -158,6 +203,7 @@ def main(argv=None) -> int:
 
     if (args.model is None) == (args.dummy is None):
         ap.error("give exactly one of --model or --dummy")
+    film = None
     doc = json.loads(args.plates.read_text())
 
     if args.dummy:
@@ -167,12 +213,17 @@ def main(argv=None) -> int:
             ap.error(f"--dummy wants WxD in mm, got {args.dummy!r}")
         model = dummy_block(doc["plates"], w, d)
         stem = "stack-placeholder"
+        if args.dummy_film:
+            film = dummy_film(doc["plates"], w, d)
     else:
         model = read_stl(args.model)
         stem = args.model.stem
     mb = bounds_of(model)
 
-    film = read_stl(args.interface) if args.interface else None
+    if args.interface:
+        film = read_stl(args.interface)
+    if args.dummy_film and not args.dummy:
+        ap.error("--dummy-film only makes sense with --dummy")
     decoy = decoy_column(doc["plates"], args.decoy_size)
     blocker = blocker_box(mb, args.blocker_margin)
     db = bounds_of(decoy)
@@ -196,9 +247,14 @@ def main(argv=None) -> int:
         if "decoy" in m.group(2).lower():
             dec_id = int(m.group(1))
     main_id = next((i for i in pos if i != dec_id), None)
-    if dec_id is None or main_id is None:
-        raise SystemExit(f"{args.template}: expected two objects on the plate, one "
-                         f"with 'decoy' in its name; found {sorted(pos)}.")
+    if main_id is None:
+        raise SystemExit(f"{args.template}: no object found on the plate; "
+                         f"found {sorted(pos)}.")
+    if dec_id is None:
+        # A template built for the film workflow has no decoy: nothing needs to
+        # provoke a filament change, because the film is a part in its own right.
+        dec_id = max(pos) + 1
+        dx = dy = 0.0
 
     # Object-local coordinates: centred on the object's own bounding box.
     mcx, mcy, mcz = (mb.x0 + mb.x1) / 2, (mb.y0 + mb.y1) / 2, (mb.z0 + mb.z1) / 2
@@ -220,7 +276,8 @@ def main(argv=None) -> int:
     # Keep each object where the template put it; only the height follows the
     # new stack, since the item's z is the object centre.
     mx, my, _ = pos[main_id]
-    dx, dy, _ = pos[dec_id]
+    if dec_id in pos:
+        dx, dy, _ = pos[dec_id]
 
     def comp(path, oid, uid):
         return (f'    <component p:path="{path}" objectid="{oid}" p:UUID="{uid}" '
@@ -259,9 +316,10 @@ def main(argv=None) -> int:
     e_main = ext.get(str(main_id), "1")
     e_dec = ext.get(str(dec_id), "1")
 
-    def part(pid, name, subtype, faces, extruder, off):
+    def part(pid, name, subtype, faces, extruder, off, extra=()):
         e = (f'      <metadata key="extruder" value="{extruder}"/>\n'
              if extruder is not None else "")
+        e += "".join(f'      <metadata key="{k}" value="{v}"/>\n' for k, v in extra)
         return (f'    <part id="{pid}" subtype="{subtype}">\n'
                 f'      <metadata key="name" value="{name}"/>\n'
                 f'      <metadata key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>\n'
@@ -276,8 +334,10 @@ def main(argv=None) -> int:
                 f'degenerate_facets="0" facets_removed="0" facets_reversed="0" '
                 f'backwards_edges="0"/>\n    </part>\n')
 
+    film_settings = part_settings(tmpl_set, "interface")
     second = (part(2, f"{stem}-interface.stl", "normal_part", b_faces,
-                   str(args.interface_extruder), mcz) if film is not None
+                   str(args.interface_extruder), mcz, film_settings)
+              if film is not None
               else part(2, f"{stem}-noSupport.stl", "support_blocker", b_faces,
                         "0", mcz))
     decoy_block = ("" if film is not None else
@@ -342,8 +402,16 @@ def main(argv=None) -> int:
           f"{mb.width:.1f} x {mb.depth:.1f} x {mb.height:.1f} mm  "
           f"at ({mx:.1f}, {my:.1f}), extruder {e_main}")
     if film is not None:
-        print(f"  film     {args.interface.name}  {b_faces} facets, "
+        label = args.interface.name if args.interface else "placeholder"
+        print(f"  film     {label}  {b_faces} facets, "
               f"extruder {args.interface_extruder}, support disabled")
+        if film_settings:
+            print(f"           carrying {len(film_settings)} part settings from "
+                  f"the template: "
+                  + ", ".join(k for k, _ in film_settings[:4]) + ", ...")
+        else:
+            print("           no part settings found on the template's interface "
+                  "part -- the film will print with the object's own settings")
     else:
         print(f"  blocker  whole-stack box, {b_faces} facets, support_blocker part")
         print(f"  decoy    {args.decoy_size:g} mm square, "
