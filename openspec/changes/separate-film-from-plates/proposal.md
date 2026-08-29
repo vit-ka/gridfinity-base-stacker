@@ -41,17 +41,46 @@ film has to be physically separated, not merely assigned another filament.
 
 ## Open questions
 
-- Whether 0.1 mm is the smallest clearance that works. It was chosen because it
-  is what the merge prompted, not because anything smaller was measured. Worth
-  one slice at 0.05 mm before the height cost is accepted permanently -- and a
-  slice answers it, since the failure is visible without printing.
+- ~~Whether 0.1 mm is the smallest clearance that works, since every 0.1 mm
+  costs height across every gap.~~ **The premise was wrong.** Clearance costs no
+  height at all:
 
-- **The CLI and the GUI disagree, and that is unexplained.** Slicing the very
-  same 3mf from the command line produces 6,940 mm of interface filament, present
-  in all eight gaps; the GUI merges the parts and produces none. The file itself
-  is not at fault: it declares the film as its own part with its own extruder,
-  and the copy Bambu re-saved still does. Until this is understood, a CLI slice
-  is not evidence that the GUI will behave, which undercuts how the rest of this
-  project has been verified. Clearance is likely to fix it either way, since
-  coincident geometry is the obvious cause, but the change should confirm the fix
-  in the GUI and not only in the harness.
+  | gap | clearance | stack height | film |
+  |---|---|---|---|
+  | 0.4 | 0.05 | 39.2 mm | 0.30 mm |
+  | 0.4 | 0.10 | 39.2 mm | 0.20 mm |
+  | 0.6 | 0.05 | 40.8 mm | 0.50 mm |
+  | 0.6 | 0.10 | 40.8 mm | 0.40 mm |
+
+  Height follows the gap, and the gap is snapped to a whole layer, so the only
+  heights on offer are 39.2 mm and 40.8 mm. Clearance only decides how much of
+  the gap is film.
+
+  That makes the real question a different one: whether **0.4 mm gap with 0.05 mm
+  clearance** works, since it is a whole layer shorter. Sliced, it keeps two
+  interface layers per gap -- 39.2 mm and 7.39 h against 40.8 mm and 8.71 h, and
+  224.6 g of PLA against 257.5 g. Worth a third of a kilo of filament and an hour
+  and a quarter.
+
+  Still open, and only a GUI check or a print can answer it: whether 0.05 mm is
+  enough separation. 0.1 mm is confirmed; 0 mm is confirmed to fail.
+
+- ~~The CLI and the GUI disagree, and that is unexplained.~~ **Closed.** They
+  disagree only about *coincident surfaces*, and that is the whole of it.
+
+  Reproduced on current geometry: with the film flush against the plates, a CLI
+  slice puts 13,151 mm of interface filament on the model, and the GUI merges the
+  volumes and puts down none. Same file, same declared parts, opposite answers.
+  Which is what an ambiguous input means -- two surfaces occupying the same plane
+  give a slicer no fact to decide by, so each resolves it however it happens to,
+  and neither is wrong.
+
+  Hold the film clear and the ambiguity is gone: both agree, confirmed in the GUI
+  preview. So the clearance is doing a second job beyond stopping the merge --
+  it is what makes the geometry decidable at all.
+
+  What this leaves behind is a rule, not a caveat: a CLI slice is evidence only
+  where the geometry is unambiguous. It is not a weaker instrument than the GUI,
+  and this was never a CLI-versus-GUI difference in general -- coincident
+  surfaces are the only case in which they have been seen to differ, and nothing
+  the generator now emits contains any.

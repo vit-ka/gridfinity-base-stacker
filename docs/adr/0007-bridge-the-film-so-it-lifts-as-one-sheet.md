@@ -67,6 +67,25 @@ about the sheet.
 
 Costs 1.2 cm3 of interface filament at the default, 0.8 at the knee.
 
+## A CLI slice is evidence only where the geometry is unambiguous
+
+Recorded here because nearly everything in this project is verified by slicing
+from the command line, and for a while that looked unsafe.
+
+With the film flush against the plates, a CLI slice put 13,151 mm of interface
+filament on the model and the GUI merged the volumes and put down none. Same
+file, same declared parts, opposite answers. That is what an ambiguous input
+means: two surfaces in the same plane give a slicer no fact to decide by, so each
+resolves it however it happens to.
+
+Hold the film clear and both agree. So the clearance in ADR 0006's sibling change
+does a second job beyond stopping the merge -- it makes the geometry decidable.
+
+This was never a CLI-versus-GUI difference in general. Coincident surfaces are
+the only case in which the two have been seen to differ, and the generator no
+longer emits any: the film is held clear of the plates, and pieces of one region
+overlap rather than touch.
+
 ## What was measured wrong first
 
 - **An island does not bridge at the same distance diagonally as along an axis,
