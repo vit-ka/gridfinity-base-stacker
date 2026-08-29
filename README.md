@@ -130,6 +130,21 @@ at every turn. Measured across all interfaces of a nine-plate stack: 6,214
 separate extrusion paths against 38,686, and 4 g less material. Leave
 `support_interface_loop_pattern` off.
 
+## Working on this
+
+Changes go through OpenSpec (`openspec/`): `/opsx:propose` to write one,
+`/opsx:apply` to implement it, `/opsx:archive` when it lands. The project context
+in `openspec/config.yaml` carries the domain facts that are not guessable from
+the code -- the socket taper, the registration, and the fact that nothing on the
+model is supported by the slicer.
+
+Decisions still live in `docs/adr`. OpenSpec tracks the work; an ADR records what
+future work has to live with, and several of them exist to stop approaches being
+re-tried after they measured as dead ends.
+
+Verify against a sliced file, not only the test suite. The suite has passed while
+the model printed into air.
+
 ## Support pillars
 
 Nothing the slicer generates lands on the model, so every overhang has to be

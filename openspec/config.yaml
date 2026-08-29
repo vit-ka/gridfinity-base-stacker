@@ -1,0 +1,59 @@
+schema: spec-driven
+
+context: |
+  A generator, not an application. `stack_plates.py` takes an STL of a Gridfinity
+  extended baseplate set -- several plates in one file -- and emits a single solid
+  that prints them stacked in one job, separated by gaps a second filament fills.
+  `make3mf.py` wraps that in a Bambu Studio project. Nothing runs at print time;
+  everything is decided when the geometry is written.
+
+  Python 3, standard library only. No numpy, no trimesh, no mesh kernel: meshes
+  are flat tuples of floats and every geometric question is answered by ray
+  casting or by rasterising to a grid. That constraint is deliberate and has held
+  through the whole project.
+
+  Style is in ~/.claude/CLAUDE.md: frozen dataclasses, immutable types,
+  comprehensions over loops, `from __future__ import annotations`, annotated
+  signatures.
+
+  Domain, because none of it is guessable from the code:
+
+  - Gridfinity plates are a 42 mm lattice of tapered sockets. The socket is a 45
+    degree funnel: 36.14 mm across at the rib face, 40.5 mm at the land face.
+    Plates in a set have different cell counts, so a narrower plate's solid
+    border can sit squarely over a wider plate's socket -- and those sockets are
+    through-holes.
+  - Alternate plates are rotated 180 degrees so every interface is land-to-land
+    or rib-to-rib, and the lattices are registered onto a common 42 mm grid.
+  - The separation works because PETG does not bond to PLA. That is the entire
+    mechanism; there is no clearance anywhere between the film and the plates.
+  - Nothing on the model is supported by the slicer. Support is off. Every
+    overhang is carried by generated geometry, so anything the generator misses
+    prints into air.
+
+  How work is judged here: by measurement, not by argument. The Bambu CLI slices
+  the real file and the G-code is parsed for what actually happened. Several
+  confident conclusions in this repo's history were wrong until measured, and
+  several bugs were invisible to the tests but obvious in the slicer preview. A
+  change is not done because it looks right.
+
+rules:
+  proposal:
+    - State how the change will be measured, not only what it will do. Print
+      time, material, clearance in mm, support extrusion in mm -- whatever the
+      claim rests on.
+    - Say what was ruled out and why. This project has repeatedly re-tried
+      approaches that were already measured as dead ends.
+  tasks:
+    - Include verifying against a sliced file, not only against the test suite.
+      The suite has passed while the model printed into air.
+
+operations:
+  archive:
+    guidance:
+      - Decisions belong in docs/adr, which predates OpenSpec here and is
+        required by ~/.claude/CLAUDE.md. Archive the change, and write or
+        supersede an ADR when the change locks in something future work has to
+        live with. Do not duplicate the reasoning in both places.
+      - Record approaches that measured as no-ops. Two are already in ADR 0005
+        precisely so they are not attempted a third time.
