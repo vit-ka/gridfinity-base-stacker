@@ -44,6 +44,46 @@ def non_manifold(mesh) -> list[tuple[tuple, int]]:
     return [(e, n) for e, n in used.items() if n != 2]
 
 
+def film_regions(mesh, gaps, step: float = 0.15) -> dict:
+    """Connected regions of film per gap, read back from the written geometry.
+
+    Independent of the plan that produced it, which is the point: the generator
+    counts regions on the raster it is about to emit, and this counts them on
+    what actually reached the file.
+
+    Rasterised rather than compared shell by shell, because the film's pieces
+    overlap deliberately (they must, or their shared edges would be
+    non-manifold) and overlapping boxes share no vertices -- so splitting the
+    mesh into connected shells reports every box separately and says nothing
+    about whether the sheet is joined.
+    """
+    boxes = [stl_io.bounds_of(mesh[i:i + 12]) for i in range(0, len(mesh), 12)]
+    if not boxes:
+        return {}
+    x0 = min(b.x0 for b in boxes)
+    y0 = min(b.y0 for b in boxes)
+    w = max(1, int((max(b.x1 for b in boxes) - x0) / step) + 2)
+    h = max(1, int((max(b.y1 for b in boxes) - y0) / step) + 2)
+
+    out = {}
+    for n, (lo, hi) in enumerate(gaps, 1):
+        rows = [0] * h
+        for b in boxes:
+            if not (lo - 1e-6 <= (b.z0 + b.z1) / 2 <= hi + 1e-6):
+                continue
+            ix0 = max(0, int((b.x0 - x0) / step))
+            ix1 = min(w, int((b.x1 - x0) / step) + 1)
+            iy0 = max(0, int((b.y0 - y0) / step))
+            iy1 = min(h, int((b.y1 - y0) / step) + 1)
+            if ix1 <= ix0:
+                continue
+            mask = ((1 << (ix1 - ix0)) - 1) << ix0
+            for iy in range(iy0, iy1):
+                rows[iy] |= mask
+        out[n] = sp.components(rows, w, h)
+    return out
+
+
 def main(src: Path, stack: Path, blockers: Path, gap: float = 0.8) -> int:
     orig = stl_io.read_stl(src)
     out = stl_io.read_stl(stack)

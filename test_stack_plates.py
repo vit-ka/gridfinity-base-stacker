@@ -809,6 +809,138 @@ class TestGapFilm(unittest.TestCase):
         self.assertLessEqual(reach, self.LAYER + 1e-6, "steeper than 45 degrees")
 
 
+class TestComponents(unittest.TestCase):
+    """Counting islands is the measurement the film's bridging rests on."""
+
+    def test_empty_is_none(self):
+        self.assertEqual(sp.components([0, 0, 0], 4, 3), 0)
+
+    def test_one_blob_is_one(self):
+        self.assertEqual(sp.components([0b0110, 0b0110], 4, 2), 1)
+
+    def test_two_separated_blobs_are_two(self):
+        self.assertEqual(sp.components([0b1001, 0b1001], 4, 2), 2)
+
+    def test_corner_touching_counts_as_two(self):
+        """A corner join is not a join a sheet survives being pulled by."""
+        self.assertEqual(sp.components([0b01, 0b10], 2, 2), 2)
+
+    def test_an_island_inside_a_ring_is_its_own_region(self):
+        ring = [0b11111, 0b10001, 0b10101, 0b10001, 0b11111]
+        self.assertEqual(sp.components(ring, 5, 5), 2)
+
+    def test_a_u_shape_is_one(self):
+        self.assertEqual(sp.components([0b101, 0b101, 0b111], 3, 3), 1)
+
+
+class TestBridging(unittest.TestCase):
+    """Film on a pillar top is an island ringed by the socket opening, and an
+    island stays behind in the socket when the sheet is lifted."""
+
+    STEP = 0.1
+
+    def rows(self, spec):
+        return [sum(1 << x for x, ch in enumerate(line) if ch == "#") for line in spec]
+
+    def test_an_island_joins_below_the_span_and_not_above(self):
+        w = 40
+        rows = [sum(1 << x for x in list(range(0, 5)) + list(range(15, 20)))] * 5
+        self.assertEqual(sp.components(rows, w, 5), 2)
+        near = sp.closed(rows, 1.5 / 2 / self.STEP, w, 5)
+        far = sp.closed(rows, 0.5 / 2 / self.STEP, w, 5)
+        self.assertEqual(sp.components(near, w, 5), 1)
+        self.assertEqual(sp.components(far, w, 5), 2)
+
+    def test_each_side_closes_on_its_own_width(self):
+        """Near a wall on one side, far from anything on the other: the near side
+        bridges and the far side's clear cells stay clear."""
+        w, h = 60, 5
+        wall = sum(1 << x for x in range(0, 5))
+        island = sum(1 << x for x in range(10, 15))
+        rows = [wall | island] * h
+        got = sp.closed(rows, 1.0 / 2 / self.STEP, w, h)
+        self.assertEqual(sp.components(got, w, h), 1, "near side should bridge")
+        for y in range(h):
+            self.assertEqual(got[y] >> 20, 0,
+                             "the far side, with nothing to reach, stayed clear")
+
+    def test_bridging_does_not_favour_an_axis(self):
+        """The same gap closes at the same span whichever way it is turned.
+
+        Isotropy is about the structuring element having no axis preference, not
+        about every configuration closing at its nearest-point distance. A gap
+        closes on its channel *width*: two blobs meeting corner to corner have a
+        wedge-shaped void wider than the corner-to-corner distance, so it needs a
+        larger disc than an equally distant face-to-face gap -- measured, radius
+        7 against 4 for nearest points 5.66 and 5.00 cells apart. That is the
+        geometry, not a bias, and rotating a gap does not change it.
+        """
+        w = h = 24
+        def joins_at(rows):
+            for r in range(1, 15):
+                if sp.components(sp.closed(rows, float(r), w, h), w, h) == 1:
+                    return r
+            return None
+
+        across_x = [0] * h
+        for y in range(0, 4):
+            for x in list(range(0, 4)) + list(range(9, 13)):
+                across_x[y] |= 1 << x
+        across_y = [0] * h
+        for y in list(range(0, 4)) + list(range(9, 13)):
+            for x in range(0, 4):
+                across_y[y] |= 1 << x
+
+        self.assertEqual(sp.components(across_x, w, h), 2)
+        self.assertEqual(sp.components(across_y, w, h), 2)
+        self.assertEqual(joins_at(across_x), joins_at(across_y),
+                         "the same gap turned 90 degrees closed at a different span")
+
+    def test_zero_span_changes_nothing(self):
+        rows = [0b1000001, 0b1000001]
+        self.assertEqual(sp.closed(rows, 0.0, 7, 2), rows)
+
+    def test_the_flare_still_holds_over_a_bridge(self):
+        """Bridging feeds the base, and the flare is applied to whatever base it
+        is given -- so no layer may overhang the one below by more than a layer."""
+        plates = tuple(sp.build_plate(perforated_plate(w, d))
+                       for w, d in ((5, 4), (5, 3), (4, 4), (4, 3)))
+        pl = sp.plan(plates, 0.6, flip=True, register=True)
+        mesh = sp.interface_slabs(pl, 0.6, bridge_span=6.0)
+        boxes = [stl_io.bounds_of(mesh[i:i + 12]) for i in range(0, len(mesh), 12)]
+        zs = sorted({round(b.z0, 3) for b in boxes})
+        lows = [b for b in boxes if abs(b.z0 - zs[0]) < 1e-9]
+        highs = [b for b in boxes if abs(b.z0 - zs[1]) < 1e-9]
+        self.assertTrue(lows and highs)
+        reach = max(b.x1 for b in highs) - max(b.x1 for b in lows)
+        self.assertLessEqual(reach, 0.2 + 1e-6, "steeper than 45 degrees")
+        self.assertGreaterEqual(reach, 0.0)
+
+
+class TestFilmRegions(unittest.TestCase):
+    def test_counted_from_the_written_geometry(self):
+        """Rasterised, not split into shells: the film's pieces overlap on
+        purpose, and overlapping boxes share no vertices, so shell-splitting
+        would report every box separately and say nothing about the sheet."""
+        plates = tuple(sp.build_plate(perforated_plate(w, d))
+                       for w, d in ((5, 4), (5, 3), (4, 4), (4, 3)))
+        pl = sp.plan(plates, 0.6, flip=True, register=True)
+        gaps = [(round(a.z1, 2), round(b.z0, 2)) for a, b in zip(pl, pl[1:])]
+        mesh = sp.interface_slabs(pl, 0.6)
+        got = verify.film_regions(mesh, gaps)
+        self.assertEqual(len(got), len(gaps))
+        self.assertTrue(all(n >= 1 for n in got.values()))
+
+    def test_bridging_reduces_the_count(self):
+        plates = tuple(sp.build_plate(perforated_plate(w, d))
+                       for w, d in ((5, 4), (5, 3), (4, 4), (4, 3)))
+        pl = sp.plan(plates, 0.6, flip=True, register=True)
+        gaps = [(round(a.z1, 2), round(b.z0, 2)) for a, b in zip(pl, pl[1:])]
+        off = verify.film_regions(sp.interface_slabs(pl, 0.6, bridge_span=0.0), gaps)
+        on = verify.film_regions(sp.interface_slabs(pl, 0.6, bridge_span=6.0), gaps)
+        self.assertLessEqual(sum(on.values()), sum(off.values()))
+
+
 class TestManifold(unittest.TestCase):
     """Every edge shared by exactly two facets.
 

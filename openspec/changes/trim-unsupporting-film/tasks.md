@@ -8,6 +8,16 @@
 - [ ] 2.1 Compute `must-carry` per gap: the plate above's downward face united
       with the pillar occupancy at the level above
 - [ ] 2.2 Intersect the film's bottom layer with it, then flare from the result
+- [ ] 2.3 **Trim before bridging, never after.** `bridge-film-over-pillars` has
+      landed and closes the film's base across short spans, and that closing is
+      the last step of forming the base. Run this trim after it and it deletes
+      every bridge: a bridge span carries nothing by construction -- anywhere
+      above it that needed carrying would already stand a pillar, and that pillar
+      would already be in the base, so there would have been nothing to bridge.
+      Film on a pillar *top* is the opposite case and must survive: it carries
+      the plate border the pillar exists for, so it is never a trim target.
+      Verify by asserting the film's region count per gap is unchanged by the
+      trim -- 1 per gap on the nine-plate drawer stack
 
 ## 3. Verify nothing lost its footing
 
