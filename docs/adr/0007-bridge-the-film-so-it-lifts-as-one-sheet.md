@@ -86,6 +86,22 @@ the only case in which the two have been seen to differ, and the generator no
 longer emits any: the film is held clear of the plates, and pieces of one region
 overlap rather than touch.
 
+## The clearance is bounded, not chosen
+
+0.1 mm per face, and each neighbouring value has been tried:
+
+| clearance | what happens |
+|---|---|
+| 0 | the slicer merges the film into the plates; no interface filament at all |
+| 0.05 mm | prints, but welds shut -- the stack does not come apart |
+| 0.1 mm | separates |
+
+It also costs nothing to hold it there. Height follows the gap, the gap snaps to
+a whole layer, so the only stack heights on offer are 39.2 mm and 40.8 mm
+whatever the clearance; a smaller value buys a thicker film, not a shorter stack.
+The 0.4 mm gap at 0.05 mm clearance would have saved an hour and a quarter and a
+third of a kilo of filament, and it is the value that welds.
+
 ## What was measured wrong first
 
 - **An island does not bridge at the same distance diagonally as along an axis,

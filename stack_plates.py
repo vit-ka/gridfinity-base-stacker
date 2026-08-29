@@ -1887,11 +1887,15 @@ def main(argv: list[str] | None = None) -> int:
                          "value to use if that matters")
     ap.add_argument("--interface-clearance", type=float, default=0.1,
                     help="hold the film clear of the plates it sits between, mm "
-                         "per face (default 0.1). Zero makes it fill the gap and "
-                         "touch both, which the slicer then merges into the "
-                         "plates and prints in one filament -- there is no film "
-                         "at all in the result. Not refused, because it was the "
-                         "previous default and is a legitimate thing to ask for")
+                         "per face (default 0.1). The default is the smallest "
+                         "value measured to work, and it is bounded on both "
+                         "sides: at 0 the slicer merges the film into the plates "
+                         "and lays down no interface filament at all, and at 0.05 "
+                         "it prints but welds shut and the stack will not come "
+                         "apart. Note that clearance costs no height -- that "
+                         "follows the gap, which snaps to a whole layer -- so a "
+                         "smaller value buys a thicker film, not a shorter stack. "
+                         "Zero is still permitted, being the previous default")
     ap.add_argument("--decoy", action="store_true",
                     help="also emit a decoy column and a whole-model support "
                          "blocker: the column is supported so the slicer changes "

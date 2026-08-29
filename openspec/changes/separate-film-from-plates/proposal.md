@@ -62,8 +62,10 @@ film has to be physically separated, not merely assigned another filament.
   224.6 g of PLA against 257.5 g. Worth a third of a kilo of filament and an hour
   and a quarter.
 
-  Still open, and only a GUI check or a print can answer it: whether 0.05 mm is
-  enough separation. 0.1 mm is confirmed; 0 mm is confirmed to fail.
+  **0.05 mm welds shut.** Tested: the film prints, but the stack does not come
+  apart. So the saving is not available, 40.8 mm and 8.71 h stand, and 0.1 mm is
+  now bounded on both sides rather than merely chosen -- 0 merges at slicing,
+  0.05 welds at printing, 0.1 separates. There is nothing left to tune here.
 
 - ~~The CLI and the GUI disagree, and that is unexplained.~~ **Closed.** They
   disagree only about *coincident surfaces*, and that is the whole of it.
