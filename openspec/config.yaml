@@ -4,8 +4,9 @@ context: |
   A generator, not an application. `stack_plates.py` takes an STL of a Gridfinity
   extended baseplate set -- several plates in one file -- and emits a single solid
   that prints them stacked in one job, separated by gaps a second filament fills.
-  `make3mf.py` wraps that in a Bambu Studio project. Nothing runs at print time;
-  everything is decided when the geometry is written.
+  `make3mf.py` wraps that in a Bambu Studio project, and `emit_interface.py`
+  writes the separating material into the sliced G-code afterwards. Nothing runs
+  at print time; everything is decided before the file reaches the printer.
 
   Python 3, standard library only. No numpy, no trimesh, no mesh kernel: meshes
   are flat tuples of floats and every geometric question is answered by ray
@@ -25,20 +26,28 @@ context: |
     through-holes.
   - Alternate plates are rotated 180 degrees so every interface is land-to-land
     or rib-to-rib, and the lattices are registered onto a common 42 mm grid.
-  - The film prints in a filament meant not to bond to PLA -- Bambu Support W,
-    a breakaway support material; PETG before it. Adhesion is a window, not a
-    yes/no: PETG peeled off mid-print, Support W stuck so hard the plates had to
-    be pried and cut apart. Neither has yet produced a stack that separates, and
-    no claim that non-bonding is "the entire mechanism" survives the test prints
-    (ADR 0008). There is no clearance anywhere between the film and the plates.
+  - The interface prints in a filament meant not to bond to PLA -- Bambu Support
+    W, a breakaway support material, or PETG at its own 255 C. Material was not
+    the problem: at a real 0.2 mm clearance on both faces both separate by hand,
+    and at a nominal 0.1 mm both fused, because the clearance was never printed
+    (ADR 0008, ADR 0009).
+  - The interface is not a mesh. A mesh is resolved against the slicer's sample
+    planes, which quantises its height to the layer and decides ties by float
+    rounding that depends on the stack's height. It is emitted as toolpaths
+    written into the sliced file instead, so its Z is exact and the clearance
+    above and below it are separate numbers.
   - Test on small, fast-printing plates. Two full-size stacks were lost partway
     through and answered nothing about separation.
-  - Nothing on the model is supported by the slicer. Support is off. Every
-    overhang is carried by generated geometry, so anything the generator misses
-    prints into air.
+  - Nothing on the *stack* is supported by the slicer -- a blocker covers it --
+    and every overhang is carried by generated geometry, so anything the
+    generator misses prints into air. Support is on, for a decoy column beside
+    the stack: its gaps are what make the slicer load and purge the interface
+    filament at the heights the interface needs.
 
   How work is judged here: by measurement, not by argument. The Bambu CLI slices
-  the real file and the G-code is parsed for what actually happened. Several
+  the real file (`--no-check` is required: an empty gap is an "empty layer" it
+  refuses) and the G-code is parsed for what actually happened, by `gcode.py`
+  and reported by `verify.py`. Several
   confident conclusions in this repo's history were wrong until measured, and
   several bugs were invisible to the tests but obvious in the slicer preview. A
   change is not done because it looks right.

@@ -17,7 +17,6 @@ from pathlib import Path
 
 import gridfinity as gf
 from stl_io import (Bounds, Mesh, bounds_of, box, read_stl, rotate_x180,
-                    signed_volume,
                     rotate_y180, split_shells, translate, write_stl)
 
 LAND, RIB = "land", "rib"
@@ -1021,20 +1020,59 @@ def support_fillers(placements: tuple[Placement, ...], gap: float,
     return tuple(out)
 
 
-def interface_slabs(placements: tuple[Placement, ...], gap: float,
-                    layer: float = 0.2, grow: float = 0.4,
-                    step: float = 0.15, min_width: float = 0.42,
-                    flare: float = 0.2, clearance: float = 0.1,
-                    clearance_above: float | None = None,
-                    weld: float = 0.001, bridge_span: float = 6.0,
-                    trim: bool = True) -> Mesh:
-    """The film filling each gap, as a solid printed in its own filament.
+@dataclass(frozen=True)
+class InterfaceLayer:
+    """One printed layer of the interface, in one gap.
+
+    `rows` is the filled region as a bitmask, one integer per grid row with bit
+    `ix` set where the cell at (ix, iy) is filled -- the same representation the
+    pillar tracing uses, and the reason no geometry library is needed here.
+    """
+    gap: int            # which gap, counting up from 0
+    index: int          # which layer within that gap, counting up from 0
+    z0: float           # bottom of the layer's material
+    z1: float           # top of it, which is the Z the printer is given
+    rows: tuple[int, ...]
+
+    @property
+    def height(self) -> float:
+        return self.z1 - self.z0
+
+
+@dataclass(frozen=True)
+class Interface:
+    """Every interface layer in the stack, on one shared raster grid."""
+    x0: float
+    y0: float
+    step: float
+    w: int
+    h: int
+    layers: tuple[InterfaceLayer, ...]
+
+    def cell(self, ix: int, iy: int) -> tuple[float, float]:
+        """Centre of a grid cell in bed coordinates."""
+        return self.x0 + (ix + 0.5) * self.step, self.y0 + (iy + 0.5) * self.step
+
+
+def interface_layers(placements: tuple[Placement, ...], gap: float,
+                     layer: float = 0.2, grow: float = 0.4,
+                     step: float = 0.15, min_width: float = 0.42,
+                     flare: float = 0.2, clearance: float = 0.1,
+                     clearance_above: float | None = None,
+                     bridge_span: float = 6.0,
+                     trim: bool = True) -> Interface:
+    """Where interface material goes: one region per layer per gap.
 
     This is what the slicer used to make as support interface, made deliberately
-    instead. As part of the model it gets ordinary perimeters and solid infill,
-    so it comes out a continuous sheet rather than the stub-ridden lattice a
-    support pattern leaves -- and no support machinery is involved at all, so
-    there are no balconies to remove and nothing to post-process.
+    instead: a continuous sheet rather than the stub-ridden lattice a support
+    pattern leaves, with no support machinery involved and so no balconies to
+    remove.
+
+    The regions are the whole of the film's shape logic and they do not care what
+    is done with them afterwards. They were boxes handed to the slicer until the
+    slicer's layer grid turned out to own the film's position (ADR 0009); they
+    are extrusions written straight into the sliced file now. Nothing between
+    here and `support_regions()` changed when that did.
 
     It carries the pillars as well as the plates. Pillars occupy the plates' own
     z bands, so the same gaps fall between them, and an empty gap above a pillar
@@ -1105,29 +1143,174 @@ def interface_slabs(placements: tuple[Placement, ...], gap: float,
                 f"or lower the clearance.")
         n = max(1, int(round((hi - lo) / layer)))
         for k in range(n):
-            zlo = lo + (hi - lo) * k / n
-            zhi = lo + (hi - lo) * (k + 1) / n
             # Not clipped to the stack's extent. The flare is meant to overhang
             # by a layer's worth on every side, all the way around, including
             # past the outer edge -- that lip is the point of it, not spill.
             # Only the base is held inside the extent, so growth that escapes is
             # the flare's and nothing else's.
             rows = dilate(base, k * flare / step, w, h) if k else base
-            # Boxes, overlapping by `weld` rather than abutting. Two closed
-            # solids that touch put four facets on the shared edge; two that
-            # interpenetrate share no edge at all, and the slicer unions them
-            # either way. Tracing the film's outline instead is what a pillar
-            # gets, and it defeats the triangulation here -- twenty interlocking
-            # holes in a two-thousand-point loop (see ADR and the change's
-            # design). A micron is 1/200th of the clearance the pillars hold.
-            # Welded sideways between neighbours, and upward into the band
-            # above -- but not past the film's own top, which is what holds it
-            # clear of the plate. The last band therefore ends exactly at zhi.
-            top = zhi + (weld if k < n - 1 else 0.0)
-            for rx0, ry0, rx1, ry1 in grid_rects(rows, x0, y0, w, h, step):
-                out.extend(box(rx0 - weld, ry0 - weld, zlo,
-                               rx1 + weld, ry1 + weld, top))
+            out.append(InterfaceLayer(j, k, lo + (hi - lo) * k / n,
+                                      lo + (hi - lo) * (k + 1) / n, tuple(rows)))
+    return Interface(x0, y0, step, w, h, tuple(out))
+
+
+def slab_mesh(iface: Interface, weld: float = 0.001) -> Mesh:
+    """The interface as boxes, which is what it was before it was toolpaths.
+
+    Kept because it is the only view of the film a person can look at, and
+    because every test of the film's *shape* -- the trim, the bridging, the
+    flare, the clearances -- was written against it and still holds.
+
+    Boxes overlap by `weld` rather than abutting. Two closed solids that touch
+    put four facets on the shared edge; two that interpenetrate share no edge at
+    all, and the slicer unions them either way. Welded sideways between
+    neighbours and upward into the band above -- but not past the film's own
+    top, which is what holds it clear of the plate, so the last band of each gap
+    ends exactly at its `z1`.
+    """
+    out: list = []
+    by_gap: dict[int, int] = {}
+    for lay in iface.layers:
+        by_gap[lay.gap] = max(by_gap.get(lay.gap, 0), lay.index)
+    for lay in iface.layers:
+        top = lay.z1 + (weld if lay.index < by_gap[lay.gap] else 0.0)
+        for rx0, ry0, rx1, ry1 in grid_rects(list(lay.rows), iface.x0, iface.y0,
+                                             iface.w, iface.h, iface.step):
+            out.extend(box(rx0 - weld, ry0 - weld, lay.z0,
+                           rx1 + weld, ry1 + weld, top))
     return tuple(out)
+
+
+def interface_slabs(placements: tuple[Placement, ...], gap: float,
+                    layer: float = 0.2, grow: float = 0.4,
+                    step: float = 0.15, min_width: float = 0.42,
+                    flare: float = 0.2, clearance: float = 0.1,
+                    clearance_above: float | None = None,
+                    weld: float = 0.001, bridge_span: float = 6.0,
+                    trim: bool = True) -> Mesh:
+    """The film as a mesh, for inspection and for the shape tests."""
+    return slab_mesh(interface_layers(placements, gap, layer, grow, step,
+                                      min_width, flare, clearance,
+                                      clearance_above, bridge_span, trim),
+                     weld)
+
+
+def _runs(bits: int, n: int) -> tuple[tuple[int, int], ...]:
+    """Maximal runs of set bits in the low `n` bits, as inclusive (first, last).
+
+    Bit tricks rather than a loop over `n`: the regions here are a thousand cells
+    across and are scanned once per bead, so the difference is seconds.
+    """
+    out: list[tuple[int, int]] = []
+    bits &= (1 << n) - 1
+    while bits:
+        start = (bits & -bits).bit_length() - 1
+        t = bits >> start
+        length = ((t + 1) & ~t).bit_length() - 1
+        out.append((start, start + length - 1))
+        bits &= ~((1 << (start + length)) - 1)
+    return tuple(out)
+
+
+Bead = tuple[float, float, float, float]     # x0, y0, x1, y1
+
+
+def raster(rows: tuple[int, ...], x0: float, y0: float, w: int, h: int,
+           step: float, width: float, along_x: bool) -> tuple[Bead, ...]:
+    """Fill a bitmask region with parallel beads, one extrusion width apart.
+
+    Monotonic: the scanlines advance in one direction and every bead runs the
+    same way, so each is laid beside one that is already down. That is what the
+    film's part settings asked the slicer for -- no walls, no shells, 100% infill
+    with a monotonic pattern -- and the emitter now has to say it directly.
+
+    The beads carry width, so a centre line drawn to the end of a run would put
+    half a bead past it. Each run is inset by half a width at both ends, which
+    keeps every centre line inside the region and every bead end on its boundary.
+    A run narrower than one bead is therefore not filled: it is the fringe of a
+    socket rim, it is under `min_width` by construction, and a slicer without
+    gap-fill does the same thing.
+
+    *Across* the scan the beads are not inset, so one whose centre line runs
+    along the region's edge spills half a width outside it. That is deliberate:
+    insetting there as well would need the region eroded by a bead in one axis,
+    which deletes the fringe teeth the film is trimmed to keep. The spill is
+    horizontal and the film already flares 0.2 mm per layer on purpose; what
+    holds the film clear of the plates is its Z, and that is untouched.
+    """
+    half = width / 2
+    out: list[Bead] = []
+    if along_x:
+        n = max(0, int((h * step - width) / width) + 1)
+        for i in range(n):
+            y = y0 + half + i * width
+            iy = min(h - 1, max(0, int((y - y0) / step)))
+            for a, b in _runs(rows[iy], w):
+                xa, xb = x0 + a * step + half, x0 + (b + 1) * step - half
+                if xb > xa:
+                    out.append((xa, y, xb, y))
+    else:
+        n = max(0, int((w * step - width) / width) + 1)
+        for i in range(n):
+            x = x0 + half + i * width
+            ix = min(w - 1, max(0, int((x - x0) / step)))
+            col = sum(((rows[iy] >> ix) & 1) << iy for iy in range(h))
+            for a, b in _runs(col, h):
+                ya, yb = y0 + a * step + half, y0 + (b + 1) * step - half
+                if yb > ya:
+                    out.append((x, ya, x, yb))
+    return tuple(out)
+
+
+def interface_beads(iface: Interface, width: float = 0.45
+                    ) -> tuple[tuple[InterfaceLayer, tuple[Bead, ...]], ...]:
+    """Every interface layer with the toolpath that fills it.
+
+    The raster axis alternates layer to layer, which is what `infill_direction`
+    did for the mesh film on its own -- 45 and 135 degrees. Ninety degrees apart
+    on the grid's own axes rather than forty-five, because the region is a
+    bitmask and a rotated scan would have to resample it; the angle is a
+    constant, and nothing else here depends on which one it is.
+    """
+    return tuple((lay, raster(lay.rows, iface.x0, iface.y0, iface.w, iface.h,
+                              iface.step, width, along_x=lay.index % 2 == 0))
+                 for lay in iface.layers)
+
+
+def region_counts(iface: Interface) -> dict[int, int]:
+    """Connected regions of interface material per gap, counted on the regions.
+
+    One region per gap is what the film wants: an island is a piece that stays in
+    a socket when the rest of the sheet is peeled, which is what the bridging
+    exists to prevent (ADR 0007). Counted on the union of the gap's layers, which
+    is the top one -- each flares outward over the one below.
+    """
+    out: dict[int, int] = {}
+    rows: dict[int, list[int]] = {}
+    for lay in iface.layers:
+        r = rows.setdefault(lay.gap, [0] * iface.h)
+        for iy, bits in enumerate(lay.rows):
+            r[iy] |= bits
+    for gap, r in rows.items():
+        out[gap + 1] = components(r, iface.w, iface.h)
+    return out
+
+
+def interface_plan(iface: Interface, width: float = 0.45) -> dict:
+    """The interface as data a G-code writer can use, in model coordinates.
+
+    Beads rather than regions: the shape logic belongs with the rest of the
+    geometry, and a region grid for a nine-plate stack is ten megabytes of
+    bitmask where the toolpath that matters is a few hundred kilobytes.
+    """
+    return {
+        "version": 1,
+        "line_width": width,
+        "layers": [{"gap": lay.gap, "index": lay.index,
+                    "z0": round(lay.z0, 6), "z1": round(lay.z1, 6),
+                    "beads": [[round(v, 4) for v in b] for b in beads]}
+                   for lay, beads in interface_beads(iface, width)],
+    }
 
 
 def solid_spans(pl: Placement, x0: float, y0: float, x1: float, y1: float,
@@ -1331,70 +1514,91 @@ PRINTING_TEMPLATE = """# Printing `{stl}`
 
 Generated by `stack_plates.py` from `{source}`.
 
-Build the project and open it:
+Build the project, slice it, and write the interface into the result:
 
     python3 make3mf.py --template templates/stack-template.3mf \\
         --model {stl} --plates {plates} \\
-        --interface {interface} --out {name}.3mf
+        --interface-plan {interface} --out {name}.3mf
 
-Then slice and print. There is nothing to configure: the template carries the
-plate layout, the filament assignments, the film's print settings, and support
-switched off.
+    BambuStudio --no-check --outputdir slice --slice 0 {name}.3mf
+
+    python3 emit_interface.py --project {name}.3mf \\
+        --gcode slice/plate_1.gcode --out {name}.gcode
+
+    python3 verify.py --project {name}.3mf --gcode {name}.gcode
+
+`--no-check` is not optional: the gaps have no model material in them, the slicer
+calls that an empty layer, and without the flag it exits without writing G-code.
+
+Print `{name}.gcode`, not the sliced file. The sliced file has no interface in it
+at all.
 
 {report}
 
 ## What is in the model
 
-The stack itself, the pillars that carry it, and a separate solid -- the film --
-that fills each gap and prints in the second filament.
+The stack itself and the pillars that carry it, both in the object filament; a
+support blocker over the whole of it; and a small decoy column beside it with the
+stack's own z profile. The decoy is there to be supported: its gaps are what make
+the slicer load and purge the interface filament at the heights the interface
+needs, and the blocker is what keeps that support off the stack.
 
-The slicer generates no support at all. Every overhang is carried by geometry
-already in the model, so anything the generator missed prints into air. If the
-preview shows support anywhere, something is wrong: check that the film part is
-still assigned to its own filament and that support is off.
+The interface is not in the model. It is written into the sliced G-code as
+toolpaths at heights chosen to the micron, because a mesh film's height is
+resolved against the slicer's sample planes and comes out quantised to the layer
+(`docs/adr/0009-clearance-is-quantised-to-the-layer-height.md`).
+
+Nothing on the stack is supported by the slicer. Every overhang is carried by
+geometry already in the model, so anything the generator missed prints into air.
+`verify.py` reads the emitted file and says so if any support reached the stack.
 
 ## Numbers for this stack
 
 | | |
 |---|---|
 | gap between plates | {gap:g} mm |
-| film | {film:g} mm, {filmlayers} layers, {clearance:g} mm clear of each plate |
+| interface | {film:g} mm in {filmlayers} layers |
+| clearance below the interface | {clearance:g} mm |
+| clearance above the interface | {above:g} mm |
 | cells | {cells} |
 | socket taper | {angle:.0f} degrees from horizontal |
 
-The film is held clear of the plates on purpose. Flush, the slicer treats it and
-the plate as one body -- the plate gets no top surface and the film no bottom --
-and they print welded. It needs enough clearance to leave one layer with no model
-material on it; at this layer height that is {clearance:g} mm.
+The two clearances do different jobs. The one below is what lets the interface
+release from the plate beneath it. The one above is what the first layer of the
+plate above has to bridge, so the underside of every plate is as poor as that
+number is large -- which is why it is the smaller of the two, and why it is a
+number a mesh could not have expressed.
 
 ## After printing
 
 The stack comes off the bed as one block. Slide a thin blade into a gap and
-twist. The film is a continuous sheet in each gap; the intent is that it lifts
-out in one piece, because it does not bond to the plates.
+twist. The interface is a continuous sheet in each gap; the intent is that it
+lifts out in one piece, because it does not bond to the plates.
 
 Work from the top down. The land-to-land gaps have the least contact area and
 give first; the rib-to-rib gaps need more persuasion.
 
-**This is intent, not a result.** No stack has yet come apart cleanly. Bambu
-Support W held so well that the plates needed active prying and came away
-covered in shreds, with the merged pillar columns needing to be cut off rather
-than peeled; PETG, on the one print that used it, peeled off mid-print instead
-and lost the job. See `docs/adr/0008-what-the-first-test-prints-showed.md`.
+At a real clearance on both faces the stack does separate -- Bambu Support W and
+PETG at 255 C both came apart by hand on a two-plate test
+(`docs/adr/0009-clearance-is-quantised-to-the-layer-height.md`). What that test
+also showed is a poor underside on the plate above, which is what the small
+clearance above is meant to fix and what the next print has to answer.
 """
 
 
 def write_printing_notes(path: Path, placements, gap, layer, report_text,
                          stl_name, plates_name, interface_name, source,
-                         clearance: float = 0.1) -> None:
+                         clearance: float = 0.1,
+                         clearance_above: float | None = None) -> None:
     plate = placements[0].plate
     angle = min(steepest_overhang(pl.plate) for pl in placements)
-    film = max(0.0, gap - 2 * clearance)
+    above = clearance if clearance_above is None else clearance_above
+    film = max(0.0, gap - clearance - above)
     path.write_text(PRINTING_TEMPLATE.format(
         stl=stl_name, plates=plates_name, interface=interface_name,
         name=Path(stl_name).stem, source=source, report=report_text,
         gap=gap, film=film, filmlayers=max(1, round(film / layer)),
-        clearance=clearance, angle=angle,
+        clearance=clearance, above=above, angle=angle,
         cells=sum(p.plate.lattice.cells for p in placements),
     ))
 
@@ -1427,9 +1631,9 @@ def main(argv: list[str] | None = None) -> int:
                          "projection reproduces webs the slicer then drops as too "
                          "thin; much more than this doubles them")
     ap.add_argument("--no-interface", action="store_true",
-                    help="skip the gap film. The stack then has nothing between "
-                         "its plates and cannot be printed as one job; useful "
-                         "only for inspecting the stack on its own")
+                    help="skip the interface plan. The stack then has nothing "
+                         "between its plates and cannot be printed as one job; "
+                         "useful only for inspecting the stack on its own")
     ap.add_argument("--bridge-span", type=float, default=6.0,
                     help="widest empty span the film bridges across, mm "
                          "(default 6, 0 disables). Film on a pillar top is an "
@@ -1442,6 +1646,11 @@ def main(argv: list[str] | None = None) -> int:
                          "23.22 at the knee, 23.59 at 6. So 6 buys no fewer "
                          "islands than 3, only 0.37 cm3 more film, and 3 is the "
                          "value to use if that matters")
+    ap.add_argument("--interface-line-width", type=float, default=0.45,
+                    help="width of the interface's extrusions, mm (default 0.45, "
+                         "the sparse_infill_line_width the mesh film printed at). "
+                         "The bead spacing is the same number: the interface is "
+                         "solid, with no walls and no gap fill")
     ap.add_argument("--interface-clearance-above", type=float, default=None,
                     metavar="MM",
                     help="clearance above the film only, mm; defaults to "
@@ -1519,16 +1728,19 @@ def main(argv: list[str] | None = None) -> int:
               + (f" (with {len(split_shells(fillers))} ledge filler blocks)"
                  if fillers else ""))
 
-        ipath = out / f"{name}-interface.stl"
+        plan_path = out / f"{name}.interface.json"
         if not args.no_interface:
-            film = interface_slabs(placements, gap, args.layer_height,
-                                   args.filler_grow, args.filler_step,
-                                   clearance=args.interface_clearance,
-                                   clearance_above=args.interface_clearance_above,
-                                   bridge_span=args.bridge_span)
-            write_stl(ipath, film, "gap film, printed in the interface filament")
-            print(f"wrote {ipath} ({len(film) // 12} blocks, "
-                  f"{signed_volume(film) / 1000:.1f} cm3)")
+            iface = interface_layers(placements, gap, args.layer_height,
+                                     args.filler_grow, args.filler_step,
+                                     clearance=args.interface_clearance,
+                                     clearance_above=args.interface_clearance_above,
+                                     bridge_span=args.bridge_span)
+            # Not `plan`: that is this module's own plate-ordering function.
+            iplan = interface_plan(iface, args.interface_line_width)
+            plan_path.write_text(json.dumps(iplan) + "\n")
+            beads = sum(len(l["beads"]) for l in iplan["layers"])
+            print(f"wrote {plan_path} ({len(iplan['layers'])} layers, "
+                  f"{beads} beads at {args.interface_line_width:g} mm)")
 
         plates_path = out / f"{name}.plates.json"
         plates_path.write_text(json.dumps(
@@ -1539,8 +1751,9 @@ def main(argv: list[str] | None = None) -> int:
         notes = out / f"{name}-PRINTING.md"
         write_printing_notes(notes, placements, gap, args.layer_height,
                              report_text, stl_path.name, plates_path.name,
-                             ipath.name, args.stl.name,
-                             clearance=args.interface_clearance)
+                             plan_path.name, args.stl.name,
+                             clearance=args.interface_clearance,
+                             clearance_above=args.interface_clearance_above)
         print(f"wrote {notes}")
     return 0
 

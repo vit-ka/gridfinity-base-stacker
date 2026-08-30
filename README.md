@@ -2,22 +2,32 @@
 
 Takes a multi-plate Gridfinity baseplate STL and stacks the plates into one
 model that prints in a single job. The plates are separated by gaps filled with a
-solid printed in a second, non-bonding filament -- Bambu Support W against PLA --
-which is peeled off afterwards so the stack comes apart into separate plates.
+film printed in a second, non-bonding filament -- Bambu Support W against PLA, or
+PETG -- which is peeled off afterwards so the stack comes apart into separate
+plates.
 
-**Status: the separation is not working yet.** The geometry and the slicing are
-verified, but no test print has yet come apart cleanly -- one film material
-peeled off mid-print, the other stuck too hard to remove.
-[ADR 0008](docs/adr/0008-what-the-first-test-prints-showed.md) has the results.
+**The separation works when the film is really held clear of the plates**, which
+took three ADRs to establish: at a nominal 0.1 mm clearance every gap printed
+with one face fused flat, because a mesh film's height is quantised to the
+slicer's layer grid
+([ADR 0009](docs/adr/0009-clearance-is-quantised-to-the-layer-height.md)). So the
+film stopped being a mesh. It is emitted as **toolpaths written into the sliced
+G-code**, at heights chosen to the micron, with the clearance below it and the
+clearance above it set separately -- the first is what lets it release, the
+second is what the plate above has to bridge.
 
-The slicer generates **no support at all**. Every overhang is carried by geometry
-the tool puts there.
+The stack itself gets **no slicer support**: every overhang on it is carried by
+geometry the tool puts there, under a blocker. Support is on only for a small
+decoy column beside the stack, whose job is to make the slicer load and purge the
+interface filament at the heights the interface needs.
 
 ![Nine baseplates stacked into one print, sliced in Bambu Studio](docs/stacked-plates.png)
 
 Nine plates of a drawer set as one job: the brown is the stack and its pillars,
 the white is the film filling each gap. The small block at the back is the wipe
-tower.
+tower. The picture is from when the film was still a model part -- it is emitted
+into the G-code now, so it no longer appears in Studio's preview at all, which is
+what `verify.py` exists to make up for.
 
 Stdlib Python only: no numpy, no trimesh, no mesh kernel. Meshes are flat tuples
 of floats and every geometric question is answered by ray casting or by
@@ -38,22 +48,36 @@ with tapered sockets, no magnet holes required.
 
 ```
 python3 stack_plates.py path/to/multiplate.stl
+
 python3 make3mf.py --template templates/stack-template.3mf \
     --model out/NAME.stl --plates out/NAME.plates.json \
-    --interface out/NAME-interface.stl --out out/NAME.3mf
+    --interface-plan out/NAME.interface.json --out out/NAME.3mf
+
+BambuStudio --no-check --outputdir out/slice --slice 0 out/NAME.3mf
+
+python3 emit_interface.py --project out/NAME.3mf \
+    --gcode out/slice/plate_1.gcode --out out/NAME.gcode
+
+python3 verify.py --project out/NAME.3mf --gcode out/NAME.gcode
 ```
 
-Open the 3mf in Bambu Studio and print it. Nothing else to configure: the
-template carries the plate layout, the filament assignments, the film's print
-settings, and support switched off.
+Print `NAME.gcode`. The sliced file has no interface in it at all -- the gaps are
+empty until the last step writes them, which is also why `--no-check` is
+required: the slicer calls an empty gap an empty layer and refuses to write
+G-code without it.
+
+Nothing else to configure: the template carries the plate layout, the filament
+assignments, the stack's print settings, and which slot the interface filament
+is in.
 
 | file | what it is |
 |---|---|
 | `NAME.stl` | the stack: plates plus the pillars that carry them |
-| `NAME-interface.stl` | the film that fills each gap, printed in the second filament |
+| `NAME.interface.json` | the interface toolpaths, one region per gap per layer |
 | `NAME.plates.json` | where every plate ended up; the 3mf builder reads it |
 | `NAME-PRINTING.md` | settings and notes for this particular stack |
-| `NAME.3mf` | the project, ready to slice |
+| `NAME.3mf` | the project, ready to slice; carries the plan on the bed |
+| `NAME.gcode` | the sliced file with the interface written into it |
 
 ## How it works
 
@@ -68,6 +92,9 @@ settings, and support switched off.
 6. Fill each gap with a **film** that carries the plates and the pillars, bridged
    so it lifts as one sheet
    ([ADR 0007](docs/adr/0007-bridge-the-film-so-it-lifts-as-one-sheet.md)).
+7. Write that film into the sliced G-code as toolpaths, at the heights it was
+   asked for rather than the ones the layer grid allows
+   ([ADR 0009](docs/adr/0009-clearance-is-quantised-to-the-layer-height.md)).
 
 ### Pillars
 
@@ -85,18 +112,45 @@ outlines follow the socket instead of stepping around it
 ### The film
 
 Two layers, each stepping 0.2 mm further out than the one below, so it leans at
-45 degrees and bridges unaided. It is held **0.1 mm clear of the plates**, and
-that clearance is not optional: it has to leave one layer with no model material
-on it, or the slicer treats film and plate as one body and they print welded.
-ADR 0007 has the mechanism, from the slicer's own source.
+45 degrees and bridges unaided. It is trimmed to what it actually carries, then
+bridged across short spans so each gap is one sheet rather than islands stranded
+on pillar tops.
 
-The film is trimmed to what it actually carries, then bridged across short spans
-so each gap is one sheet rather than islands stranded on pillar tops.
+It is held clear of the plates on both faces, and the two distances are separate
+settings because they do different jobs. The gap **below** is what lets the film
+release; the gap **above** is what the first layer of the plate above has to
+bridge, so the underside of every plate is as poor as that number is large.
+
+That is why the film is no longer a mesh. A mesh gets sliced, and a face landing
+on one of the slicer's sample planes is resolved by float rounding that depends
+on the height of the stack it belongs to -- so a nominal 0.1 mm clearance printed
+as 0.00 on one stack and 0.20 on another, and 0.1 mm was not available at all.
+The regions are still worked out the same way; only the output changed, from
+facets to extrusions written into the sliced file. Measured on two stacks of
+different height, every gap now comes out at exactly the two numbers it was
+asked for.
+
+### The decoy and the blocker
+
+Nothing in the model uses the interface filament any more, so nothing makes the
+slicer load it -- and an injected extrusion in a filament the file never loaded
+prints in whatever was already in the nozzle. A small **decoy** column stands
+beside the stack with the stack's own z profile; its gaps get slicer support in
+the interface filament, which produces the real tool change, purge and prime
+tower volume at exactly the heights the interface needs. The interface then rides
+on machinery the slicer built rather than on a hand-written tool change, which
+would be wrong in ways that only show up on the printer.
+
+A **blocker** over the whole stack is the other half: support has to be on for
+the decoy's sake, so the stack has to be explicitly protected from it
+([ADR 0003](docs/adr/0003-support-generation-findings.md) measured that one slab
+over everything is the arrangement that does not leak). `verify.py` reads the
+emitted file and fails if any support reached the stack.
 
 ## Options
 
-`--gap` 0.6 mm, `--interface-clearance` 0.1 mm, `--bridge-span` 6 mm and
-`--filler-grow` 0.4 mm are the ones with measurements behind them; each option's
+`--gap`, `--interface-clearance`, `--interface-clearance-above`, `--bridge-span`
+and `--filler-grow` are the ones with measurements behind them; each option's
 help text carries the numbers and what was swept to arrive at them.
 
 ```
@@ -106,20 +160,30 @@ python3 stack_plates.py --help
 `--split` emits one stack per chain of the containment order, so nothing
 overhangs anything -- fewer pillars, at the cost of one print job per stack.
 
-Earlier versions carried machinery for three approaches that no longer exist
-here: support blockers and enforcers, a decoy column to provoke filament changes,
-and a G-code pass to delete support the slicer insisted on generating. All of it
-is gone, because the slicer now generates no support at all. What was learned
-from each is in [ADR 0003](docs/adr/0003-support-generation-findings.md) and
+Earlier versions carried machinery for approaches that no longer exist here:
+support enforcers, and a G-code pass to delete support the slicer insisted on
+generating. What was learned from each is in
+[ADR 0003](docs/adr/0003-support-generation-findings.md) and
 [ADR 0004](docs/adr/0004-strip-balconies-in-gcode.md), which is the part worth
-keeping; git history has the code.
+keeping; git history has the code. That earlier G-code pass had to identify and
+delete someone else's extrusions by inference, which is what killed it; this one
+writes its own and deletes nothing.
 
 ## The template
 
 `templates/stack-template.3mf` carries the plate layout, wipe tower position,
 filament assignments, all the project settings, and the per-part print settings
-for the stack and the film. Placeholder blocks stand in for the geometry, so no
-one's model lives in this repository.
+for the stack. A placeholder block stands in for the geometry, so no one's model
+lives in this repository.
+
+`support_interface_filament` in that template is what says which slot the
+interface prints in -- one number, because the decoy's support and the interface
+are the same filament by construction. `--interface-extruder` overrides it.
+
+The template deliberately does *not* park a decoy. Its position is derived, so it
+stands beside whatever stack it is built for rather than 80 mm away from a small
+one. A part named "decoy" in a template is found and its position kept, for
+anyone who wants it somewhere specific.
 
 To change any of it, arrange it in Bambu Studio, save with **File > Save Project
 As**, and point `--template` at the result. Note that per-part settings live in
@@ -129,11 +193,16 @@ project settings shows nothing at all when someone has configured a part.
 ## Verifying
 
 ```
-python3 -m unittest test_stack_plates test_postprocess
+python3 -m unittest test_stack_plates test_gcode
 ```
 
-`verify.py` checks a written stack independently of the plan that produced it:
-manifold edges, film regions per gap, and clearances.
+`verify.py` checks the result independently of the plan that produced it. Given
+`--source`/`--stack` it checks the geometry: manifold edges, shell volumes, plate
+containment, ledges, lattice registration. Given `--project`/`--gcode` it reads
+the file that goes to the printer and reports, per gap, the measured clearance
+above and below the interface, how many pieces the film is in, and whether any
+support reached the stack. An interface layer that is not at the height it was
+asked for is an error there, and it names both numbers.
 
 Verify against a sliced file, not only the test suite. The suite has passed while
 the model printed into air. Note also that a CLI slice is evidence only where the

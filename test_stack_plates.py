@@ -533,7 +533,7 @@ class TestSupportEstimate(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
-    def test_end_to_end_writes_all_three_outputs(self):
+    def test_end_to_end_writes_all_four_outputs(self):
         mesh = (perforated_plate(4, 3, origin=(0.0, 0.0))
                 + perforated_plate(3, 3, origin=(500.0, 0.0)))
         with tempfile.TemporaryDirectory() as td:
@@ -542,11 +542,15 @@ class TestCli(unittest.TestCase):
             out = Path(td) / "out"
             self.assertEqual(sp.main([str(src), "-o", str(out)]), 0)
             self.assertTrue((out / "gf-stack-2.stl").exists())
-            self.assertTrue((out / "gf-stack-2-interface.stl").exists())
+            self.assertTrue((out / "gf-stack-2.interface.json").exists())
             self.assertTrue((out / "gf-stack-2.plates.json").exists())
             notes = (out / "gf-stack-2-PRINTING.md").read_text()
             self.assertIn("land-to-land", notes)
-            self.assertIn("no support at all", notes)
+            # The two facts a reader has to have: the interface is not in the
+            # model, and the file to print is not the one the slicer wrote.
+            self.assertIn("emit_interface.py", notes)
+            self.assertIn("--no-check", notes)
+            self.assertNotIn("-interface.stl", notes)
 
     def test_notes_have_no_unrendered_placeholders(self):
         """A section substituted as a value keeps its own braces."""
@@ -611,6 +615,137 @@ class TestCli(unittest.TestCase):
             self.assertAlmostEqual(gaps.height, 4.0 + 0.8 + 4.0, places=6)
 
 
+class TestInterfaceLayers(unittest.TestCase):
+    """The film's shape, as regions rather than as a mesh.
+
+    `interface_layers()` is the whole of the shape logic; `slab_mesh()` and the
+    G-code emitter are two views of the same regions. Every shape property is
+    tested through the mesh view in TestGapFilm, because that is where those
+    tests were written and they hold unchanged -- what is tested here is that the
+    two views agree, so neither can drift.
+    """
+
+    GAP, LAYER, CLEAR = 0.6, 0.2, 0.1
+
+    def stack(self, gap=None):
+        plates = tuple(sp.build_plate(perforated_plate(w, d))
+                       for w, d in ((5, 4), (5, 3), (4, 4), (4, 3)))
+        return sp.plan(plates, gap or self.GAP, flip=True, register=True)
+
+    def test_layers_fill_the_band_between_the_two_clearances(self):
+        pl = self.stack()
+        iface = sp.interface_layers(pl, self.GAP, self.LAYER, clearance=0.2,
+                                    clearance_above=0.1)
+        for j, (lower, upper) in enumerate(sp.interfaces(pl)):
+            band = [l for l in iface.layers if l.gap == j]
+            self.assertTrue(band)
+            self.assertAlmostEqual(band[0].z0, lower.z1 + 0.2, places=6)
+            self.assertAlmostEqual(band[-1].z1, upper.z0 - 0.1, places=6)
+            for a, b in zip(band, band[1:]):
+                self.assertAlmostEqual(a.z1, b.z0, places=9)
+
+    def test_each_layer_flares_outward_over_the_one_below(self):
+        """0.2 mm out for 0.2 mm up is the angle a printer bridges unaided."""
+        pl = self.stack()
+        iface = sp.interface_layers(pl, self.GAP, self.LAYER)
+        for a, b in zip(iface.layers, iface.layers[1:]):
+            if a.gap != b.gap:
+                continue
+            for ra, rb in zip(a.rows, b.rows):
+                self.assertEqual(ra & ~rb, 0, "a layer is not covered by the one above")
+
+    def test_the_mesh_view_lies_inside_the_regions(self):
+        """Every box slab_mesh() writes is a filled cell of its own layer."""
+        pl = self.stack()
+        iface = sp.interface_layers(pl, self.GAP, self.LAYER)
+        by_z = {round(l.z0, 6): l for l in iface.layers}
+        mesh = sp.slab_mesh(iface)
+        weld = 0.001
+        for i in range(0, len(mesh), 12):
+            b = stl_io.bounds_of(mesh[i:i + 12])
+            lay = by_z[round(b.z0, 6)]
+            ix = int((b.x0 + weld - iface.x0) / iface.step + 0.5)
+            iy = int((b.y0 + weld - iface.y0) / iface.step + 0.5)
+            self.assertTrue(lay.rows[iy] >> ix & 1,
+                            "a box sits on a cell the region says is empty")
+
+    def stamp(self, iface, beads, width):
+        """The beads' footprint on the region's own grid."""
+        rows = [0] * iface.h
+        for bx0, by0, bx1, by1 in beads:
+            ix0 = int((min(bx0, bx1) - width / 2 - iface.x0) / iface.step)
+            ix1 = int((max(bx0, bx1) + width / 2 - iface.x0) / iface.step)
+            iy0 = int((min(by0, by1) - width / 2 - iface.y0) / iface.step)
+            iy1 = int((max(by0, by1) + width / 2 - iface.y0) / iface.step)
+            mask = ((1 << (ix1 - ix0 + 1)) - 1) << ix0
+            for iy in range(max(0, iy0), min(iface.h, iy1 + 1)):
+                rows[iy] |= mask
+        return rows
+
+    def test_runs_of_set_bits(self):
+        self.assertEqual(sp._runs(0b1011, 8), ((0, 1), (3, 3)))
+        self.assertEqual(sp._runs(0b0111, 8), ((0, 2),))
+        self.assertEqual(sp._runs(0, 8), ())
+        self.assertEqual(sp._runs(0b1111, 2), ((0, 1),))
+
+    def test_the_raster_alternates_axis_between_layers(self):
+        pl = self.stack()
+        iface = sp.interface_layers(pl, self.GAP, self.LAYER)
+        for lay, beads in sp.interface_beads(iface):
+            self.assertTrue(beads)
+            horizontal = all(b[1] == b[3] for b in beads)
+            vertical = all(b[0] == b[2] for b in beads)
+            self.assertTrue(horizontal or vertical, "a layer mixes raster axes")
+            self.assertEqual(horizontal, lay.index % 2 == 0)
+
+    def test_the_raster_is_monotonic(self):
+        """One direction per bead, scanlines advancing one way, so each bead is
+        laid against one already down."""
+        pl = self.stack()
+        iface = sp.interface_layers(pl, self.GAP, self.LAYER)
+        for lay, beads in sp.interface_beads(iface):
+            for x0, y0, x1, y1 in beads:
+                self.assertGreater((x1 - x0) + (y1 - y0), 0)
+            across = [b[1] if b[1] == b[3] else b[0] for b in beads]
+            self.assertEqual(across, sorted(across))
+
+    def test_every_bead_lies_inside_its_region(self):
+        pl = self.stack()
+        iface = sp.interface_layers(pl, self.GAP, self.LAYER)
+        width = 0.45
+        for lay, beads in sp.interface_beads(iface, width):
+            for bx0, by0, bx1, by1 in beads:
+                n = int((max(bx1 - bx0, by1 - by0)) / iface.step) + 1
+                for k in range(n + 1):
+                    f = k / n
+                    ix = int((bx0 + (bx1 - bx0) * f - iface.x0) / iface.step)
+                    iy = int((by0 + (by1 - by0) * f - iface.y0) / iface.step)
+                    self.assertTrue(lay.rows[iy] >> ix & 1,
+                                    "a bead's centre line leaves the region")
+            # Its footprint may spill half a bead sideways where the centre line
+            # runs along the boundary, and the square stamp used here rounds that
+            # up at the ends; nothing reaches a full bead width outside.
+            grown = sp.dilate(list(lay.rows), width / iface.step, iface.w, iface.h)
+            stamped = self.stamp(iface, beads, width)
+            self.assertEqual(sum((s & ~g) for s, g in zip(stamped, grown)), 0)
+
+    def test_the_raster_leaves_no_gaps_inside_the_region(self):
+        pl = self.stack()
+        iface = sp.interface_layers(pl, self.GAP, self.LAYER)
+        width = 0.45
+        for lay, beads in sp.interface_beads(iface, width):
+            stamped = self.stamp(iface, beads, width)
+            # Everything but a bead's own half-width of the boundary is covered.
+            core = sp.erode(list(lay.rows), 2.0, iface.w, iface.h)
+            self.assertTrue(any(core))
+            self.assertEqual(sum((c & ~s) for c, s in zip(core, stamped)), 0)
+
+    def test_the_grid_is_shared_by_every_layer(self):
+        pl = self.stack()
+        iface = sp.interface_layers(pl, self.GAP, self.LAYER)
+        self.assertTrue(all(len(l.rows) == iface.h for l in iface.layers))
+
+
 class TestGapFilm(unittest.TestCase):
     """The film must be separated from the plates, not merely a different filament.
 
@@ -665,6 +800,44 @@ class TestGapFilm(unittest.TestCase):
         msg = str(e.exception)
         self.assertIn("0.2", msg)      # names the gap
         self.assertIn("0.1", msg)      # and the clearance
+
+    def test_a_gap_too_small_names_both_clearances(self):
+        """They are separate settings, so a message naming one is half an answer."""
+        pl = self.stack(gap=0.6)
+        with self.assertRaises(ValueError) as e:
+            sp.interface_slabs(pl, 0.6, self.LAYER, clearance=0.3,
+                               clearance_above=0.25)
+        msg = str(e.exception)
+        self.assertIn("0.6", msg)      # the gap
+        self.assertIn("0.3", msg)      # below
+        self.assertIn("0.25", msg)     # above
+
+    def test_the_two_clearances_are_independent(self):
+        """0.2 to release below, 0.1 for the plate above to bridge.
+
+        The faces are placed at exactly those distances, which is the whole
+        point of the setting -- what the *slicer* then does with a face at
+        4.10 is ADR 0009's problem and the reason the film stops being a mesh.
+        """
+        pl = self.stack(gap=0.6)
+        film = self.boxes(sp.interface_slabs(pl, 0.6, self.LAYER, clearance=0.2,
+                                             clearance_above=0.1))
+        for b in film:
+            below = max(p.z1 for p in pl if p.z1 <= b.z0 + 1e-9)
+            above = min(p.z0 for p in pl if p.z0 >= b.z1 - 1e-9)
+            self.assertGreaterEqual(b.z0 - below, 0.2 - 1e-9)
+            self.assertGreaterEqual(above - b.z1, 0.1 - 1e-9)
+        lo = min(b.z0 for b in film if b.z0 < pl[1].z0)
+        hi = max(b.z1 for b in film if b.z0 < pl[1].z0)
+        self.assertAlmostEqual(lo - pl[0].z1, 0.2, places=6)
+        self.assertAlmostEqual(pl[1].z0 - hi, 0.1, places=6)
+
+    def test_one_clearance_sets_both(self):
+        pl = self.stack()
+        one = sp.interface_slabs(pl, self.GAP, self.LAYER, clearance=0.15)
+        both = sp.interface_slabs(pl, self.GAP, self.LAYER, clearance=0.15,
+                                  clearance_above=0.15)
+        self.assertEqual(one, both)
 
     def test_zero_clearance_is_still_permitted(self):
         """It was the previous default and is a legitimate thing to ask for."""
@@ -806,26 +979,32 @@ class TestBridging(unittest.TestCase):
 
 
 class TestFilmRegions(unittest.TestCase):
-    def test_counted_from_the_written_geometry(self):
-        """Rasterised, not split into shells: the film's pieces overlap on
-        purpose, and overlapping boxes share no vertices, so shell-splitting
-        would report every box separately and say nothing about the sheet."""
+    """How many pieces the film in each gap comes out as.
+
+    An island is a piece the size of a socket opening, and it stays in the socket
+    when the rest of the sheet is peeled (ADR 0007). Counted on the regions
+    themselves rather than on a mesh: the film's pieces overlap on purpose, and
+    overlapping boxes share no vertices, so shell-splitting a mesh reports every
+    box separately and says nothing about whether the sheet is joined.
+    """
+
+    def stack(self):
         plates = tuple(sp.build_plate(perforated_plate(w, d))
                        for w, d in ((5, 4), (5, 3), (4, 4), (4, 3)))
-        pl = sp.plan(plates, 0.6, flip=True, register=True)
-        gaps = [(round(a.z1, 2), round(b.z0, 2)) for a, b in zip(pl, pl[1:])]
-        mesh = sp.interface_slabs(pl, 0.6)
-        got = verify.film_regions(mesh, gaps)
-        self.assertEqual(len(got), len(gaps))
+        return sp.plan(plates, 0.6, flip=True, register=True)
+
+    def counts(self, **kw):
+        return sp.region_counts(sp.interface_layers(self.stack(), 0.6, **kw))
+
+    def test_one_count_per_gap(self):
+        pl = self.stack()
+        got = self.counts()
+        self.assertEqual(len(got), len(pl) - 1)
         self.assertTrue(all(n >= 1 for n in got.values()))
 
     def test_bridging_reduces_the_count(self):
-        plates = tuple(sp.build_plate(perforated_plate(w, d))
-                       for w, d in ((5, 4), (5, 3), (4, 4), (4, 3)))
-        pl = sp.plan(plates, 0.6, flip=True, register=True)
-        gaps = [(round(a.z1, 2), round(b.z0, 2)) for a, b in zip(pl, pl[1:])]
-        off = verify.film_regions(sp.interface_slabs(pl, 0.6, bridge_span=0.0), gaps)
-        on = verify.film_regions(sp.interface_slabs(pl, 0.6, bridge_span=6.0), gaps)
+        off = self.counts(bridge_span=0.0)
+        on = self.counts(bridge_span=6.0)
         self.assertLessEqual(sum(on.values()), sum(off.values()))
 
 
@@ -905,9 +1084,8 @@ class TestFilmTrim(unittest.TestCase):
         """Ordering: trim first, bridge last. Reversed, the trim deletes every
         bridge -- a bridge span carries nothing by construction."""
         pl = self.stack()
-        gaps = [(round(a.z1, 2), round(b.z0, 2)) for a, b in zip(pl, pl[1:])]
-        untrimmed = verify.film_regions(sp.interface_slabs(pl, 0.6, trim=False), gaps)
-        trimmed = verify.film_regions(sp.interface_slabs(pl, 0.6, trim=True), gaps)
+        untrimmed = sp.region_counts(sp.interface_layers(pl, 0.6, trim=False))
+        trimmed = sp.region_counts(sp.interface_layers(pl, 0.6, trim=True))
         self.assertEqual(trimmed, untrimmed,
                          "the trim changed the film's connectivity")
 
