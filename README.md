@@ -2,8 +2,13 @@
 
 Takes a multi-plate Gridfinity baseplate STL and stacks the plates into one
 model that prints in a single job. The plates are separated by gaps filled with a
-solid printed in a second, non-bonding filament -- PETG against PLA -- which is
-peeled off afterwards so the stack comes apart into separate plates.
+solid printed in a second, non-bonding filament -- Bambu Support W against PLA --
+which is peeled off afterwards so the stack comes apart into separate plates.
+
+**Status: the separation is not working yet.** The geometry and the slicing are
+verified, but no test print has yet come apart cleanly -- one film material
+peeled off mid-print, the other stuck too hard to remove.
+[ADR 0008](docs/adr/0008-what-the-first-test-prints-showed.md) has the results.
 
 The slicer generates **no support at all**. Every overhang is carried by geometry
 the tool puts there.

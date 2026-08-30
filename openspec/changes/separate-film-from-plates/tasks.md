@@ -20,5 +20,10 @@
       model lies inside a gap
 - [x] 3.2 Record the new height and print time against the current 39.2 mm /
       7.39 h
-- [ ] 3.3 Test print, and confirm the stack separates -- this is the only check
-      that answers the question the change exists for
+- [x] 3.3 Test print, and confirm the stack separates -- this is the only check
+      that answers the question the change exists for.
+      **Printed; it does not separate.** Two stacks, one per film material, both
+      ruined before finishing: PETG peeled at the first interface layer, Support W
+      held past base 7 and then spaghettied. What did separate needed prying and
+      came away covered in shreds. Recorded in ADR 0008; testing moves to small
+      fast-printing plates before this is answered.
