@@ -1025,6 +1025,7 @@ def interface_slabs(placements: tuple[Placement, ...], gap: float,
                     layer: float = 0.2, grow: float = 0.4,
                     step: float = 0.15, min_width: float = 0.42,
                     flare: float = 0.2, clearance: float = 0.1,
+                    clearance_above: float | None = None,
                     weld: float = 0.001, bridge_span: float = 6.0,
                     trim: bool = True) -> Mesh:
     """The film filling each gap, as a solid printed in its own filament.
@@ -1092,14 +1093,16 @@ def interface_slabs(placements: tuple[Placement, ...], gap: float,
         if bridge_span > 0:
             base = closed(base, bridge_span / 2 / step, w, h)
         base = [b & e for b, e in zip(base, extent)]
-        lo, hi = lower.z1 + clearance, upper.z0 - clearance
+        above = clearance if clearance_above is None else clearance_above
+        lo, hi = lower.z1 + clearance, upper.z0 - above
         if hi - lo < layer - 1e-9:
             raise ValueError(
-                f"a {gap:g} mm gap cannot hold {clearance:g} mm of clearance at "
-                f"each face and still leave a layer of film: "
-                f"{gap:g} - 2 x {clearance:g} = {gap - 2 * clearance:g} mm, and "
-                f"a layer is {layer:g} mm. Widen the gap to at least "
-                f"{2 * clearance + layer:g} mm, or lower the clearance.")
+                f"a {gap:g} mm gap cannot hold {clearance:g} mm of clearance "
+                f"below the film and {above:g} mm above it and still leave a "
+                f"layer of film: {gap:g} - {clearance:g} - {above:g} = "
+                f"{gap - clearance - above:g} mm, and a layer is {layer:g} mm. "
+                f"Widen the gap to at least {clearance + above + layer:g} mm, "
+                f"or lower the clearance.")
         n = max(1, int(round((hi - lo) / layer)))
         for k in range(n):
             zlo = lo + (hi - lo) * k / n
@@ -1367,11 +1370,17 @@ material on it; at this layer height that is {clearance:g} mm.
 ## After printing
 
 The stack comes off the bed as one block. Slide a thin blade into a gap and
-twist. The film is a continuous sheet in each gap and should lift out in one
-piece; it does not bond to the plates, which is the whole mechanism.
+twist. The film is a continuous sheet in each gap; the intent is that it lifts
+out in one piece, because it does not bond to the plates.
 
 Work from the top down. The land-to-land gaps have the least contact area and
 give first; the rib-to-rib gaps need more persuasion.
+
+**This is intent, not a result.** No stack has yet come apart cleanly. Bambu
+Support W held so well that the plates needed active prying and came away
+covered in shreds, with the merged pillar columns needing to be cut off rather
+than peeled; PETG, on the one print that used it, peeled off mid-print instead
+and lost the job. See `docs/adr/0008-what-the-first-test-prints-showed.md`.
 """
 
 
@@ -1431,8 +1440,16 @@ def main(argv: list[str] | None = None) -> int:
                          "go 28 at 0 mm, 11 at 1-2 mm, and 0 from 3 mm upward, "
                          "while film volume keeps climbing -- 22.40, 22.70, "
                          "23.22 at the knee, 23.59 at 6. So 6 buys no fewer "
-                         "islands than 3, only 0.37 cm3 more PETG, and 3 is the "
+                         "islands than 3, only 0.37 cm3 more film, and 3 is the "
                          "value to use if that matters")
+    ap.add_argument("--interface-clearance-above", type=float, default=None,
+                    metavar="MM",
+                    help="clearance above the film only, mm; defaults to "
+                         "--interface-clearance. The two faces are not "
+                         "interchangeable: the gap below the film is what lets "
+                         "it release, and the gap above is what the plate above "
+                         "has to bridge, so the underside of every plate is as "
+                         "poor as this number is large")
     ap.add_argument("--interface-clearance", type=float, default=0.1,
                     help="hold the film clear of the plates it sits between, mm "
                          "per face (default 0.1). It has to be enough to leave "
@@ -1507,6 +1524,7 @@ def main(argv: list[str] | None = None) -> int:
             film = interface_slabs(placements, gap, args.layer_height,
                                    args.filler_grow, args.filler_step,
                                    clearance=args.interface_clearance,
+                                   clearance_above=args.interface_clearance_above,
                                    bridge_span=args.bridge_span)
             write_stl(ipath, film, "gap film, printed in the interface filament")
             print(f"wrote {ipath} ({len(film) // 12} blocks, "
