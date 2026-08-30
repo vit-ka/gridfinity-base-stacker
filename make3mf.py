@@ -37,6 +37,7 @@ centre, not its corner.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import re
 import shutil
@@ -54,6 +55,7 @@ HDR = ('<?xml version="1.0" encoding="UTF-8"?>\n'
 
 MODEL_XML = "3D/3dmodel.model"
 SETTINGS = "Metadata/model_settings.config"
+OBJ_RELS = "3D/_rels/3dmodel.model.rels"
 PROJECT = "Metadata/project_settings.config"
 
 
@@ -170,6 +172,30 @@ def part_settings(xml: str, needle: str) -> list[tuple[str, str]]:
     return []
 
 
+def part_extruder(xml: str, needle: str | None) -> str | None:
+    """The filament slot a template part is assigned to.
+
+    Structural, so it is not copied along with the rest of a part's settings --
+    but it is still the user's filament choice, and it is not stable across
+    templates. Rearranging the slots in Bambu renumbers every part; a template
+    that puts the support filament first moves the stack from 2 to 3, and a
+    hardcoded number would print it in whatever now sits in the old slot.
+
+    `needle` matches the film part by name; None asks for the model part.
+    """
+    for block in re.findall(r"<part\b.*?</part>", xml, re.S):
+        name = re.search(r'<metadata key="name" value="([^"]*)"', block)
+        if not name:
+            continue
+        low = name.group(1).lower()
+        if not (needle in low if needle is not None
+                else not any(m in low for m in OTHER_PARTS)):
+            continue
+        e = re.search(r'<metadata key="extruder" value="(\d+)"', block)
+        return e.group(1) if e else None
+    return None
+
+
 def dummy_film(plates: list[dict], width: float, depth: float,
                clearance: float = 0.1) -> Mesh:
     """A placeholder film: one slab per gap, held clear of the plates.
@@ -211,8 +237,9 @@ def main(argv=None) -> int:
                     help="the gap film STL, added as a part in its own filament. "
                          "With it the plate needs no blocker and no decoy: the "
                          "slicer generates no support at all")
-    ap.add_argument("--interface-extruder", type=int, default=5,
-                    help="filament slot for the film (default 5)")
+    ap.add_argument("--interface-extruder", type=int, default=None,
+                    help="filament slot for the film; by default whatever the "
+                         "template's own film part is assigned to")
     ap.add_argument("--dummy-film", action="store_true",
                     help="with --dummy, also stand in a placeholder film, so the "
                          "template has a part for the film's print settings to "
@@ -357,8 +384,11 @@ def main(argv=None) -> int:
 
     film_settings = part_settings(tmpl_set, "interface")
     stack_settings = model_part_settings(tmpl_set)
+    e_film = (str(args.interface_extruder) if args.interface_extruder is not None
+              else part_extruder(tmpl_set, "interface") or "5")
+    e_stack = part_extruder(tmpl_set, None)
     second = (part(2, f"{stem}-interface.stl", "normal_part", b_faces,
-                   str(args.interface_extruder), mcz, film_settings)
+                   e_film, mcz, film_settings)
               if film is not None
               else part(2, f"{stem}-noSupport.stl", "support_blocker", b_faces,
                         "0", mcz))
@@ -381,7 +411,7 @@ def main(argv=None) -> int:
                + f'    <metadata key="name" value="{stem}.stl"/>\n'
                + f'    <metadata key="extruder" value="{e_main}"/>\n'
                + f'    <metadata face_count="{m_faces}"/>\n'
-               + part(1, f"{stem}.stl", "normal_part", m_faces, None, mcz,
+               + part(1, f"{stem}.stl", "normal_part", m_faces, e_stack, mcz,
                       stack_settings)
                + second
                + '  </object>\n'
@@ -399,8 +429,9 @@ def main(argv=None) -> int:
         MODEL_XML: new_model.encode(),
         SETTINGS: new_set.encode(),
         "3D/Objects/object_20.model": obj_main.encode(),
-        "3D/Objects/object_21.model": obj_dec.encode(),
     }
+    if film is None:
+        replace["3D/Objects/object_21.model"] = obj_dec.encode()
     if film is not None:
         # Nothing left for the slicer to support: every overhang is carried by a
         # pillar and every gap is filled by the film, both of them model parts.
@@ -408,17 +439,53 @@ def main(argv=None) -> int:
                               if i.filename == PROJECT))
         cfg["enable_support"] = "0"
         replace[PROJECT] = json.dumps(cfg, indent=4).encode()
+    # The part relationships name the object files by path, and we just renamed
+    # them. A relationship pointing at a part that is not in the archive does not
+    # degrade gracefully: Bambu fails to parse the whole 3mf.
+    replace[OBJ_RELS] = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+        'relationships">\n'
+        + "".join(f' <Relationship Target="/{n}" Id="rel-{i}" '
+                  f'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/'
+                  f'3dmodel"/>\n'
+                  for i, n in enumerate(sorted(n for n in replace
+                                               if n.startswith("3D/Objects/")), 1))
+        + '</Relationships>\n').encode()
     # Thumbnails and plate_1.json describe the template's geometry, not ours.
     # Bambu regenerates them on slice; leaving stale ones in is only cosmetic,
     # but plate_1.json carries bounding boxes that would be wrong.
     drop = {"Metadata/plate_1.json"}
+    # So does the template's own object geometry, and it does not ride along:
+    # we write object_20 and reference it by name from the model XML. A template
+    # whose geometry is called something else (Bambu numbers these per project)
+    # would otherwise contribute an unreferenced mesh -- 10 MB of one, in the
+    # case that found this -- while our own object went missing entirely,
+    # because the archive was written by walking the template's entries.
+    drop |= {i.filename for i, _ in entries
+             if i.filename.startswith("3D/Objects/") and i.filename not in replace}
+    # A thumbnail is a picture of the template author's model. Blanked rather
+    # than dropped, so anything referencing it still resolves.
+    blank = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+        "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+    for i, _ in entries:
+        if i.filename.startswith("Metadata/") and i.filename.endswith(".png"):
+            replace[i.filename] = blank
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(args.out, "w", zipfile.ZIP_DEFLATED) as z:
+        seen = set()
         for info, data in entries:
             if info.filename in drop:
                 continue
             z.writestr(info.filename, replace.get(info.filename, data))
+            seen.add(info.filename)
+        # Entries the template did not have. Walking only its entries silently
+        # dropped our geometry when the template numbered its objects otherwise.
+        for name, data in replace.items():
+            if name not in seen:
+                z.writestr(name, data)
 
     print(f"wrote {args.out}")
     if stack_settings:
@@ -426,11 +493,11 @@ def main(argv=None) -> int:
               f"the template: " + ", ".join(k for k, _ in stack_settings))
     print(f"  model    {stem}  {m_faces} facets, "
           f"{mb.width:.1f} x {mb.depth:.1f} x {mb.height:.1f} mm  "
-          f"at ({mx:.1f}, {my:.1f}), extruder {e_main}")
+          f"at ({mx:.1f}, {my:.1f}), extruder {e_stack or e_main}")
     if film is not None:
         label = args.interface.name if args.interface else "placeholder"
         print(f"  film     {label}  {b_faces} facets, "
-              f"extruder {args.interface_extruder}, support disabled")
+              f"extruder {e_film}, support disabled")
         if film_settings:
             print(f"           carrying {len(film_settings)} part settings from "
                   f"the template: "
