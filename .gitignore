@@ -6,4 +6,4 @@ __pycache__/
 result.json
 *.3mf
 !templates/*.3mf
-.claude/.codex-gate-*
+.claude/.review-gate-*

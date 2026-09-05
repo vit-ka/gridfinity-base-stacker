@@ -5,8 +5,19 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash scripts/codex-gate-hook.sh",
+            "command": "bash scripts/review-gate-hook.sh",
             "timeout": 600
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash scripts/review-gate-arm.sh",
+            "timeout": 30
           }
         ]
       }

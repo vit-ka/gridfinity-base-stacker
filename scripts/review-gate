@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+#
+# review-gate — controls for the two-stage review gate.
+#
+# Toggles a git-ignored sentinel that the Stop-hook guard (review-gate-hook.sh)
+# checks. While disabled, the gate is skipped entirely (no review, no sync) so
+# you can commit by hand without interruption.
+#
+#   review-gate start [change]  arm the gate for a workstream (run when you begin
+#                              implementation, e.g. from /openspec-apply-change)
+#   review-gate stop            disarm the gate (end the workstream)
+#   review-gate off      disable the gate until re-enabled
+#   review-gate on       re-enable the gate
+#   review-gate status   report gate state, armed workstream, and review mode
+#   review-gate resume   leave Claude-only mode now (re-enable the Codex stage)
+#
+# The gate runs on Stop ONLY while armed (a `.claude/.review-gate-active` marker):
+# it does not review on ordinary stops. Archiving the armed change auto-disarms.
+# For a single Stop only, prefer the one-shot bypass: SKIP_REVIEW_GATE=1.
+#
+# This file is part of the shared gate at vit-ka/openspec-codex-gate and is
+# kept in sync from the canonical checkout — edit it THERE, not here.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SENTINEL="$ROOT/.claude/.review-gate-disabled"
+CLAUDE_ONLY="$ROOT/.claude/.review-gate-claude-only"
+ACTIVE="$ROOT/.claude/.review-gate-active"
+
+# Most recently modified non-archived change (used when `start` gets no name).
+latest_change() {
+  ls -t "$ROOT"/openspec/changes/*/tasks.md 2>/dev/null \
+    | grep -v '/archive/' \
+    | head -1 \
+    | sed -E 's#.*/changes/([^/]+)/tasks\.md$#\1#'
+}
+
+human_time() {
+  date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
+    || date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
+    || echo "epoch $1"
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: review-gate {start [change]|stop|on|off|status|resume}
+  start    arm the gate for an implementation workstream (defaults to the most
+           recently modified change; pass a name to be explicit)
+  stop     disarm the gate (end the workstream)
+  on       re-enable the review gate
+  off      disable the review gate (persists until `review-gate on`)
+  status   report gate state, armed workstream, and review mode
+  resume   leave Claude-only mode now and re-enable the Codex stage
+EOF
+  exit 2
+}
+
+report_armed() {
+  if [ -e "$ACTIVE" ]; then
+    local ch; ch="$(tr -d '\n' < "$ACTIVE" 2>/dev/null)"
+    echo "review-gate: ARMED for workstream: ${ch:-<unknown change>}"
+  else
+    echo "review-gate: not armed (idle — the gate will not run on stops; use 'review-gate start')"
+  fi
+}
+
+report_mode() {
+  if [ -e "$CLAUDE_ONLY" ]; then
+    local resume now; resume="$(tr -dc '0-9' < "$CLAUDE_ONLY")"; resume="${resume:-0}"; now="$(date +%s)"
+    if [ "$now" -lt "$resume" ]; then
+      echo "review-gate: Mode: CLAUDE-ONLY (Codex usage limit) — Codex resumes at $(human_time "$resume")"
+    else
+      echo "review-gate: Mode: two-stage (Claude-only cooldown elapsed; Codex re-probes on the next run)"
+    fi
+  else
+    echo "review-gate: Mode: two-stage (Claude → Codex)"
+  fi
+}
+
+case "${1:-}" in
+  start)
+    ch="${2:-}"
+    [ -n "$ch" ] || ch="$(latest_change)"
+    if [ -z "$ch" ]; then
+      echo "review-gate: no change found to arm — pass one explicitly: review-gate start <change>" >&2
+      exit 2
+    fi
+    if [ ! -d "$ROOT/openspec/changes/$ch" ]; then
+      echo "review-gate: change '$ch' not found under openspec/changes/ — cannot arm." >&2
+      exit 2
+    fi
+    mkdir -p "$(dirname "$ACTIVE")"
+    printf '%s\n' "$ch" > "$ACTIVE"
+    echo "review-gate: ARMED for change '$ch' — the review gate will run on stops until 'review-gate stop' or archive."
+    ;;
+  stop)
+    if [ -e "$ACTIVE" ]; then
+      rm -f "$ACTIVE"
+      echo "review-gate: DISARMED — the review gate will not run until the next 'review-gate start'."
+    else
+      echo "review-gate: not armed — nothing to stop."
+    fi
+    ;;
+  off)
+    mkdir -p "$(dirname "$SENTINEL")"
+    : > "$SENTINEL"
+    echo "review-gate: DISABLED — the review gate will be skipped. Run 'review-gate on' to re-enable."
+    ;;
+  on)
+    rm -f "$SENTINEL"
+    echo "review-gate: ENABLED — the review gate will run for active OpenSpec work."
+    ;;
+  status)
+    if [ -e "$SENTINEL" ]; then
+      echo "review-gate: DISABLED (sentinel present: .claude/.review-gate-disabled)"
+    else
+      echo "review-gate: ENABLED"
+    fi
+    report_armed
+    report_mode
+    ;;
+  resume)
+    if [ -e "$CLAUDE_ONLY" ]; then
+      rm -f "$CLAUDE_ONLY"
+      echo "review-gate: Claude-only mode cleared — full two-stage review restored on the next run."
+    else
+      echo "review-gate: not in Claude-only mode — nothing to resume."
+    fi
+    ;;
+  *)
+    usage
+    ;;
+esac
