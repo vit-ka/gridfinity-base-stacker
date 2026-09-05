@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+#
+# codex-gate — enable/disable the Codex review gate for manual work.
+#
+# Toggles a git-ignored sentinel that the Stop-hook guard (codex-gate-hook.sh)
+# checks. While disabled, the gate is skipped entirely (no review, no sync) so
+# you can commit by hand without interruption.
+#
+#   codex-gate off      disable the gate until re-enabled
+#   codex-gate on       re-enable the gate
+#   codex-gate status   report whether the gate is on or off
+#
+# For a single Stop only, prefer the one-shot bypass: SKIP_CODEX_GATE=1.
+#
+# This file is part of the shared gate at vit-ka/openspec-codex-gate and is
+# kept in sync from the canonical checkout — edit it THERE, not here.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SENTINEL="$ROOT/.claude/.codex-gate-disabled"
+
+usage() {
+  cat >&2 <<'EOF'
+usage: codex-gate {on|off|status}
+  off      disable the review gate (persists until `codex-gate on`)
+  on       re-enable the review gate
+  status   report whether the gate is enabled or disabled
+EOF
+  exit 2
+}
+
+case "${1:-}" in
+  off)
+    mkdir -p "$(dirname "$SENTINEL")"
+    : > "$SENTINEL"
+    echo "codex-gate: DISABLED — the review gate will be skipped. Run 'codex-gate on' to re-enable."
+    ;;
+  on)
+    rm -f "$SENTINEL"
+    echo "codex-gate: ENABLED — the review gate will run for active OpenSpec work."
+    ;;
+  status)
+    if [ -e "$SENTINEL" ]; then
+      echo "codex-gate: DISABLED (sentinel present: .claude/.codex-gate-disabled)"
+    else
+      echo "codex-gate: ENABLED"
+    fi
+    ;;
+  *)
+    usage
+    ;;
+esac

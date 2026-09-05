@@ -1,0 +1,32 @@
+gridfinity-base-stacker
+Copyright (c) 2026 Vitalii Kalinkin
+Licensed under the MIT License. See LICENSE.
+
+This product bundles third-party works under `vendor/gridflock/`. They are
+carried byte-identical to upstream and are not modified. See
+`vendor/gridflock/UPSTREAM.md` for the commits they were taken from.
+
+--------------------------------------------------------------------------------
+GridFlock
+https://github.com/yawkat/GridFlock
+Copyright (c) 2026 Jonas Konrad
+Licensed under the MIT License. Full text: vendor/gridflock/LICENSE
+
+GridFlock is dual-licensed MIT and CC-BY-4.0, the CC-BY-4.0 part covering model
+data under its `opengrid/` directory by other authors. That directory is NOT
+bundled here, so only the MIT terms apply to what this repository carries.
+
+--------------------------------------------------------------------------------
+Gridfinity Rebuilt
+https://github.com/kennetek/gridfinity-rebuilt-openscad
+Copyright (c) 2023 Kenneth Hodson
+Licensed under the MIT License.
+Full text: vendor/gridflock/gridfinity-rebuilt-openscad/LICENSE
+
+--------------------------------------------------------------------------------
+threads.scad
+https://www.thingiverse.com/thing:1686322
+Created 2016-2017 by Ryan A. Colyer
+Released under CC0 1.0 into the public domain.
+https://creativecommons.org/publicdomain/zero/1.0/
+Bundled at vendor/gridflock/gridfinity-rebuilt-openscad/src/external/threads-scad/threads.scad

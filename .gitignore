@@ -7,3 +7,4 @@ result.json
 *.3mf
 !templates/*.3mf
 .claude/.codex-gate-rounds
+.claude/.codex-gate-disabled

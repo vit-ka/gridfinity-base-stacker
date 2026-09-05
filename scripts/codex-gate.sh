@@ -1,125 +1,148 @@
 #!/usr/bin/env bash
 #
-# codex-gate.sh -- run a Codex code review over the uncommitted changes and
-# block on actionable defects.
+# codex-gate.sh — Codex-based code-review gate for an OpenSpec project.
 #
-# Env vars (with defaults):
-#   REVIEW_THRESHOLD   fail on findings P0..P<THRESHOLD>          (default 3)
-#   REVIEW_MODEL       codex model to review with                 (default gpt-5.6-sol)
-#   REVIEW_EFFORT      model_reasoning_effort                     (default high)
-#   REVIEW_MAX_ROUNDS  after this many blocking rounds, escape    (default 5)
+# Runs Codex read-only over the uncommitted changes, asks for actionable
+# defects as strict JSON, and blocks (exit 2) when any finding is at or above
+# the configured priority threshold. Designed to be driven in a loop from a
+# Claude Code Stop hook (see codex-gate-hook.sh); a round counter prevents it
+# from spinning forever. Safe to run by hand at any time.
 #
-# Exit codes: 0 = clean (or escaped after max rounds), 2 = blocking findings,
-# 1 = the gate itself could not run (missing tool, unparseable output).
+# This file is part of the shared gate at vit-ka/openspec-codex-gate and is
+# kept in sync from the canonical checkout — edit it THERE, not here.
+#
+# Env vars (defaults in parentheses):
+#   REVIEW_THRESHOLD   (2)           Fail on findings P0..P<THRESHOLD>.
+#   REVIEW_MODEL       (gpt-5.6-sol) Model passed to `codex exec -m`.
+#   REVIEW_EFFORT      (high)        model_reasoning_effort.
+#   REVIEW_MAX_ROUNDS  (5)           After this many blocking rounds, bail to
+#                                    human review (exit 0, loud warning).
+#
+# Exit codes: 0 = clean (or bailed to human review), 2 = blocking findings,
+#             1 = misconfiguration / unparseable output (never a silent pass).
 
 set -euo pipefail
 
-REVIEW_THRESHOLD="${REVIEW_THRESHOLD:-3}"
+REVIEW_THRESHOLD="${REVIEW_THRESHOLD:-2}"
 REVIEW_MODEL="${REVIEW_MODEL:-gpt-5.6-sol}"
 REVIEW_EFFORT="${REVIEW_EFFORT:-high}"
 REVIEW_MAX_ROUNDS="${REVIEW_MAX_ROUNDS:-5}"
 
-ROUNDS_FILE=".claude/.codex-gate-rounds"
+# Resolve repo root from this script's location so paths and `git diff` work
+# regardless of the caller's working directory.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+COUNTER_FILE="$ROOT/.claude/.codex-gate-rounds"
 
 die() { echo "codex-gate: $*" >&2; exit 1; }
 
-# --- preconditions: fail loudly, never silently pass ------------------------
-for tool in codex jq python3; do
-  command -v "$tool" >/dev/null 2>&1 || die "required tool '$tool' not found on PATH"
-done
+command -v codex >/dev/null 2>&1 || die "'codex' CLI not found on PATH — cannot run review gate."
+command -v jq    >/dev/null 2>&1 || die "'jq' not found on PATH — cannot parse review output."
 
-case "$REVIEW_THRESHOLD" in ''|*[!0-9]*) die "REVIEW_THRESHOLD must be an integer, got '$REVIEW_THRESHOLD'";; esac
-case "$REVIEW_MAX_ROUNDS" in ''|*[!0-9]*) die "REVIEW_MAX_ROUNDS must be an integer, got '$REVIEW_MAX_ROUNDS'";; esac
+read_counter() {
+  if [ -f "$COUNTER_FILE" ]; then
+    local v
+    v="$(tr -dc '0-9' < "$COUNTER_FILE")"
+    echo "${v:-0}"
+  else
+    echo 0
+  fi
+}
 
-# --- the review prompt ------------------------------------------------------
-read -r -d '' PROMPT <<'EOF' || true
-Review the uncommitted changes in this repository. Inspect the tracked changes
-with `git diff HEAD` and include untracked files (`git ls-files --others
---exclude-standard`).
+write_counter() {
+  mkdir -p "$(dirname "$COUNTER_FILE")"
+  printf '%s\n' "$1" > "$COUNTER_FILE"
+}
 
-Report ONLY actionable defects: correctness, security, reliability, or
-violations of the specs and rules under openspec/. Ignore style nits, naming
-preferences, and formatting.
+PROMPT='Review the uncommitted changes in this repository: everything in `git diff HEAD` plus any untracked files. Report ONLY actionable defects — correctness, security, reliability, or violations of the specifications under openspec/. Assign each finding a priority: P0 (critical), P1 (high), P2 (medium), P3 (minor). Ignore style nits and formatting preferences. Output ONLY a single JSON object, no prose and no markdown fences, of exactly this shape: {"findings":[{"priority":"P1","file":"path/to/file","line":0,"issue":"what is wrong","fix":"how to fix it"}]}. Use an empty array when there are no defects: {"findings":[]}.'
 
-Assign each finding a priority: P0 (critical), P1 (high), P2 (medium), P3 (minor).
+# Extract the last complete top-level JSON object from a stream. Scans
+# backward from the final '}' to its matching '{', tracking JSON string/escape
+# context so braces inside strings (and stray unbalanced braces in any Codex
+# reasoning preamble) do not confuse the match.
+extract_json() {
+  awk '
+    { s = s $0 "\n" }
+    END {
+      n = length(s); endpos = 0;
+      for (i = n; i >= 1; i--) { if (substr(s, i, 1) == "}") { endpos = i; break } }
+      if (endpos == 0) { exit }
+      depth = 0; instr = 0; start = 0;
+      for (i = endpos; i >= 1; i--) {
+        c = substr(s, i, 1);
+        if (c == "\"") {
+          bs = 0; j = i - 1;
+          while (j >= 1 && substr(s, j, 1) == "\\") { bs++; j-- }
+          if (bs % 2 == 0) { instr = !instr }
+          continue;
+        }
+        if (instr) continue;
+        if (c == "}") depth++;
+        else if (c == "{") { depth--; if (depth == 0) { start = i; break } }
+      }
+      if (start == 0) { exit }
+      printf "%s", substr(s, start, endpos - start + 1);
+    }'
+}
 
-Output ONLY a single JSON object, no prose before or after, of exactly this
-shape:
-{"findings":[{"priority":"P1","file":"path/to/file","line":0,"issue":"what is wrong","fix":"what to do"}]}
-Use an empty array when there are no defects: {"findings":[]}
-EOF
+# Run Codex read-only over the working tree. `-o` writes ONLY the agent's final
+# message (the JSON verdict) to a file, which is the reliable source; stdout is
+# a fallback. Keep stderr for diagnostics.
+CODEX_ERR="$(mktemp)"
+LAST_MSG="$(mktemp)"
+trap 'rm -f "$CODEX_ERR" "$LAST_MSG"' EXIT
 
-# --- run codex --------------------------------------------------------------
 set +e
-RAW="$(codex exec -m "$REVIEW_MODEL" -c model_reasoning_effort="\"$REVIEW_EFFORT\"" --sandbox read-only --skip-git-repo-check "$PROMPT" 2>/dev/null)"
-codex_status=$?
+RAW="$(codex exec -m "$REVIEW_MODEL" \
+  -c model_reasoning_effort="\"$REVIEW_EFFORT\"" \
+  --sandbox read-only \
+  --skip-git-repo-check \
+  -o "$LAST_MSG" \
+  "$PROMPT" 2>"$CODEX_ERR")"
+CODEX_RC=$?
 set -e
-[ "$codex_status" -eq 0 ] || die "codex exec failed (exit $codex_status)"
 
-# --- extract the last top-level JSON object from stdout ---------------------
-# A real JSON parser is used because issue/fix strings can contain braces, which
-# defeats naive brace counting.
-JSON="$(printf '%s' "$RAW" | python3 -c '
-import sys, json
-data = sys.stdin.read()
-dec = json.JSONDecoder()
-last, i, n = None, 0, len(data)
-while i < n:
-    if data[i] == "{":
-        try:
-            obj, end = dec.raw_decode(data, i)
-            if isinstance(obj, dict):
-                last = json.dumps(obj)
-                i = end
-                continue
-        except json.JSONDecodeError:
-            pass
-    i += 1
-if last is None:
-    sys.exit(3)
-sys.stdout.write(last)
-')" || die "could not find a parseable JSON object in codex output"
-
-# Require the documented shape rather than treating anything parseable as clean.
-printf '%s' "$JSON" | jq -e 'has("findings") and (.findings | type == "array")' >/dev/null 2>&1 \
-  || die "codex output JSON has no 'findings' array -- refusing to pass"
-
-# --- filter to blocking findings (priority number <= THRESHOLD) -------------
-BLOCKING="$(printf '%s' "$JSON" | jq -c --argjson t "$REVIEW_THRESHOLD" \
-  '[.findings[] | select((.priority | ltrimstr("P") | tonumber) <= $t)]')" \
-  || die "failed to filter findings with jq"
-BLOCKING_COUNT="$(printf '%s' "$BLOCKING" | jq 'length')"
-
-# --- round counter ----------------------------------------------------------
-mkdir -p "$(dirname "$ROUNDS_FILE")"
-rounds=0
-if [ -f "$ROUNDS_FILE" ]; then
-  rounds="$(cat "$ROUNDS_FILE" 2>/dev/null || echo 0)"
-  case "$rounds" in ''|*[!0-9]*) rounds=0;; esac
+# Prefer the clean last-message file; fall back to extracting from stdout.
+JSON="$(extract_json < "$LAST_MSG")"
+if [ -z "$JSON" ]; then
+  JSON="$(printf '%s' "$RAW" | extract_json)"
 fi
 
-if [ "$BLOCKING_COUNT" -eq 0 ]; then
-  printf '0\n' > "$ROUNDS_FILE"
+if [ -z "$JSON" ] || ! printf '%s' "$JSON" | jq -e 'has("findings") and (.findings | type == "array")' >/dev/null 2>&1; then
+  echo "codex-gate: could not parse a JSON review result from Codex output (rc=$CODEX_RC)." >&2
+  echo "codex-gate: Codex stderr follows:" >&2
+  sed 's/^/  codex: /' "$CODEX_ERR" >&2 || true
+  exit 1
+fi
+
+# Findings whose numeric priority is at or below the threshold are blocking.
+BLOCKING="$(printf '%s' "$JSON" | jq -c --argjson t "$REVIEW_THRESHOLD" \
+  '[.findings[] | select((.priority | ltrimstr("P") | tonumber) <= $t)]')"
+COUNT="$(printf '%s' "$BLOCKING" | jq 'length')"
+
+format_findings() {
+  printf '%s' "$1" | jq -r '.[] | "- [\(.priority)] \(.file):\(.line) \(.issue) → \(.fix)"'
+}
+
+if [ "$COUNT" -eq 0 ]; then
+  write_counter 0
   echo "Codex review clean."
   exit 0
 fi
 
-rounds=$((rounds + 1))
-printf '%s\n' "$rounds" > "$ROUNDS_FILE"
+# Blocking findings: bump the round counter.
+ROUNDS="$(read_counter)"
+ROUNDS=$((ROUNDS + 1))
+write_counter "$ROUNDS"
 
-findings_txt="$(printf '%s' "$BLOCKING" | jq -r \
-  '.[] | "- [\(.priority)] \(.file):\(.line) \(.issue) → \(.fix)"')"
-
-if [ "$rounds" -gt "$REVIEW_MAX_ROUNDS" ]; then
-  {
-    echo "codex-gate: gate exceeded max rounds ($REVIEW_MAX_ROUNDS) -- remaining findings need human review"
-    echo "$findings_txt"
-  } >&2
+if [ "$ROUNDS" -gt "$REVIEW_MAX_ROUNDS" ]; then
+  write_counter 0
+  echo "codex-gate: WARNING — gate exceeded max rounds ($REVIEW_MAX_ROUNDS) — remaining findings need human review." >&2
+  format_findings "$BLOCKING" >&2
   exit 0
 fi
 
-{
-  echo "codex-gate: blocking findings (round $rounds of $REVIEW_MAX_ROUNDS):"
-  echo "$findings_txt"
-} >&2
+echo "codex-gate: blocking findings (round $ROUNDS/$REVIEW_MAX_ROUNDS), priority <= P$REVIEW_THRESHOLD:" >&2
+format_findings "$BLOCKING" >&2
 exit 2
