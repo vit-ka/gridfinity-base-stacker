@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# codex-gate — enable/disable the Codex review gate for manual work.
+# codex-gate — controls for the two-stage review gate.
 #
 # Toggles a git-ignored sentinel that the Stop-hook guard (codex-gate-hook.sh)
 # checks. While disabled, the gate is skipped entirely (no review, no sync) so
@@ -8,7 +8,8 @@
 #
 #   codex-gate off      disable the gate until re-enabled
 #   codex-gate on       re-enable the gate
-#   codex-gate status   report whether the gate is on or off
+#   codex-gate status   report gate state and current review mode
+#   codex-gate resume   leave Claude-only mode now (re-enable the Codex stage)
 #
 # For a single Stop only, prefer the one-shot bypass: SKIP_CODEX_GATE=1.
 #
@@ -19,15 +20,36 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SENTINEL="$ROOT/.claude/.codex-gate-disabled"
+CLAUDE_ONLY="$ROOT/.claude/.codex-gate-claude-only"
+
+human_time() {
+  date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
+    || date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
+    || echo "epoch $1"
+}
 
 usage() {
   cat >&2 <<'EOF'
-usage: codex-gate {on|off|status}
+usage: codex-gate {on|off|status|resume}
   off      disable the review gate (persists until `codex-gate on`)
   on       re-enable the review gate
-  status   report whether the gate is enabled or disabled
+  status   report whether the gate is enabled/disabled and its review mode
+  resume   leave Claude-only mode now and re-enable the Codex stage
 EOF
   exit 2
+}
+
+report_mode() {
+  if [ -e "$CLAUDE_ONLY" ]; then
+    local resume now; resume="$(tr -dc '0-9' < "$CLAUDE_ONLY")"; resume="${resume:-0}"; now="$(date +%s)"
+    if [ "$now" -lt "$resume" ]; then
+      echo "codex-gate: Mode: CLAUDE-ONLY (Codex usage limit) — Codex resumes at $(human_time "$resume")"
+    else
+      echo "codex-gate: Mode: two-stage (Claude-only cooldown elapsed; Codex re-probes on the next run)"
+    fi
+  else
+    echo "codex-gate: Mode: two-stage (Claude → Codex)"
+  fi
 }
 
 case "${1:-}" in
@@ -45,6 +67,15 @@ case "${1:-}" in
       echo "codex-gate: DISABLED (sentinel present: .claude/.codex-gate-disabled)"
     else
       echo "codex-gate: ENABLED"
+    fi
+    report_mode
+    ;;
+  resume)
+    if [ -e "$CLAUDE_ONLY" ]; then
+      rm -f "$CLAUDE_ONLY"
+      echo "codex-gate: Claude-only mode cleared — full two-stage review restored on the next run."
+    else
+      echo "codex-gate: not in Claude-only mode — nothing to resume."
     fi
     ;;
   *)

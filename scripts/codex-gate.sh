@@ -1,25 +1,39 @@
 #!/usr/bin/env bash
 #
-# codex-gate.sh — Codex-based code-review gate for an OpenSpec project.
+# codex-gate.sh — two-stage code-review gate for an OpenSpec project.
 #
-# Runs Codex read-only over the uncommitted changes, asks for actionable
-# defects as strict JSON, and blocks (exit 2) when any finding is at or above
-# the configured priority threshold. Designed to be driven in a loop from a
-# Claude Code Stop hook (see codex-gate-hook.sh); a round counter prevents it
-# from spinning forever. Safe to run by hand at any time.
+# Each gated run reviews the uncommitted changes in two stages:
+#   1. Claude  — a cheap pass via the `claude` CLI headless
+#                (`claude -p --model "$CLAUDE_REVIEW_MODEL"`), the diff fed
+#                in-prompt. Blocks (exit 2) until it comes back clean.
+#   2. Codex   — the costly full pass, run only once the Claude stage is clean.
+#
+# A clean Codex pass is cached against a fingerprint of the reviewed diff, so a
+# converged change is not re-billed to Codex on every subsequent stop. When
+# Codex reports a usage/subscription limit the gate does NOT fail closed: it
+# enters an announced, git-ignored Claude-only mode until the limit resets.
+#
+# Designed to be driven in a loop from a Claude Code Stop hook (see
+# codex-gate-hook.sh); per-stage round counters prevent it spinning forever.
+# Safe to run by hand at any time.
 #
 # This file is part of the shared gate at vit-ka/openspec-codex-gate and is
 # kept in sync from the canonical checkout — edit it THERE, not here.
 #
 # Env vars (defaults in parentheses):
-#   REVIEW_THRESHOLD   (2)           Fail on findings P0..P<THRESHOLD>.
-#   REVIEW_MODEL       (gpt-5.6-sol) Model passed to `codex exec -m`.
-#   REVIEW_EFFORT      (high)        model_reasoning_effort.
-#   REVIEW_MAX_ROUNDS  (5)           After this many blocking rounds, bail to
-#                                    human review (exit 0, loud warning).
+#   REVIEW_THRESHOLD    (2)                Block on findings P0..P<THRESHOLD>.
+#   REVIEW_MODEL        (gpt-5.6-sol)      Model passed to `codex exec -m`.
+#   REVIEW_EFFORT       (high)             Codex model_reasoning_effort.
+#   REVIEW_MAX_ROUNDS   (5)                Per stage: after this many blocking
+#                                          rounds, bail to human review.
+#   CLAUDE_REVIEW_MODEL (claude-opus-4-8)  Model for the Claude stage.
+#   CODEX_LIMIT_COOLDOWN(60m)              Claude-only fallback when no reset
+#                                          time is parseable (Ns/Nm/Nh or N).
+#   CODEX_GATE_NOTIFY   (1)                0 disables the macOS notification.
 #
-# Exit codes: 0 = clean (or bailed to human review), 2 = blocking findings,
-#             1 = misconfiguration / unparseable output (never a silent pass).
+# Exit codes: 0 = clean / cached / degraded-to-Claude-only (session may stop),
+#             2 = blocking findings, 1 = misconfiguration / unparseable output
+#             (never a silent pass).
 
 set -euo pipefail
 
@@ -27,40 +41,132 @@ REVIEW_THRESHOLD="${REVIEW_THRESHOLD:-2}"
 REVIEW_MODEL="${REVIEW_MODEL:-gpt-5.6-sol}"
 REVIEW_EFFORT="${REVIEW_EFFORT:-high}"
 REVIEW_MAX_ROUNDS="${REVIEW_MAX_ROUNDS:-5}"
+CLAUDE_REVIEW_MODEL="${CLAUDE_REVIEW_MODEL:-claude-opus-4-8}"
+CODEX_LIMIT_COOLDOWN="${CODEX_LIMIT_COOLDOWN:-60m}"
+CODEX_GATE_NOTIFY="${CODEX_GATE_NOTIFY:-1}"
 
 # Resolve repo root from this script's location so paths and `git diff` work
 # regardless of the caller's working directory.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-COUNTER_FILE="$ROOT/.claude/.codex-gate-rounds"
+CLAUDE_DIR="$ROOT/.claude"
+CLAUDE_ONLY="$CLAUDE_DIR/.codex-gate-claude-only"   # holds resume epoch
+CODEX_PASS="$CLAUDE_DIR/.codex-gate-codex-pass"      # holds last clean diff hash
+CHANGES=""                                           # active change name(s); set in main
 
-die() { echo "codex-gate: $*" >&2; exit 1; }
+die()  { echo "codex-gate: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
 
-command -v codex >/dev/null 2>&1 || die "'codex' CLI not found on PATH — cannot run review gate."
-command -v jq    >/dev/null 2>&1 || die "'jq' not found on PATH — cannot parse review output."
+have jq || die "'jq' not found on PATH — cannot parse review output."
 
-read_counter() {
-  if [ -f "$COUNTER_FILE" ]; then
-    local v
-    v="$(tr -dc '0-9' < "$COUNTER_FILE")"
-    echo "${v:-0}"
+# ---------------------------------------------------------------------------
+# Small utilities
+# ---------------------------------------------------------------------------
+now_epoch() { date +%s; }
+
+# Convert a duration (Ns / Nm / Nh / bare N seconds) to seconds; 1h on garbage.
+to_seconds() {
+  local v="${1:-}"
+  if [[ "$v" =~ ^([0-9]+)([sSmMhH]?)$ ]]; then
+    local n="${BASH_REMATCH[1]}" u="${BASH_REMATCH[2]}"
+    case "$u" in
+      [sS]|"") echo "$n" ;;
+      [mM])    echo $(( n * 60 )) ;;
+      [hH])    echo $(( n * 3600 )) ;;
+    esac
   else
-    echo 0
+    echo 3600
   fi
 }
 
-write_counter() {
-  mkdir -p "$(dirname "$COUNTER_FILE")"
-  printf '%s\n' "$1" > "$COUNTER_FILE"
+human_time() {
+  date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
+    || date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null \
+    || echo "epoch $1"
 }
 
-PROMPT='Review the uncommitted changes in this repository: everything in `git diff HEAD` plus any untracked files. Report ONLY actionable defects — correctness, security, reliability, or violations of the specifications under openspec/. Assign each finding a priority: P0 (critical), P1 (high), P2 (medium), P3 (minor). Ignore style nits and formatting preferences. Output ONLY a single JSON object, no prose and no markdown fences, of exactly this shape: {"findings":[{"priority":"P1","file":"path/to/file","line":0,"issue":"what is wrong","fix":"how to fix it"}]}. Use an empty array when there are no defects: {"findings":[]}.'
+sha256() {
+  if have shasum; then shasum -a 256
+  elif have sha256sum; then sha256sum
+  else cat  # degraded: identity, still stable for cache comparison within a run
+  fi | awk '{print $1}'
+}
 
-# Extract the last complete top-level JSON object from a stream. Scans
-# backward from the final '}' to its matching '{', tracking JSON string/escape
-# context so braces inside strings (and stray unbalanced braces in any Codex
-# reasoning preamble) do not confuse the match.
+# The uncommitted changes, used to compute the Codex-pass cache fingerprint. The
+# gate's own transient files (.claude/.codex-gate-*) are skipped so they cannot
+# perturb the fingerprint — otherwise writing the cache would change the next
+# run's fingerprint and the cache would never hit in a repo that does not
+# git-ignore them.
+diff_content() {
+  git diff HEAD 2>/dev/null || true
+  git ls-files --others --exclude-standard -z 2>/dev/null | while IFS= read -r -d '' f; do
+    case "$f" in .claude/.codex-gate-*) continue ;; esac
+    printf '\n===== untracked: %s =====\n' "$f"
+    cat -- "$f" 2>/dev/null || true
+  done
+}
+
+# A stable fingerprint of the uncommitted changes, for the Codex-pass cache.
+diff_fingerprint() { diff_content | sha256; }
+
+# ---------------------------------------------------------------------------
+# Round counters (per stage: claude|codex)
+# ---------------------------------------------------------------------------
+counter_file() { echo "$CLAUDE_DIR/.codex-gate-$1-rounds"; }
+read_counter() {
+  local f; f="$(counter_file "$1")"
+  if [ -f "$f" ]; then local v; v="$(tr -dc '0-9' < "$f")"; echo "${v:-0}"; else echo 0; fi
+}
+write_counter() { mkdir -p "$CLAUDE_DIR"; printf '%s\n' "$2" > "$(counter_file "$1")"; }
+
+# ---------------------------------------------------------------------------
+# Notification helpers
+# ---------------------------------------------------------------------------
+loud_banner() {
+  {
+    echo "############################################################"
+    local line
+    for line in "$@"; do echo "# $line"; done
+    echo "############################################################"
+  } >&2
+}
+notify() {
+  [ "$CODEX_GATE_NOTIFY" != "0" ] || return 0
+  [ "$(uname)" = "Darwin" ] || return 0
+  have osascript || return 0
+  osascript -e "display notification \"$1\" with title \"codex-gate\"" >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# Review prompt + JSON extraction (shared by both stages)
+# ---------------------------------------------------------------------------
+# The active, non-archived OpenSpec change names (those with a tasks.md).
+active_changes() {
+  find openspec/changes -maxdepth 2 -name tasks.md -not -path '*/archive/*' 2>/dev/null \
+    | sed -E 's#.*/changes/([^/]+)/tasks\.md$#\1#' | sort -u
+}
+
+# The shared review prompt. Names the active change(s) so each agent reads
+# openspec/changes/<name>/ and locates the related code itself, rather than being
+# handed a precomputed diff. $1 is the comma-separated change list (may be empty).
+review_prompt() {
+  local changes="$1"
+  if [ -n "$changes" ]; then
+    printf 'You are the code-review gate for this repository. Active OpenSpec change(s) under review: %s.\n\n' "$changes"
+    printf 'For each change, read its planning artifacts under openspec/changes/<name>/ (proposal.md, design.md, tasks.md, specs/**/*.md) to understand the intended behavior, then find and review the related implementation in this repository yourself.\n\n'
+  else
+    printf 'You are the code-review gate for this repository. Review the uncommitted changes in this repository.\n\n'
+  fi
+  cat <<'EOF'
+Focus on the uncommitted work (everything in `git diff HEAD` plus any untracked files). Report ONLY actionable defects — correctness, security, reliability, or violations of the specifications under openspec/. Assign each finding a priority: P0 (critical), P1 (high), P2 (medium), P3 (minor). Ignore style nits and formatting preferences. Output ONLY a single JSON object, no prose and no markdown fences, of exactly this shape: {"findings":[{"priority":"P1","file":"path/to/file","line":0,"issue":"what is wrong","fix":"how to fix it"}]}. Use an empty array when there are no defects: {"findings":[]}.
+EOF
+}
+
+# Extract the last complete top-level JSON object from a stream. Scans backward
+# from the final '}' to its matching '{', tracking JSON string/escape context so
+# braces inside strings (and stray braces in any reasoning preamble) do not
+# confuse the match.
 extract_json() {
   awk '
     { s = s $0 "\n" }
@@ -86,88 +192,209 @@ extract_json() {
     }'
 }
 
-# Run Codex read-only over the working tree. `-o` writes ONLY the agent's final
-# message (the JSON verdict) to a file, which is the reliable source; stdout is
-# a fallback. Keep stderr for diagnostics.
-CODEX_ERR="$(mktemp)"
-LAST_MSG="$(mktemp)"
-trap 'rm -f "$CODEX_ERR" "$LAST_MSG"' EXIT
-
-set +e
-RAW="$(codex exec -m "$REVIEW_MODEL" \
-  -c model_reasoning_effort="\"$REVIEW_EFFORT\"" \
-  --sandbox read-only \
-  --skip-git-repo-check \
-  -o "$LAST_MSG" \
-  "$PROMPT" 2>"$CODEX_ERR")"
-CODEX_RC=$?
-set -e
-
-# A nonzero Codex exit means the review did not complete reliably. Fail closed
-# (exit 1) rather than trusting whatever happens to be in the output files —
-# otherwise a crashed run that left an empty verdict would silently pass.
-if [ "$CODEX_RC" -ne 0 ]; then
-  echo "codex-gate: 'codex exec' exited $CODEX_RC — treating as a failed review (fail-closed)." >&2
-  echo "codex-gate: Codex stderr follows:" >&2
-  sed 's/^/  codex: /' "$CODEX_ERR" >&2 || true
-  exit 1
-fi
-
-# Prefer the clean last-message file; fall back to extracting from stdout.
-JSON="$(extract_json < "$LAST_MSG")"
-if [ -z "$JSON" ]; then
-  JSON="$(printf '%s' "$RAW" | extract_json)"
-fi
-
-if [ -z "$JSON" ] || ! printf '%s' "$JSON" | jq -e 'has("findings") and (.findings | type == "array")' >/dev/null 2>&1; then
-  echo "codex-gate: could not parse a JSON review result from Codex output (rc=$CODEX_RC)." >&2
-  echo "codex-gate: Codex stderr follows:" >&2
-  sed 's/^/  codex: /' "$CODEX_ERR" >&2 || true
-  exit 1
-fi
-
-# Every finding must be well-formed before we threshold it — otherwise a
-# malformed priority (missing, non-numeric, out of range) would either be
-# mis-classified or crash the jq thresholding below with an opaque status.
-if ! printf '%s' "$JSON" | jq -e '.findings | all(
-      (.priority? | type == "string" and test("^P[0-3]$")) and
-      (.file?     | type == "string") and
-      (.line?     | type == "number") and
-      (.issue?    | type == "string") and
-      (.fix?      | type == "string"))' >/dev/null 2>&1; then
-  echo "codex-gate: review JSON has malformed findings (need priority P0-P3, string file/issue/fix, numeric line)." >&2
-  echo "codex-gate: raw verdict follows:" >&2
-  printf '%s\n' "$JSON" | sed 's/^/  json: /' >&2
-  exit 1
-fi
-
-# Findings whose numeric priority is at or below the threshold are blocking.
-BLOCKING="$(printf '%s' "$JSON" | jq -c --argjson t "$REVIEW_THRESHOLD" \
-  '[.findings[] | select((.priority | ltrimstr("P") | tonumber) <= $t)]')"
-COUNT="$(printf '%s' "$BLOCKING" | jq 'length')"
+# Parse a stage's output into a blocking-findings array (global BLOCKING).
+# Fails closed (exit 1) on unparseable or malformed output — never a silent pass.
+#   $1 label   $2 last-message file (may be empty)   $3 raw stdout   $4 stderr file
+parse_verdict() {
+  local label="$1" msg="$2" raw="$3" err="$4" json
+  json="$(extract_json < "$msg")"
+  [ -n "$json" ] || json="$(printf '%s' "$raw" | extract_json)"
+  if [ -z "$json" ] || ! printf '%s' "$json" | jq -e 'has("findings") and (.findings | type == "array")' >/dev/null 2>&1; then
+    echo "codex-gate: [$label] could not parse a JSON review result." >&2
+    echo "codex-gate: [$label] stderr follows:" >&2
+    sed "s/^/  $label: /" "$err" >&2 2>/dev/null || true
+    exit 1
+  fi
+  if ! printf '%s' "$json" | jq -e '.findings | all(
+        (.priority? | type == "string" and test("^P[0-3]$")) and
+        (.file?     | type == "string") and
+        (.line?     | type == "number") and
+        (.issue?    | type == "string") and
+        (.fix?      | type == "string"))' >/dev/null 2>&1; then
+    echo "codex-gate: [$label] review JSON has malformed findings (need priority P0-P3, string file/issue/fix, numeric line)." >&2
+    printf '%s\n' "$json" | sed 's/^/  json: /' >&2
+    exit 1
+  fi
+  BLOCKING="$(printf '%s' "$json" | jq -c --argjson t "$REVIEW_THRESHOLD" \
+    '[.findings[] | select((.priority | ltrimstr("P") | tonumber) <= $t)]')"
+}
 
 format_findings() {
   printf '%s' "$1" | jq -r '.[] | "- [\(.priority)] \(.file):\(.line) \(.issue) → \(.fix)"'
 }
+blocking_count() { printf '%s' "${1:-[]}" | jq 'length'; }
 
-if [ "$COUNT" -eq 0 ]; then
-  write_counter 0
-  echo "Codex review clean."
-  exit 0
-fi
+# ---------------------------------------------------------------------------
+# Stage runners. Return: 0 clean, 2 blocking (BLOCKING set), 3 usage-limit
+# (codex only; RESET_EPOCH set). Genuine failures exit 1 via die/parse_verdict.
+# ---------------------------------------------------------------------------
+run_claude() {
+  have claude || die "'claude' CLI not found on PATH — cannot run the Claude review stage."
+  local err msg raw rc
+  err="$(mktemp)"; msg="$(mktemp)"; : > "$msg"
+  # The agent locates and reads the code itself with read-only tools; writers are
+  # denied and dontAsk means it neither prompts nor edits. SKIP_CODEX_GATE=1
+  # guards against any Stop hook this nested `claude` might fire.
+  set +e
+  raw="$(review_prompt "$CHANGES" | SKIP_CODEX_GATE=1 claude -p --model "$CLAUDE_REVIEW_MODEL" \
+    --permission-mode dontAsk \
+    --allowedTools "Read Grep Glob Bash(git diff:*) Bash(git status:*) Bash(git log:*) Bash(git show:*) Bash(git ls-files:*)" \
+    --disallowedTools "Write Edit NotebookEdit" \
+    2>"$err")"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    echo "codex-gate: [claude] 'claude -p' exited $rc — treating as a failed review (fail-closed)." >&2
+    sed 's/^/  claude: /' "$err" >&2 2>/dev/null || true
+    rm -f "$err" "$msg"; exit 1
+  fi
+  parse_verdict claude "$msg" "$raw" "$err"
+  rm -f "$err" "$msg"
+  [ "$(blocking_count "$BLOCKING")" -eq 0 ] && return 0 || return 2
+}
 
-# Blocking findings: bump the round counter.
-ROUNDS="$(read_counter)"
-ROUNDS=$((ROUNDS + 1))
-write_counter "$ROUNDS"
+# Distinguish a usage/rate/subscription limit from a genuine failure.
+is_limit() {
+  grep -qiE 'usage limit|rate ?limit|rate.?limited|quota|429|too many requests|resets? (at|in)|try again (in|later)' "$1"
+}
 
-if [ "$ROUNDS" -gt "$REVIEW_MAX_ROUNDS" ]; then
-  write_counter 0
-  echo "codex-gate: WARNING — gate exceeded max rounds ($REVIEW_MAX_ROUNDS) — remaining findings need human review." >&2
-  format_findings "$BLOCKING" >&2
-  exit 0
-fi
+# Best-effort resume epoch from a Codex limit message; else now + cooldown.
+parse_reset_epoch() {
+  local f="$1" now m; now="$(now_epoch)"
+  m="$(grep -ioE 'in [0-9]+ ?(second|minute|hour)' "$f" 2>/dev/null | head -1 || true)"
+  if [ -n "$m" ]; then
+    local num unit
+    num="$(printf '%s' "$m" | grep -oE '[0-9]+')"
+    unit="$(printf '%s' "$m" | grep -ioE '(second|minute|hour)' | tr 'A-Z' 'a-z')"
+    case "$unit" in
+      second) echo $(( now + num )); return ;;
+      minute) echo $(( now + num * 60 )); return ;;
+      hour)   echo $(( now + num * 3600 )); return ;;
+    esac
+  fi
+  echo $(( now + $(to_seconds "$CODEX_LIMIT_COOLDOWN") ))
+}
 
-echo "codex-gate: blocking findings (round $ROUNDS/$REVIEW_MAX_ROUNDS), priority <= P$REVIEW_THRESHOLD:" >&2
-format_findings "$BLOCKING" >&2
-exit 2
+run_codex() {
+  have codex || die "'codex' CLI not found on PATH — cannot run the Codex review stage."
+  local err msg raw rc
+  err="$(mktemp)"; msg="$(mktemp)"
+  set +e
+  raw="$(codex exec -m "$REVIEW_MODEL" \
+    -c model_reasoning_effort="\"$REVIEW_EFFORT\"" \
+    --sandbox read-only \
+    --skip-git-repo-check \
+    -o "$msg" \
+    "$(review_prompt "$CHANGES")" 2>"$err")"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    if is_limit "$err"; then
+      RESET_EPOCH="$(parse_reset_epoch "$err")"
+      rm -f "$err" "$msg"; return 3
+    fi
+    echo "codex-gate: [codex] 'codex exec' exited $rc — treating as a failed review (fail-closed)." >&2
+    sed 's/^/  codex: /' "$err" >&2 2>/dev/null || true
+    rm -f "$err" "$msg"; exit 1
+  fi
+  parse_verdict codex "$msg" "$raw" "$err"
+  rm -f "$err" "$msg"
+  [ "$(blocking_count "$BLOCKING")" -eq 0 ] && return 0 || return 2
+}
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+main() {
+  local codex_allowed=1
+
+  # Name the active change(s) for both agents; empty falls back to a generic
+  # "review the uncommitted changes" prompt.
+  CHANGES="$(active_changes | paste -sd, - | sed 's/,/, /g')"
+
+  # Claude-only mode: skip Codex until the recorded resume epoch has passed.
+  if [ -f "$CLAUDE_ONLY" ]; then
+    local resume now; resume="$(tr -dc '0-9' < "$CLAUDE_ONLY")"; resume="${resume:-0}"; now="$(now_epoch)"
+    if [ "$now" -ge "$resume" ]; then
+      rm -f "$CLAUDE_ONLY"
+      echo "codex-gate: Claude-only cooldown elapsed — re-probing Codex." >&2
+    else
+      codex_allowed=0
+      loud_banner \
+        "CODEX REVIEW GATE — CLAUDE-ONLY MODE (Codex usage limit reached)" \
+        "Codex is temporarily disabled; reviewing with $CLAUDE_REVIEW_MODEL only." \
+        "Codex resumes automatically after $(human_time "$resume")." \
+        "Force a full review sooner with:  scripts/codex-gate resume"
+      notify "Claude-only mode — Codex limited until $(human_time "$resume")"
+    fi
+  fi
+
+  # Stage 1 — Claude.
+  local rc=0; run_claude || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    local n; n="$(read_counter claude)"; n=$(( n + 1 )); write_counter claude "$n"
+    if [ "$n" -gt "$REVIEW_MAX_ROUNDS" ]; then
+      write_counter claude 0
+      loud_banner "CLAUDE STAGE exceeded max rounds ($REVIEW_MAX_ROUNDS) — remaining findings need human review."
+      format_findings "$BLOCKING" >&2
+      # Bail: treat the Claude stage as passed and fall through to Codex.
+    else
+      echo "codex-gate: [claude] blocking findings (round $n/$REVIEW_MAX_ROUNDS), priority <= P$REVIEW_THRESHOLD:" >&2
+      format_findings "$BLOCKING" >&2
+      exit 2
+    fi
+  else
+    write_counter claude 0
+  fi
+
+  # Claude stage passed (clean or bailed to human review).
+  if [ "$codex_allowed" -eq 0 ]; then
+    echo "codex-gate: Claude stage clean; Codex skipped (Claude-only mode)." >&2
+    exit 0
+  fi
+
+  # Codex-pass cache: skip Codex while the reviewed diff is unchanged.
+  if [ -f "$CODEX_PASS" ]; then
+    local fp cur; fp="$(cat "$CODEX_PASS" 2>/dev/null || true)"; cur="$(diff_fingerprint)"
+    if [ -n "$fp" ] && [ "$fp" = "$cur" ]; then
+      echo "codex-gate: Codex review cached (diff unchanged since last clean pass) — skipping Codex."
+      exit 0
+    fi
+  fi
+
+  # Stage 2 — Codex.
+  local crc=0; run_codex || crc=$?
+  case "$crc" in
+    0)
+      write_counter codex 0
+      diff_fingerprint > "$CODEX_PASS"
+      echo "Two-stage review clean (Claude + Codex)."
+      exit 0
+      ;;
+    2)
+      local n; n="$(read_counter codex)"; n=$(( n + 1 )); write_counter codex "$n"
+      if [ "$n" -gt "$REVIEW_MAX_ROUNDS" ]; then
+        write_counter codex 0
+        loud_banner "CODEX STAGE exceeded max rounds ($REVIEW_MAX_ROUNDS) — remaining findings need human review."
+        format_findings "$BLOCKING" >&2
+        exit 0
+      fi
+      echo "codex-gate: [codex] blocking findings (round $n/$REVIEW_MAX_ROUNDS), priority <= P$REVIEW_THRESHOLD:" >&2
+      format_findings "$BLOCKING" >&2
+      exit 2
+      ;;
+    3)
+      mkdir -p "$CLAUDE_DIR"
+      printf '%s\n' "$RESET_EPOCH" > "$CLAUDE_ONLY"
+      loud_banner \
+        "CODEX USAGE LIMIT REACHED — entering CLAUDE-ONLY MODE." \
+        "The Claude stage already passed, so this stop is allowed to proceed." \
+        "Codex will be skipped until $(human_time "$RESET_EPOCH")." \
+        "Force a retry sooner with:  scripts/codex-gate resume"
+      notify "Codex limit reached — Claude-only until $(human_time "$RESET_EPOCH")"
+      exit 0
+      ;;
+  esac
+}
+
+main "$@"
