@@ -103,6 +103,16 @@ RAW="$(codex exec -m "$REVIEW_MODEL" \
 CODEX_RC=$?
 set -e
 
+# A nonzero Codex exit means the review did not complete reliably. Fail closed
+# (exit 1) rather than trusting whatever happens to be in the output files —
+# otherwise a crashed run that left an empty verdict would silently pass.
+if [ "$CODEX_RC" -ne 0 ]; then
+  echo "codex-gate: 'codex exec' exited $CODEX_RC — treating as a failed review (fail-closed)." >&2
+  echo "codex-gate: Codex stderr follows:" >&2
+  sed 's/^/  codex: /' "$CODEX_ERR" >&2 || true
+  exit 1
+fi
+
 # Prefer the clean last-message file; fall back to extracting from stdout.
 JSON="$(extract_json < "$LAST_MSG")"
 if [ -z "$JSON" ]; then
@@ -113,6 +123,21 @@ if [ -z "$JSON" ] || ! printf '%s' "$JSON" | jq -e 'has("findings") and (.findin
   echo "codex-gate: could not parse a JSON review result from Codex output (rc=$CODEX_RC)." >&2
   echo "codex-gate: Codex stderr follows:" >&2
   sed 's/^/  codex: /' "$CODEX_ERR" >&2 || true
+  exit 1
+fi
+
+# Every finding must be well-formed before we threshold it — otherwise a
+# malformed priority (missing, non-numeric, out of range) would either be
+# mis-classified or crash the jq thresholding below with an opaque status.
+if ! printf '%s' "$JSON" | jq -e '.findings | all(
+      (.priority? | type == "string" and test("^P[0-3]$")) and
+      (.file?     | type == "string") and
+      (.line?     | type == "number") and
+      (.issue?    | type == "string") and
+      (.fix?      | type == "string"))' >/dev/null 2>&1; then
+  echo "codex-gate: review JSON has malformed findings (need priority P0-P3, string file/issue/fix, numeric line)." >&2
+  echo "codex-gate: raw verdict follows:" >&2
+  printf '%s\n' "$JSON" | sed 's/^/  json: /' >&2
   exit 1
 fi
 
