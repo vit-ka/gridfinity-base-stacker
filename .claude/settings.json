@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ \"${SKIP_CODEX_GATE:-0}\" = \"1\" ]; then exit 0; fi; if [ -z \"$(git status --porcelain 2>/dev/null)\" ]; then exit 0; fi; if [ -z \"$(find openspec/changes -mindepth 2 -maxdepth 2 -name tasks.md -not -path '*/archive/*' 2>/dev/null)\" ]; then exit 0; fi; bash scripts/codex-gate.sh",
+            "command": "bash scripts/codex-gate-hook.sh",
             "timeout": 600
           }
         ]
