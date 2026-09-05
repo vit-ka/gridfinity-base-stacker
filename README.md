@@ -152,3 +152,40 @@ the code.
 
 Decisions live in `docs/adr`. Several exist specifically to stop approaches being
 re-tried after they measured as dead ends.
+
+### The code review gate
+
+`scripts/codex-gate.sh` runs a [Codex](https://developers.openai.com/codex/cli/)
+review over the uncommitted changes (`git diff HEAD` plus untracked files) and
+reports actionable defects only -- correctness, security, reliability, and
+violations of the specs in `openspec/`, not style. Each finding is P0 (critical)
+to P3 (minor); by default anything P0..P3 blocks.
+
+A Claude Code `Stop` hook (`.claude/settings.json`) runs the gate automatically
+when a stop happens with an OpenSpec change in progress -- there are uncommitted
+changes *and* a non-archived `openspec/changes/*/tasks.md` exists. Blocking
+findings (exit 2) stop the session and are fed back so they get fixed; the gate
+is also the mandated final task of every change (`openspec/config.yaml`).
+
+Run it by hand any time:
+
+```
+bash scripts/codex-gate.sh
+```
+
+Tunable via environment variables:
+
+| var | default | meaning |
+|---|---|---|
+| `REVIEW_THRESHOLD` | `3` | block on findings P0..P<THRESHOLD> |
+| `REVIEW_MODEL` | `gpt-5.6-sol` | Codex model to review with |
+| `REVIEW_EFFORT` | `high` | `model_reasoning_effort` |
+| `REVIEW_MAX_ROUNDS` | `5` | after this many blocking rounds in a row, the gate stops blocking and asks for a human, so a fix loop can't spin forever |
+
+The round counter lives in `.claude/.codex-gate-rounds` (gitignored) and resets
+on a clean run.
+
+To bypass the gate in an emergency, set `SKIP_CODEX_GATE=1` -- the Stop hook then
+exits without running it. The gate needs `codex` and `jq` on `PATH` and fails
+loudly rather than passing silently if either is missing or Codex returns
+unparseable output.

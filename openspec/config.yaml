@@ -47,8 +47,15 @@ rules:
   tasks:
     - Include verifying against a sliced file, not only against the test suite.
       The suite has passed while the model printed into air.
+    - The final task of every change MUST be "Run scripts/codex-gate.sh and
+      resolve all reported findings; re-run until clean"
 
 operations:
+  apply:
+    guidance:
+      - After completing all tasks, run scripts/codex-gate.sh. Fix every
+        reported finding and re-run until it exits 0. Do not mark the change
+        complete otherwise.
   archive:
     guidance:
       - Decisions belong in docs/adr, which predates OpenSpec here and is
