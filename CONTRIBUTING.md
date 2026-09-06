@@ -31,6 +31,11 @@ Arming is scoped to implementation work: the `UserPromptSubmit` hook arms on
 finalizing does not trigger reviews. A plain prompt leaves the armed state
 unchanged. Re-run `/openspec-apply-change` to re-arm after a detour.
 
+**Prefer a skill?** These controls are also a Claude Code skill, so you can run
+them without the `scripts/` path: type `/review-gate <subcommand>` (for example
+`/review-gate status` or `/review-gate reset-cooldown`) and it forwards to
+`scripts/review-gate`; a bare `/review-gate` prints this cheat sheet.
+
 **Want to review right now?** Run a fresh review on demand (it ignores the pass
 cache), without waiting for a stop:
 

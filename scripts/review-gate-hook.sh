@@ -38,6 +38,8 @@ cd "$ROOT"
 
 # The scripts kept in sync from the canonical checkout.
 MANAGED_SCRIPTS=(review-gate.sh review-gate-hook.sh review-gate review-gate-arm.sh)
+# Managed skills kept in sync too — the review-gate skill (.claude/skills/<name>/SKILL.md).
+MANAGED_SKILLS=(review-gate)
 
 # 1. One-shot bypass.
 if [ "${SKIP_REVIEW_GATE:-0}" = "1" ]; then
@@ -85,6 +87,22 @@ sync_from_canonical() {
       tmp="$dst.tmp.$$"
       cp -p "$src" "$tmp" && mv -f "$tmp" "$dst" || { rm -f "$tmp"; continue; }
       echo "review-gate: synced scripts/$name from canonical ($canon_root)." >&2
+    fi
+  done
+  # Managed skills: same canonical-wins refresh for .claude/skills/<name>/SKILL.md.
+  # The skill is a non-executing markdown file, but we reuse the same-dir temp +
+  # atomic-rename path for uniformity. A consumer missing the skill (cmp fails on a
+  # nonexistent dst) has it created; the dir is made if absent.
+  local sdir
+  for name in "${MANAGED_SKILLS[@]}"; do
+    src="$canon_root/.claude/skills/$name/SKILL.md"
+    dst="$ROOT/.claude/skills/$name/SKILL.md"
+    [ -f "$src" ] || continue
+    if ! cmp -s "$src" "$dst" 2>/dev/null; then
+      sdir="$(dirname "$dst")"; mkdir -p "$sdir" || continue
+      tmp="$dst.tmp.$$"
+      cp -p "$src" "$tmp" && mv -f "$tmp" "$dst" || { rm -f "$tmp"; continue; }
+      echo "review-gate: synced .claude/skills/$name/SKILL.md from canonical ($canon_root)." >&2
     fi
   done
 }
