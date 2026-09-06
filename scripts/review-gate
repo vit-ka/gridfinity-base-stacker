@@ -86,8 +86,16 @@ case "${1:-}" in
       echo "review-gate: no change found to arm — pass one explicitly: review-gate start <change>" >&2
       exit 2
     fi
-    if [ ! -d "$ROOT/openspec/changes/$ch" ]; then
-      echo "review-gate: change '$ch' not found under openspec/changes/ — cannot arm." >&2
+    # Accept only a real, active change: a single path component (no '/'), not the
+    # 'archive' container, whose tasks.md exists. This refuses `start archive`,
+    # nested paths like `<change>/specs`, and nonexistent names.
+    case "$ch" in
+      */*|.|..|archive)
+        echo "review-gate: '$ch' is not a valid change name — pass a single active change under openspec/changes/." >&2
+        exit 2 ;;
+    esac
+    if [ ! -f "$ROOT/openspec/changes/$ch/tasks.md" ]; then
+      echo "review-gate: change '$ch' not found under openspec/changes/ (no tasks.md) — cannot arm." >&2
       exit 2
     fi
     mkdir -p "$(dirname "$ACTIVE")"

@@ -12,8 +12,9 @@
 #                (`$REVIEW_MODEL`) normally, or Claude `$FINAL_CLAUDE_MODEL` only
 #                when Codex is rate-limited.
 #
-# A clean final pass is cached against a fingerprint of the reviewed diff, so a
-# converged change is not re-reviewed on every subsequent stop. When Codex
+# A clean final pass is cached against a content fingerprint (a git tree hash of
+# the working state, committed + uncommitted) keyed by the change under review, so
+# a converged change is not re-reviewed on every subsequent stop. When Codex
 # reports a usage/subscription limit the gate does NOT fail closed: it records a
 # git-ignored Codex-cooldown sentinel and uses Claude `$FINAL_CLAUDE_MODEL` as
 # the final reviewer until the limit resets. The final reviewers reuse their
@@ -86,7 +87,7 @@ unset _env_REVIEW_THRESHOLD _env_REVIEW_MODEL _env_REVIEW_EFFORT _env_REVIEW_MAX
 
 CLAUDE_DIR="$ROOT/.claude"
 CODEX_COOLDOWN="$CLAUDE_DIR/.review-gate-codex-cooldown" # Codex limited until this epoch → use final Claude
-FINAL_PASS="$CLAUDE_DIR/.review-gate-final-pass"         # diff hash of the last clean FINAL review
+FINAL_PASS="$CLAUDE_DIR/.review-gate-final-pass"         # "<change>\t<content-fingerprint>" of the last clean FULL review
 ACTIVE_MARKER="$CLAUDE_DIR/.review-gate-active"          # armed workstream: the change under review
 # Per-stage reused review sessions live in .review-gate-<stage>-session as
 # "<change>\t<session-id>" (see session_file/session_id_for/save_session).
@@ -160,8 +161,15 @@ diff_content() {
 # The real index and working tree are untouched. Falls back to hashing
 # diff_content when no HEAD/tree is available (e.g. a repo with no commits).
 diff_fingerprint() {
-  local idx tree
-  idx="$(mktemp)"
+  local idxdir idx tree
+  # Seed the throwaway index at a guaranteed-NONEXISTENT path inside a private temp
+  # dir (not an existing empty file): some git builds reject an existing file as an
+  # alternate index. The dir is removed regardless of outcome.
+  idxdir="$(mktemp -d)"; idx="$idxdir/index"
+  # Clean the scratch dir even if a signal interrupts the git commands below
+  # (the normal path clears the trap and removes it explicitly). No other EXIT
+  # trap exists in this script.
+  trap 'rm -rf "$idxdir"' EXIT
   if GIT_INDEX_FILE="$idx" git read-tree HEAD 2>/dev/null \
      && GIT_INDEX_FILE="$idx" git add -A -- ':(exclude,glob).claude/.review-gate-*' 2>/dev/null; then
     # Drop the gate's own markers from the index — both any that `git add` still
@@ -171,8 +179,29 @@ diff_fingerprint() {
     GIT_INDEX_FILE="$idx" git rm --cached -q --ignore-unmatch -- ':(glob).claude/.review-gate-*' 2>/dev/null || true
     tree="$(GIT_INDEX_FILE="$idx" git write-tree 2>/dev/null || true)"
   fi
-  rm -f "$idx"
+  rm -rf "$idxdir"; trap - EXIT
   if [ -n "${tree:-}" ]; then printf '%s\n' "$tree"; else diff_content | sha256; fi
+}
+
+# The full-pass cache is keyed by BOTH the change under review and the content
+# fingerprint, stored as one "<change>\t<fingerprint>" line. A cached pass may
+# short-circuit the review ONLY for the same change on identical content — arming a
+# different change whose repository content is byte-identical must NOT reuse another
+# change's approval. An empty/ad-hoc CHANGE uses the '-' sentinel so it only matches
+# another generic run.
+# The ad-hoc sentinel contains '/', which arming forbids in a change name, so it can
+# never collide with a real change (even one literally named '-').
+cache_change_key() { if [ -n "${CHANGE:-}" ]; then printf '%s' "$CHANGE"; else printf '%s' '/ad-hoc/'; fi; }
+write_final_pass() {
+  mkdir -p "$CLAUDE_DIR"
+  printf '%s\t%s\n' "$(cache_change_key)" "$(diff_fingerprint)" > "$FINAL_PASS"
+}
+# 0 iff the stored cache is for THIS change AND the current fingerprint matches.
+final_pass_matches() {
+  [ -f "$FINAL_PASS" ] || return 1
+  local sc sf tab; tab="$(printf '\t')"
+  IFS="$tab" read -r sc sf < "$FINAL_PASS" 2>/dev/null || true
+  [ -n "${sf:-}" ] && [ "$sc" = "$(cache_change_key)" ] && [ "$sf" = "$(diff_fingerprint)" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -214,6 +243,19 @@ notify() {
   [ "$(uname)" = "Darwin" ] || return 0
   have osascript || return 0
   osascript -e "display notification \"$1\" with title \"review-gate\"" >/dev/null 2>&1 || true
+}
+
+# Announce the Codex→Claude fallback loudly. Called on EVERY run that uses the
+# Claude final reviewer because Codex is unavailable — both when the limit is first
+# hit and on later runs while the cooldown sentinel is still active — so the
+# degraded mode is never silent. Reads the resume epoch from the cooldown sentinel.
+announce_codex_fallback() {
+  local ep; ep="$(tr -dc '0-9' < "$CODEX_COOLDOWN" 2>/dev/null || true)"; ep="${ep:-0}"
+  loud_banner \
+    "CODEX USAGE LIMIT — final review falls back to $FINAL_CLAUDE_MODEL." \
+    "Codex resumes automatically after $(human_time "$ep")." \
+    "Force a Codex retry sooner with:  scripts/review-gate resume"
+  notify "Codex limited — final reviewer is $FINAL_CLAUDE_MODEL until $(human_time "$ep")"
 }
 
 # ---------------------------------------------------------------------------
@@ -350,9 +392,15 @@ run_claude_stage() {
     --disallowedTools "Write Edit NotebookEdit")
   local -a sflag=(); local use_session=0
   if [ "$reuse" = "1" ]; then
-    use_session=1
     sid="$(session_id_for "$stage" "$CHANGE")"
-    if [ -n "$sid" ]; then sflag=(--resume "$sid"); else sid="$(gen_uuid)"; sflag=(--session-id "$sid"); fi
+    if [ -n "$sid" ]; then
+      use_session=1; sflag=(--resume "$sid")
+    else
+      # gen_uuid may fail (no uuidgen AND no python3) — never fatal: fall back to a
+      # plain no-session call rather than aborting the gate under set -e.
+      sid="$(gen_uuid || true)"
+      if [ -n "$sid" ]; then use_session=1; sflag=(--session-id "$sid"); fi
+    fi
   fi
   set +e
   raw="$(review_prompt "$CHANGE" | SKIP_REVIEW_GATE=1 claude "${cflags[@]}" ${sflag[@]+"${sflag[@]}"} 2>"$err")"
@@ -512,19 +560,17 @@ main() {
   CHANGE=""
   [ -f "$ACTIVE_MARKER" ] && CHANGE="$(tr -d '\n' < "$ACTIVE_MARKER" 2>/dev/null || true)"
   if [ -z "$CHANGE" ]; then
-    CHANGE="$(active_change)"
+    CHANGE="$(active_change || true)"   # never abort under set -e/pipefail when zero non-archived changes
     local nchanges; nchanges="$(active_changes | grep -c . || true)"
     [ "${nchanges:-0}" -gt 1 ] && echo "review-gate: $nchanges non-archived changes found — reviewing the most recently modified: ${CHANGE:-<none>}." >&2
   fi
 
-  # ---- Full-review cache: if nothing has changed since the last clean pass (both
-  # stages passed on this exact diff), skip the ENTIRE review — no reviewer runs. ----
-  if [ -f "$FINAL_PASS" ]; then
-    local fp cur; fp="$(cat "$FINAL_PASS" 2>/dev/null || true)"; cur="$(diff_fingerprint)"
-    if [ -n "$fp" ] && [ "$fp" = "$cur" ]; then
-      echo "review-gate: review cached (nothing changed since the last clean pass) — skipping the review."
-      exit 0
-    fi
+  # ---- Full-review cache: if this exact change passed a full clean review on this
+  # exact content, skip the ENTIRE review — no reviewer runs. Keyed by change +
+  # fingerprint, so a different change with identical content is not covered. ----
+  if final_pass_matches; then
+    echo "review-gate: review cached (nothing changed since the last clean pass) — skipping the review."
+    exit 0
   fi
 
   # Is Codex on cooldown from an earlier limit? While so, the FINAL reviewer is
@@ -537,7 +583,11 @@ main() {
   fi
 
   # ---- Stage 1: cheap Sonnet pass (fresh session every round) ----
-  local rc=0 cheap_desc="cheap $CHEAP_REVIEW_MODEL"
+  # cheap_cacheable gates the full-pass cache: a clean cheap verdict OR a
+  # rate-limited skip is cacheable (the final reviewer is authoritative), but a
+  # max-rounds BAIL is not — its blocking findings are unresolved, so caching over
+  # them would permanently hide them on later cached runs.
+  local rc=0 cheap_cacheable=1 cheap_desc="cheap $CHEAP_REVIEW_MODEL"
   run_claude_stage "$CHEAP_REVIEW_MODEL" cheap 0 || rc=$?
   if [ "$rc" -eq 4 ]; then
     cheap_desc="cheap stage skipped (rate-limited)"
@@ -548,6 +598,8 @@ main() {
     local n; n="$(read_counter cheap)"; n=$(( n + 1 )); write_counter cheap "$n"
     if [ "$n" -gt "$REVIEW_MAX_ROUNDS" ]; then
       write_counter cheap 0
+      cheap_cacheable=0   # unresolved blocking findings — never cache over them
+      cheap_desc="cheap stage bailed to human review (findings NOT cached)"
       loud_banner "CHEAP ($CHEAP_REVIEW_MODEL) STAGE exceeded max rounds ($REVIEW_MAX_ROUNDS) — the [BLOCK] findings above need human review."
       # bail → fall through to the final reviewer
     else
@@ -562,23 +614,20 @@ main() {
   if [ "$codex_ok" -eq 1 ]; then
     local crc=0; run_codex || crc=$?
     case "$crc" in
-      0) write_counter final 0; diff_fingerprint > "$FINAL_PASS"; echo "Review clean ($cheap_desc + Codex)."; exit 0 ;;
+      0) write_counter final 0; if [ "$cheap_cacheable" = 1 ]; then write_final_pass; fi; echo "Review clean ($cheap_desc + Codex)."; exit 0 ;;
       2) final_block codex ;;
       3) mkdir -p "$CLAUDE_DIR"; printf '%s\n' "$RESET_EPOCH" > "$CODEX_COOLDOWN"
-         loud_banner \
-           "CODEX USAGE LIMIT — final review falls back to $FINAL_CLAUDE_MODEL." \
-           "Codex resumes automatically after $(human_time "$RESET_EPOCH")." \
-           "Force a Codex retry sooner with:  scripts/review-gate resume"
-         notify "Codex limited — final reviewer is $FINAL_CLAUDE_MODEL until $(human_time "$RESET_EPOCH")"
          codex_ok=0 ;;
     esac
   fi
 
   # Codex unavailable (cooldown or just limited) → final reviewer is Claude Opus.
+  # Announce the fallback on EVERY such run (not just when the limit was first hit).
   if [ "$codex_ok" -eq 0 ]; then
+    announce_codex_fallback
     local orc=0; run_claude_stage "$FINAL_CLAUDE_MODEL" final 1 || orc=$?
     case "$orc" in
-      0) write_counter final 0; diff_fingerprint > "$FINAL_PASS"; echo "Review clean ($cheap_desc + $FINAL_CLAUDE_MODEL)."; exit 0 ;;
+      0) write_counter final 0; if [ "$cheap_cacheable" = 1 ]; then write_final_pass; fi; echo "Review clean ($cheap_desc + $FINAL_CLAUDE_MODEL)."; exit 0 ;;
       2) final_block "$FINAL_CLAUDE_MODEL" ;;
       4) loud_banner \
            "NO FINAL REVIEW PERFORMED — Codex and Claude are both rate-limited." \
