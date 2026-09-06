@@ -16,8 +16,13 @@
 #   review-gate stop-auto-review  disarm the gate (end the workstream)
 #   review-gate off      disable the gate until re-enabled
 #   review-gate on       re-enable the gate
-#   review-gate status   report gate state, armed workstream, and review mode
-#   review-gate resume   clear the Codex cooldown (re-probe Codex next run)
+#   review-gate status   report gate state, armed workstream, review mode, and
+#                              the latest review result per stage + total retained
+#   review-gate history [index]  list retained review results newest-first (or
+#                              print one in full by its index)
+#   review-gate reset-cooldown  reset every rate-limit cooldown (re-probe the
+#                              affected reviewer next run); `resume` is a
+#                              deprecated alias
 #   review-gate help     print the useful-commands cheat sheet
 #
 # The gate runs on Stop ONLY while armed (a `.claude/.review-gate-active` marker):
@@ -33,6 +38,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SENTINEL="$ROOT/.claude/.review-gate-disabled"
 CODEX_COOLDOWN="$ROOT/.claude/.review-gate-codex-cooldown"
 ACTIVE="$ROOT/.claude/.review-gate-active"
+HISTORY_DIR="$ROOT/.review-gate-history"   # committable per-verdict review history (see review-gate.sh)
 
 # Most recently modified non-archived change (used when `start` gets no name).
 latest_change() {
@@ -58,9 +64,11 @@ review-gate — useful commands:
                                        bare 'start' runs the full round. A change
                                        name reviews that change (even if archived)
                                        without changing the armed workstream.
-  review-gate status                   gate state, armed workstream, review mode
+  review-gate status                   gate state, armed workstream, review mode,
+                                       latest result per stage + total retained
+  review-gate history [index]          list past review results (or show one)
   review-gate stop-auto-review         disarm the auto-gate (end the workstream)
-  review-gate resume                   clear a Codex cooldown (re-probe next run)
+  review-gate reset-cooldown           reset all rate-limit cooldowns (re-probe next run)
   review-gate off                      disable the gate until 'review-gate on'
 EOF
 }
@@ -84,6 +92,79 @@ report_mode() {
     fi
   else
     echo "review-gate: Mode: normal (cheap Sonnet → Codex; Claude Opus if Codex is limited)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Review-history store (read-only). Entries are files named
+# <epoch>-<seq>-<change>-<stage>.md (see review-gate.sh:append_history). The
+# stage never contains '-', so it is the trailing filename field; the change may
+# contain '-', so its value (and every other field) is read from the header lines
+# inside the file, never parsed out of the filename.
+# ---------------------------------------------------------------------------
+# Entry file paths, newest-first. Sort on the BASENAME's leading epoch then seq
+# (both numeric), so ordering is correct regardless of dashes elsewhere — crucially
+# the store PATH itself contains dashes (".review-gate-history"), so a naive
+# `sort -t-` over full paths would sort on the constant path prefix, not the epoch.
+# We prefix each line with the basename as an explicit sort key, then strip it. The
+# glob-guard (`[ -e ]`) keeps an empty store from failing under set -e/pipefail.
+hist_list_desc() {
+  local f
+  for f in "$HISTORY_DIR"/*.md; do
+    [ -e "$f" ] || continue
+    printf '%s\t%s\n' "$(basename "$f")" "$f"
+  done | sort -t- -k1,1nr -k2,2nr | cut -f2-
+}
+hist_count() { hist_list_desc | grep -c . || true; }
+# Read one "- <key>: <value>" header field from an entry file. $1 = file, $2 = key.
+hist_field() { sed -n "s/^- $2: //p" "$1" 2>/dev/null | head -1; }
+# The stage of an entry, taken from the filename's trailing field (stable: a stage
+# label has no '-'). $1 = entry file path.
+hist_stage() { local b; b="$(basename "$1" .md)"; printf '%s' "${b##*-}"; }
+
+# For `status`: total retained entries + the most recent entry per stage.
+report_history() {
+  local total; total="$(hist_count)"
+  if [ "${total:-0}" -eq 0 ]; then
+    echo "review-gate: History: no reviews recorded yet"
+    return 0
+  fi
+  echo "review-gate: History: $total entr$([ "$total" -eq 1 ] && echo y || echo ies) retained; latest per stage:"
+  # Walk newest-first, printing the first (newest) entry seen for each stage.
+  local seen=" "
+  hist_list_desc | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    local stage; stage="$(hist_stage "$f")"
+    case "$seen" in *" $stage "*) continue ;; esac
+    seen="$seen$stage "
+    printf 'review-gate:   %s: %s / %s (%s findings) @ %s\n' \
+      "$stage" "$(hist_field "$f" change)" "$(hist_field "$f" verdict)" \
+      "$(hist_field "$f" findings)" "$(hist_field "$f" timestamp)"
+  done
+}
+
+# Clear every cooldown sentinel the gate keeps so the affected reviewer(s) are
+# re-probed on the next run. Today only the Codex cooldown exists; the glob over
+# .review-gate-*-cooldown is forward-compatible with any future cooldown sentinel.
+# Reports "nothing to reset" (and changes nothing) when none are present.
+reset_all_cooldowns() {
+  local found=0 failed=0 f
+  for f in "$ROOT"/.claude/.review-gate-*-cooldown; do
+    [ -e "$f" ] || continue
+    # Attempt to remove EVERY matched sentinel; a removal that fails (e.g. a
+    # read-only store) must be reported, not swallowed — reporting "cleared" while
+    # a sentinel survives would leave a reviewer stuck on cooldown. Keep going so
+    # one unremovable file does not strand the others.
+    if rm -f "$f"; then found=1; else echo "review-gate: could not clear cooldown sentinel: $f" >&2; failed=1; fi
+  done
+  if [ "$failed" -eq 1 ]; then
+    echo "review-gate: one or more cooldowns could not be cleared (see above)." >&2
+    return 1
+  fi
+  if [ "$found" -eq 1 ]; then
+    echo "review-gate: cooldown(s) cleared — the affected reviewer(s) will be re-probed on the next run."
+  else
+    echo "review-gate: no cooldown in effect — nothing to reset."
   fi
 }
 
@@ -187,14 +268,54 @@ case "${1:-}" in
     fi
     report_armed
     report_mode
+    report_history
+    ;;
+  history)
+    # Read-only browse of the retained review history.
+    #   review-gate history           list entries newest-first with an index
+    #   review-gate history <index>   print that entry's full retained report
+    shift
+    if [ "$#" -gt 1 ]; then
+      echo "review-gate: history takes at most one index — got: $*" >&2; exit 1
+    fi
+    entries="$(hist_list_desc)"
+    total="$(printf '%s\n' "$entries" | grep -c . || true)"
+    if [ -z "$entries" ]; then
+      echo "review-gate: no reviews recorded yet"
+      exit 0
+    fi
+    if [ "$#" -eq 0 ]; then
+      # Newest-first listing: index, timestamp, change, stage, verdict, count.
+      idx=0
+      printf '%s\n' "$entries" | while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        idx=$(( idx + 1 ))
+        printf '%3d  %s  %s  [%s]  %s  (%s findings)\n' \
+          "$idx" "$(hist_field "$f" timestamp)" "$(hist_field "$f" change)" \
+          "$(hist_stage "$f")" "$(hist_field "$f" verdict)" "$(hist_field "$f" findings)"
+      done
+      echo "review-gate: $total entr$([ "$total" -eq 1 ] && echo y || echo ies) — 'review-gate history <index>' prints one in full."
+      exit 0
+    fi
+    n="$1"
+    if ! printf '%s' "$n" | grep -qE '^[0-9]+$' || [ "$n" -lt 1 ]; then
+      echo "review-gate: history index must be a positive integer — got '$n'." >&2; exit 1
+    fi
+    if [ "$n" -gt "$total" ]; then
+      echo "review-gate: history index $n out of range (only $total entr$([ "$total" -eq 1 ] && echo y || echo ies) retained)." >&2; exit 1
+    fi
+    sel="$(printf '%s\n' "$entries" | sed -n "${n}p")"
+    [ -n "$sel" ] && [ -f "$sel" ] || { echo "review-gate: could not read history entry $n." >&2; exit 1; }
+    cat "$sel"
+    ;;
+  reset-cooldown)
+    reset_all_cooldowns
     ;;
   resume)
-    if [ -e "$CODEX_COOLDOWN" ]; then
-      rm -f "$CODEX_COOLDOWN"
-      echo "review-gate: Codex cooldown cleared — Codex will be re-probed on the next run."
-    else
-      echo "review-gate: Codex is not on cooldown — nothing to resume."
-    fi
+    # Deprecated alias for reset-cooldown (renamed for clarity). Still works so
+    # muscle memory and not-yet-synced consumer banners keep functioning.
+    echo "review-gate: 'resume' was renamed to 'reset-cooldown' — please use 'reset-cooldown' instead." >&2
+    reset_all_cooldowns
     ;;
   help|"")
     usage_cheatsheet

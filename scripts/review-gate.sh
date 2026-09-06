@@ -89,6 +89,11 @@ CLAUDE_DIR="$ROOT/.claude"
 CODEX_COOLDOWN="$CLAUDE_DIR/.review-gate-codex-cooldown" # Codex limited until this epoch → use final Claude
 FINAL_PASS="$CLAUDE_DIR/.review-gate-final-pass"         # "<change>\t<content-fingerprint>" of the last clean FULL review
 ACTIVE_MARKER="$CLAUDE_DIR/.review-gate-active"          # armed workstream: the change under review
+# Committable, human-readable review history — one file per stage verdict. Lives at
+# the repo ROOT (deliberately NOT under the git-ignored .claude/.review-gate-* glob)
+# so entries are tracked and committed. Excluded from the content fingerprint (see
+# diff_fingerprint) so appending/committing a verdict never busts the pass cache.
+HISTORY_DIR="$ROOT/.review-gate-history"
 # Per-stage reused review sessions live in .review-gate-<stage>-session as
 # "<change>\t<session-id>" (see session_file/session_id_for/save_session).
 CHANGE=""                                            # the single change under review; set in main
@@ -146,12 +151,13 @@ sha256() {
 
 # Fallback content of the working tree (committed + uncommitted), used only when a
 # git tree hash can't be produced. The gate's own transient files
-# (.claude/.review-gate-*) are skipped so they cannot perturb the fingerprint.
+# (.claude/.review-gate-*) AND the committable review-history store
+# (.review-gate-history/) are skipped so neither can perturb the fingerprint.
 diff_content() {
   git rev-parse HEAD 2>/dev/null || true
-  git diff HEAD -- ':(exclude,glob).claude/.review-gate-*' 2>/dev/null || git diff HEAD 2>/dev/null || true
+  git diff HEAD -- ':(exclude,glob).claude/.review-gate-*' ':(exclude,glob).review-gate-history/**' 2>/dev/null || git diff HEAD 2>/dev/null || true
   git ls-files --others --exclude-standard -z 2>/dev/null | while IFS= read -r -d '' f; do
-    case "$f" in .claude/.review-gate-*) continue ;; esac
+    case "$f" in .claude/.review-gate-*|.review-gate-history/*) continue ;; esac
     printf '\n===== untracked: %s =====\n' "$f"
     cat -- "$f" 2>/dev/null || true
   done
@@ -167,7 +173,10 @@ diff_content() {
 #   - any real edit (committed or not) changes the tree id → the cache invalidates
 #     and the reviewer runs again;
 #   - the gate's own .claude/.review-gate-* markers are excluded (and .gitignored
-#     files are ignored by `git add` anyway), so their per-run churn never counts.
+#     files are ignored by `git add` anyway), so their per-run churn never counts;
+#   - the committable review-history store (.review-gate-history/) is excluded the
+#     same way — it IS tracked, so appending or committing a verdict there must not
+#     change the tree id and re-trigger a review of otherwise-unchanged code.
 # The real index and working tree are untouched. Falls back to hashing
 # diff_content when no HEAD/tree is available (e.g. a repo with no commits).
 diff_fingerprint() {
@@ -181,12 +190,13 @@ diff_fingerprint() {
   # trap exists in this script.
   trap 'rm -rf "$idxdir"' EXIT
   if GIT_INDEX_FILE="$idx" git read-tree HEAD 2>/dev/null \
-     && GIT_INDEX_FILE="$idx" git add -A -- ':(exclude,glob).claude/.review-gate-*' 2>/dev/null; then
-    # Drop the gate's own markers from the index — both any that `git add` still
-    # let through and, crucially, any that a repo committed before adopting the
-    # gitignore (those arrive via read-tree HEAD, so excluding them from `add`
-    # alone would leave their per-run churn in the tree id and defeat the cache).
-    GIT_INDEX_FILE="$idx" git rm --cached -q --ignore-unmatch -- ':(glob).claude/.review-gate-*' 2>/dev/null || true
+     && GIT_INDEX_FILE="$idx" git add -A -- ':(exclude,glob).claude/.review-gate-*' ':(exclude).review-gate-history' ':(exclude,glob).review-gate-history/**' 2>/dev/null; then
+    # Drop the excluded paths from the index — both any that `git add` still let
+    # through and, crucially, any that a repo committed before adopting the
+    # gitignore/exclusion (those arrive via read-tree HEAD, so excluding them from
+    # `add` alone would leave their per-run churn in the tree id and defeat the
+    # cache). The history store is tracked on purpose, so it MUST be removed here.
+    GIT_INDEX_FILE="$idx" git rm --cached -q --ignore-unmatch -- ':(glob).claude/.review-gate-*' ':(glob).review-gate-history/**' 2>/dev/null || true
     tree="$(GIT_INDEX_FILE="$idx" git write-tree 2>/dev/null || true)"
   fi
   rm -rf "$idxdir"; trap - EXIT
@@ -264,7 +274,7 @@ announce_codex_fallback() {
   loud_banner \
     "CODEX USAGE LIMIT — final review falls back to $FINAL_CLAUDE_MODEL." \
     "Codex resumes automatically after $(human_time "$ep")." \
-    "Force a Codex retry sooner with:  scripts/review-gate resume"
+    "Force a Codex retry sooner with:  scripts/review-gate reset-cooldown"
   notify "Codex limited — final reviewer is $FINAL_CLAUDE_MODEL until $(human_time "$ep")"
 }
 
@@ -403,6 +413,15 @@ parse_verdict() {
 
 blocking_count() { printf '%s' "${1:-[]}" | jq 'length'; }
 
+# Render every finding as one human-readable line each (blocking tagged [BLOCK],
+# sub-threshold tagged [note]) to stdout. Shared by report_findings (→ stderr, the
+# session log) and append_history (→ the retained entry file), so the stored report
+# is byte-identical to what the session saw. $1 = all-findings JSON array.
+render_findings() {
+  printf '%s' "${1:-[]}" | jq -r --argjson t "$REVIEW_THRESHOLD" \
+    '.[] | "  \(if (.priority | ltrimstr("P") | tonumber) <= $t then "[BLOCK]" else "[note] " end) [\(.priority)] \(.file):\(.line) — \(.issue) → \(.fix)"'
+}
+
 # Print EVERY finding from a stage (blocking and sub-threshold) to stderr so the
 # full review stays in the session log. $1 stage label, $2 all-findings JSON.
 report_findings() {
@@ -412,8 +431,86 @@ report_findings() {
     return 0
   fi
   echo "review-gate: [$1] review findings ($n) — [BLOCK] = priority at/above P$REVIEW_THRESHOLD:" >&2
-  printf '%s' "$2" | jq -r --argjson t "$REVIEW_THRESHOLD" \
-    '.[] | "  \(if (.priority | ltrimstr("P") | tonumber) <= $t then "[BLOCK]" else "[note] " end) [\(.priority)] \(.file):\(.line) — \(.issue) → \(.fix)"' >&2
+  render_findings "$2" >&2
+}
+
+# Human-readable timestamp for a history header (with seconds).
+hist_timestamp() {
+  date -r "$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+    || date -d "@$1" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+    || echo "epoch $1"
+}
+
+# Append a durable, committable history entry for a stage outcome. One file per
+# entry under $HISTORY_DIR, named <epoch>-<seq>-<change>-<stage>.md — the change
+# name is in the filename (as well as the header) for easy browsing of the committed
+# store, sanitized for a filename. Durability, per the spec's "SHALL be retained as
+# durable history" and the gate's "never silently pass on its own failure":
+#   - the full entry is written to a private temp file FIRST, then atomically renamed
+#     into place, so a reader never sees a partial entry and a mid-write crash leaves
+#     no half-written file behind;
+#   - the final name is claimed with `ln` — an atomic create-if-absent (like
+#     O_EXCL) — so two concurrent runs in the same second can never overwrite each
+#     other's entry (a collision just bumps <seq> and retries), honouring "none is
+#     overwritten";
+#   - <seq> is seeded from the count of entries already in this epoch-second, across
+#     ALL stages, so entries created in the same second sort in creation order
+#     (cheap before codex, etc.) rather than colliding on seq 0;
+#   - a genuine write failure calls die (exit 1): the gate must not report a
+#     successful review it could not retain.
+#   $1 = stage label   $2 = verdict (clean|blocking|skipped)   $3 = all-findings JSON
+append_history() {
+  local stage="$1" verdict="$2" findings="${3:-[]}" epoch seq change_sane fname tmp n e
+  epoch="$(now_epoch)"
+  n="$(printf '%s' "$findings" | jq 'length' 2>/dev/null || echo 0)"
+  # Sanitize the change name for a filename: keep [A-Za-z0-9._-], map the rest to '_'.
+  change_sane="$(printf '%s' "${CHANGE:-ad-hoc}" | tr -c 'A-Za-z0-9._-' '_')"
+  [ -n "$change_sane" ] || change_sane="ad-hoc"
+  mkdir -p "$HISTORY_DIR" || die "could not create the review-history store $HISTORY_DIR."
+  # Stage the full entry in a temp file (same dir → same filesystem, so the rename
+  # below is atomic). The '.'-prefixed name is hidden from the *.md globs the store
+  # is browsed and counted by.
+  tmp="$(mktemp "$HISTORY_DIR/.tmp.XXXXXX")" || die "could not create a temp file in $HISTORY_DIR."
+  {
+    printf '# review-gate history entry\n\n'
+    printf -- '- change: %s\n'    "${CHANGE:-<ad-hoc>}"
+    printf -- '- stage: %s\n'     "$stage"
+    printf -- '- verdict: %s\n'   "$verdict"
+    printf -- '- timestamp: %s\n' "$(hist_timestamp "$epoch")"
+    printf -- '- findings: %s\n\n' "$n"
+    printf '## Findings\n\n'
+    if [ "${n:-0}" -eq 0 ]; then
+      printf '  (no findings)\n'
+    else
+      render_findings "$findings"
+    fi
+  } > "$tmp" || { rm -f "$tmp"; die "could not write the review-history entry for stage '$stage'."; }
+  # Seed <seq> from the number of entries already stamped this same second (any
+  # stage/change), so appends within one second keep creation order. Glob-safe under
+  # set -e: iterate and test existence rather than parsing `ls`.
+  seq=0
+  for e in "$HISTORY_DIR/${epoch}-"*.md; do [ -e "$e" ] && seq=$(( seq + 1 )); done
+  # Claim a unique name atomically; a collision (another run took it) bumps <seq>.
+  while :; do
+    fname="$HISTORY_DIR/${epoch}-${seq}-${change_sane}-${stage}.md"
+    if ln "$tmp" "$fname" 2>/dev/null; then break; fi
+    [ -e "$fname" ] || { rm -f "$tmp"; die "could not link the review-history entry into $HISTORY_DIR."; }
+    seq=$(( seq + 1 ))
+    [ "$seq" -gt 100000 ] && { rm -f "$tmp"; die "could not find a free review-history slot in $HISTORY_DIR."; }
+  done
+  rm -f "$tmp"
+}
+
+# Emit a completed stage's findings to the session log, append a durable history
+# entry, and map the result to the stage return code (0 clean, 2 blocking). Shared
+# by every stage runner so history is recorded uniformly on both verdicts.
+#   $1 = stage label   $2 = all-findings JSON   $3 = blocking-findings JSON
+finish_stage() {
+  report_findings "$1" "$2"
+  if [ "$(blocking_count "$3")" -eq 0 ]; then
+    append_history "$1" clean "$2"; return 0
+  fi
+  append_history "$1" blocking "$2"; return 2
 }
 
 # ---------------------------------------------------------------------------
@@ -486,8 +583,7 @@ run_claude_stage() {
   parse_verdict "$stage" "$msg" "$raw" "$err"
   rm -f "$err" "$msg"
   [ "$use_session" -eq 1 ] && save_session "$stage" "$CHANGE" "$sid"
-  report_findings "$stage" "$ALL"
-  [ "$(blocking_count "$BLOCKING")" -eq 0 ] && return 0 || return 2
+  finish_stage "$stage" "$ALL" "$BLOCKING"
 }
 
 # Distinguish a usage/rate/subscription limit from a genuine failure. Broad on
@@ -581,8 +677,7 @@ run_codex() {
     [ -n "$newid" ] && save_session codex "$CHANGE" "$newid"
   fi
   rm -f "$err" "$msg"
-  report_findings codex "$ALL"
-  [ "$(blocking_count "$BLOCKING")" -eq 0 ] && return 0 || return 2
+  finish_stage codex "$ALL" "$BLOCKING"
 }
 
 # ---------------------------------------------------------------------------
@@ -668,10 +763,12 @@ main() {
   if [ "$full_run" = 0 ]; then
     cheap_desc="cheap stage skipped (start 2 — final reviewer only)"
     echo "review-gate: manual start at stage 2 — running only the final reviewer." >&2
+    append_history cheap skipped '[]'   # record the deliberately-skipped stage in history
   else
   run_claude_stage "$CHEAP_REVIEW_MODEL" cheap 0 || rc=$?
   if [ "$rc" -eq 4 ]; then
     cheap_desc="cheap stage skipped (rate-limited)"
+    append_history cheap skipped '[]'   # rate-limited: no verdict, but record the skipped attempt
     loud_banner \
       "CHEAP ($CHEAP_REVIEW_MODEL) STAGE RATE-LIMITED — skipping it this stop." \
       "Falling through to the final reviewer; Claude should recover by $(human_time "$CLAUDE_RESET_EPOCH")."
@@ -698,7 +795,8 @@ main() {
     case "$crc" in
       0) write_counter final 0; if [ "$full_run" = 1 ] && [ "$cheap_cacheable" = 1 ]; then write_final_pass; fi; echo "Review clean ($cheap_desc + Codex)."; exit 0 ;;
       2) final_block codex ;;
-      3) mkdir -p "$CLAUDE_DIR"; printf '%s\n' "$RESET_EPOCH" > "$CODEX_COOLDOWN"
+      3) append_history codex skipped '[]'   # Codex rate-limited: record the skipped attempt before falling back to Claude
+         mkdir -p "$CLAUDE_DIR"; printf '%s\n' "$RESET_EPOCH" > "$CODEX_COOLDOWN"
          codex_ok=0 ;;
     esac
   fi
@@ -711,7 +809,8 @@ main() {
     case "$orc" in
       0) write_counter final 0; if [ "$full_run" = 1 ] && [ "$cheap_cacheable" = 1 ]; then write_final_pass; fi; echo "Review clean ($cheap_desc + $FINAL_CLAUDE_MODEL)."; exit 0 ;;
       2) final_block "$FINAL_CLAUDE_MODEL" ;;
-      4) loud_banner \
+      4) append_history final skipped '[]'   # no reviewer available: record the skipped final stage
+         loud_banner \
            "NO FINAL REVIEW PERFORMED — Codex and Claude are both rate-limited." \
            "The cheap stage ran, but no expensive reviewer is available this stop." \
            "This stop is allowed to proceed; please review the change by hand before merging."
