@@ -29,10 +29,13 @@ if command -v jq >/dev/null 2>&1; then
   [ -n "$p" ] && prompt="$p"
 fi
 
-# Arm on an apply-change invocation. `review-gate start` (no arg) targets the
-# most recently modified change — the one being applied.
-case "$prompt" in
-  */openspec-apply-change*|*openspec-apply-change*)
+# Arm only on an actual /openspec-apply-change slash-command invocation — the
+# command as the first token of the prompt — so a prompt that merely mentions it
+# in prose does not arm. `review-gate start` (no arg) targets the most recently
+# modified change (the one being applied).
+trimmed="${prompt#"${prompt%%[![:space:]]*}"}"   # strip leading whitespace
+case "$trimmed" in
+  /openspec-apply-change|/openspec-apply-change[[:space:]]*)
     [ -x "$ROOT/scripts/review-gate" ] && bash "$ROOT/scripts/review-gate" start >/dev/null 2>&1 || true
     ;;
 esac

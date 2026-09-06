@@ -2,16 +2,22 @@
 #
 # review-gate.sh — two-stage code-review gate for an OpenSpec project.
 #
-# Each gated run reviews the uncommitted changes in two stages:
-#   1. Claude  — a cheap pass via the `claude` CLI headless
-#                (`claude -p --model "$CLAUDE_REVIEW_MODEL"`), the diff fed
-#                in-prompt. Blocks (exit 2) until it comes back clean.
-#   2. Codex   — the costly full pass, run only once the Claude stage is clean.
+# Each gated run reviews the active change in two stages:
+#   1. Cheap Claude (Sonnet) — a cheap pass via the `claude` CLI headless
+#                (`claude -p --model "$CHEAP_REVIEW_MODEL"`, fresh session each
+#                round). Given the change name, it locates/reads the related code
+#                itself with a read-only tool allow-list. Blocks (exit 2) until
+#                it comes back clean.
+#   2. Expensive final reviewer — run only once stage 1 is clean: Codex
+#                (`$REVIEW_MODEL`) normally, or Claude `$FINAL_CLAUDE_MODEL` only
+#                when Codex is rate-limited.
 #
-# A clean Codex pass is cached against a fingerprint of the reviewed diff, so a
-# converged change is not re-billed to Codex on every subsequent stop. When
-# Codex reports a usage/subscription limit the gate does NOT fail closed: it
-# enters an announced, git-ignored Claude-only mode until the limit resets.
+# A clean final pass is cached against a fingerprint of the reviewed diff, so a
+# converged change is not re-reviewed on every subsequent stop. When Codex
+# reports a usage/subscription limit the gate does NOT fail closed: it records a
+# git-ignored Codex-cooldown sentinel and uses Claude `$FINAL_CLAUDE_MODEL` as
+# the final reviewer until the limit resets. The final reviewers reuse their
+# session across rounds; the cheap stage does not.
 #
 # Designed to be driven in a loop from a Claude Code Stop hook (see
 # review-gate-hook.sh); per-stage round counters prevent it spinning forever.
@@ -22,39 +28,71 @@
 #
 # Env vars (defaults in parentheses):
 #   REVIEW_THRESHOLD    (2)                Block on findings P0..P<THRESHOLD>.
-#   REVIEW_MODEL        (gpt-5.6-sol)      Model passed to `codex exec -m`.
+#   CHEAP_REVIEW_MODEL  (claude-sonnet-5)  Stage-1 cheap Claude model.
+#   REVIEW_MODEL        (gpt-5.6-sol)      Stage-2 Codex model (`codex exec -m`).
+#   FINAL_CLAUDE_MODEL  (claude-opus-4-8)  Stage-2 fallback Claude model (Codex-limited).
 #   REVIEW_EFFORT       (high)             Codex model_reasoning_effort.
 #   REVIEW_MAX_ROUNDS   (5)                Per stage: after this many blocking
 #                                          rounds, bail to human review.
-#   CLAUDE_REVIEW_MODEL (claude-opus-4-8)  Model for the Claude stage.
-#   CODEX_LIMIT_COOLDOWN(60m)              Claude-only fallback when no reset
+#   CODEX_LIMIT_COOLDOWN(60m)              Codex-cooldown length when no reset
 #                                          time is parseable (Ns/Nm/Nh or N).
 #   REVIEW_GATE_NOTIFY   (1)                0 disables the macOS notification.
 #
-# Exit codes: 0 = clean / cached / degraded-to-Claude-only (session may stop),
+# All of the above can also be set in a committed ./.review-gate.conf (a shell
+# fragment; override its path with REVIEW_GATE_CONF). Precedence: environment
+# variable > .review-gate.conf > built-in default.
+#
+# Exit codes: 0 = clean / cached / no reviewer available (session may stop),
 #             2 = blocking findings, 1 = misconfiguration / unparseable output
 #             (never a silent pass).
 
 set -euo pipefail
-
-REVIEW_THRESHOLD="${REVIEW_THRESHOLD:-2}"
-REVIEW_MODEL="${REVIEW_MODEL:-gpt-5.6-sol}"
-REVIEW_EFFORT="${REVIEW_EFFORT:-high}"
-REVIEW_MAX_ROUNDS="${REVIEW_MAX_ROUNDS:-5}"
-CLAUDE_REVIEW_MODEL="${CLAUDE_REVIEW_MODEL:-claude-opus-4-8}"
-CODEX_LIMIT_COOLDOWN="${CODEX_LIMIT_COOLDOWN:-60m}"
-REVIEW_GATE_NOTIFY="${REVIEW_GATE_NOTIFY:-1}"
 
 # Resolve repo root from this script's location so paths and `git diff` work
 # regardless of the caller's working directory.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Configuration. Precedence: environment variable > repo config file > default.
+# The config file (default ./.review-gate.conf, override with $REVIEW_GATE_CONF)
+# is an optional committed shell fragment — the easy way to set the review models
+# and other knobs per repo, e.g.:  CHEAP_REVIEW_MODEL=claude-sonnet-5
+#
+# Two stages; the final stage's reviewer depends on Codex availability:
+#   CHEAP_REVIEW_MODEL  stage 1 — cheap Claude pass (fresh session each round)
+#   REVIEW_MODEL        stage 2 — Codex, the normal final reviewer (session reused)
+#   FINAL_CLAUDE_MODEL  stage 2 fallback — Claude, used only when Codex is limited
+_env_REVIEW_THRESHOLD="${REVIEW_THRESHOLD:-}"
+_env_REVIEW_MODEL="${REVIEW_MODEL:-}"
+_env_REVIEW_EFFORT="${REVIEW_EFFORT:-}"
+_env_REVIEW_MAX_ROUNDS="${REVIEW_MAX_ROUNDS:-}"
+_env_CHEAP_REVIEW_MODEL="${CHEAP_REVIEW_MODEL:-}"
+_env_FINAL_CLAUDE_MODEL="${FINAL_CLAUDE_MODEL:-}"
+_env_CODEX_LIMIT_COOLDOWN="${CODEX_LIMIT_COOLDOWN:-}"
+_env_REVIEW_GATE_NOTIFY="${REVIEW_GATE_NOTIFY:-}"
+REVIEW_GATE_CONF="${REVIEW_GATE_CONF:-$ROOT/.review-gate.conf}"
+# shellcheck disable=SC1090
+[ -f "$REVIEW_GATE_CONF" ] && . "$REVIEW_GATE_CONF"
+REVIEW_THRESHOLD="${_env_REVIEW_THRESHOLD:-${REVIEW_THRESHOLD:-2}}"
+REVIEW_MODEL="${_env_REVIEW_MODEL:-${REVIEW_MODEL:-gpt-5.6-sol}}"
+REVIEW_EFFORT="${_env_REVIEW_EFFORT:-${REVIEW_EFFORT:-high}}"
+REVIEW_MAX_ROUNDS="${_env_REVIEW_MAX_ROUNDS:-${REVIEW_MAX_ROUNDS:-5}}"
+CHEAP_REVIEW_MODEL="${_env_CHEAP_REVIEW_MODEL:-${CHEAP_REVIEW_MODEL:-claude-sonnet-5}}"
+FINAL_CLAUDE_MODEL="${_env_FINAL_CLAUDE_MODEL:-${FINAL_CLAUDE_MODEL:-claude-opus-4-8}}"
+CODEX_LIMIT_COOLDOWN="${_env_CODEX_LIMIT_COOLDOWN:-${CODEX_LIMIT_COOLDOWN:-60m}}"
+REVIEW_GATE_NOTIFY="${_env_REVIEW_GATE_NOTIFY:-${REVIEW_GATE_NOTIFY:-1}}"
+unset _env_REVIEW_THRESHOLD _env_REVIEW_MODEL _env_REVIEW_EFFORT _env_REVIEW_MAX_ROUNDS \
+      _env_CHEAP_REVIEW_MODEL _env_FINAL_CLAUDE_MODEL _env_CODEX_LIMIT_COOLDOWN _env_REVIEW_GATE_NOTIFY
+
 CLAUDE_DIR="$ROOT/.claude"
-CLAUDE_ONLY="$CLAUDE_DIR/.review-gate-claude-only"   # holds resume epoch
-CODEX_PASS="$CLAUDE_DIR/.review-gate-codex-pass"      # holds last clean diff hash
-ACTIVE_MARKER="$CLAUDE_DIR/.review-gate-active"       # armed workstream: the change under review
+CODEX_COOLDOWN="$CLAUDE_DIR/.review-gate-codex-cooldown" # Codex limited until this epoch → use final Claude
+FINAL_PASS="$CLAUDE_DIR/.review-gate-final-pass"         # diff hash of the last clean FINAL review
+ACTIVE_MARKER="$CLAUDE_DIR/.review-gate-active"          # armed workstream: the change under review
+# Per-stage reused review sessions live in .review-gate-<stage>-session as
+# "<change>\t<session-id>" (see session_file/session_id_for/save_session).
 CHANGE=""                                            # the single change under review; set in main
+CLAUDE_RESET_EPOCH=""                                # set by a Claude stage when rate-limited
+RESET_EPOCH=""                                        # set by run_codex on a Codex limit
 
 die()  { echo "review-gate: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -88,10 +126,11 @@ human_time() {
 }
 
 sha256() {
-  if have shasum; then shasum -a 256
-  elif have sha256sum; then sha256sum
-  else cat  # degraded: identity, still stable for cache comparison within a run
-  fi | awk '{print $1}'
+  if have shasum; then shasum -a 256 | awk '{print $1}'
+  elif have sha256sum; then sha256sum | awk '{print $1}'
+  else cat  # no hasher: pass the content through unchanged (true identity) — a
+            # longer cache key, but correct; never collapses distinct diffs
+  fi
 }
 
 # The uncommitted changes, used to compute the Codex-pass cache fingerprint. The
@@ -120,6 +159,19 @@ read_counter() {
   if [ -f "$f" ]; then local v; v="$(tr -dc '0-9' < "$f")"; echo "${v:-0}"; else echo 0; fi
 }
 write_counter() { mkdir -p "$CLAUDE_DIR"; printf '%s\n' "$2" > "$(counter_file "$1")"; }
+
+# Claude review session reuse: keep one session per change so rounds 2..N of the
+# same change resume prior context instead of re-inferring from scratch; a new
+# change gets a new session.
+gen_uuid() { uuidgen 2>/dev/null || python3 -c 'import uuid;print(uuid.uuid4())' 2>/dev/null; }
+session_file() { echo "$CLAUDE_DIR/.review-gate-$1-session"; }   # $1 = claude|codex
+session_id_for() {  # $1 = stage, $2 = change; echoes the stored session id iff it is for this change
+  local f; f="$(session_file "$1")"; [ -f "$f" ] || return 0
+  local sc su tab; tab="$(printf '\t')"
+  IFS="$tab" read -r sc su < "$f" 2>/dev/null || return 0
+  [ "$sc" = "$2" ] && [ -n "$su" ] && printf '%s' "$su"
+}
+save_session() { mkdir -p "$CLAUDE_DIR"; printf '%s\t%s\n' "$2" "$3" > "$(session_file "$1")"; }  # $1 stage $2 change $3 id
 
 # ---------------------------------------------------------------------------
 # Notification helpers
@@ -164,13 +216,14 @@ active_change() {
 review_prompt() {
   local change="$1"
   if [ -n "$change" ]; then
-    printf 'You are the code-review gate for this repository. The OpenSpec change under review: %s.\n\n' "$change"
-    printf 'Read its planning artifacts under openspec/changes/%s/ (proposal.md, design.md, tasks.md, specs/**/*.md) to understand the intended behavior, then find and review the related implementation in this repository yourself.\n\n' "$change"
+    printf 'You are the code-review gate for this repository. Verify that the OpenSpec change "%s" is implemented correctly.\n\n' "$change"
+    printf 'First read the artifacts for this change under openspec/changes/%s/ — proposal.md, design.md, tasks.md, and specs/**/*.md — to understand exactly what it is supposed to do. Then review this repository and judge whether the implementation of that change is correct, complete, and faithful to those specs. Whether the relevant code is already committed or still uncommitted does not matter — review the implementation as it now stands.\n\n' "$change"
+    printf 'Stay scoped to THIS change: report defects only in the code that implements it. Do not audit the repository at large and do not flag pre-existing issues unrelated to this change.\n\n'
   else
-    printf 'You are the code-review gate for this repository. Review the uncommitted changes in this repository.\n\n'
+    printf 'You are the code-review gate for this repository. Review the uncommitted changes for actionable defects.\n\n'
   fi
   cat <<'EOF'
-Focus on the uncommitted work (everything in `git diff HEAD` plus any untracked files). Report ONLY actionable defects — correctness, security, reliability, or violations of the specifications under openspec/. Assign each finding a priority: P0 (critical), P1 (high), P2 (medium), P3 (minor). Ignore style nits and formatting preferences. Output ONLY a single JSON object, no prose and no markdown fences, of exactly this shape: {"findings":[{"priority":"P1","file":"path/to/file","line":0,"issue":"what is wrong","fix":"how to fix it"}]}. Use an empty array when there are no defects: {"findings":[]}.
+Do NOT modify anything in the repository, and do NOT run tests, builds, formatters, or other commands — review by reading the code only (this keeps the review fast and side-effect-free). Report ONLY actionable defects — correctness, security, reliability, or violations of the change's specifications under openspec/. Assign each finding a priority: P0 (critical), P1 (high), P2 (medium), P3 (minor). Ignore style nits and formatting preferences. Output ONLY a single JSON object, no prose and no markdown fences, of exactly this shape: {"findings":[{"priority":"P1","file":"path/to/file","line":0,"issue":"what is wrong","fix":"how to fix it"}]}. Use an empty array when there are no defects: {"findings":[]}.
 EOF
 }
 
@@ -250,29 +303,66 @@ report_findings() {
 # Stage runners. Return: 0 clean, 2 blocking (BLOCKING set), 3 usage-limit
 # (codex only; RESET_EPOCH set). Genuine failures exit 1 via die/parse_verdict.
 # ---------------------------------------------------------------------------
-run_claude() {
-  have claude || die "'claude' CLI not found on PATH — cannot run the Claude review stage."
-  local err msg raw rc
+# Run a Claude review stage. $1 = model, $2 = stage label (also the session key and
+# round-counter key), $3 = reuse-session (1 = reuse across rounds of this change,
+# 0 = fresh session every round). Returns: 0 clean, 2 blocking (BLOCKING set),
+# 4 usage/rate limit (CLAUDE_RESET_EPOCH set); genuine failure exits 1.
+run_claude_stage() {
+  local model="$1" stage="$2" reuse="$3"
+  have claude || die "'claude' CLI not found on PATH — cannot run the $stage review stage."
+  local err msg raw rc sid
   err="$(mktemp)"; msg="$(mktemp)"; : > "$msg"
-  # The agent locates and reads the code itself with read-only tools; writers are
-  # denied and dontAsk means it neither prompts nor edits. SKIP_REVIEW_GATE=1
-  # guards against any Stop hook this nested `claude` might fire.
-  set +e
-  raw="$(review_prompt "$CHANGE" | SKIP_REVIEW_GATE=1 claude -p --model "$CLAUDE_REVIEW_MODEL" \
-    --permission-mode dontAsk \
+  # The agent locates and reads the code itself. `--setting-sources ''` isolates
+  # the review from the repo's own settings so its allow-list can't inherit the
+  # project/user permissions (which may permit mutating Bash/cp/etc.) — the review
+  # is genuinely read-only, granting only the explicit read-only allow-list, with
+  # writers denied. No --permission-mode (its values vary across builds).
+  # SKIP_REVIEW_GATE=1 guards against Stop-hook recursion.
+  local -a cflags=(-p --model "$model" --setting-sources '' \
     --allowedTools "Read Grep Glob Bash(git diff:*) Bash(git status:*) Bash(git log:*) Bash(git show:*) Bash(git ls-files:*)" \
-    --disallowedTools "Write Edit NotebookEdit" \
-    2>"$err")"
+    --disallowedTools "Write Edit NotebookEdit")
+  local -a sflag=(); local use_session=0
+  if [ "$reuse" = "1" ]; then
+    use_session=1
+    sid="$(session_id_for "$stage" "$CHANGE")"
+    if [ -n "$sid" ]; then sflag=(--resume "$sid"); else sid="$(gen_uuid)"; sflag=(--session-id "$sid"); fi
+  fi
+  set +e
+  raw="$(review_prompt "$CHANGE" | SKIP_REVIEW_GATE=1 claude "${cflags[@]}" ${sflag[@]+"${sflag[@]}"} 2>"$err")"
   rc=$?
+  # Fail-safe: if a session-flagged call fails for a non-limit reason — a stale
+  # session, or a `claude` build that doesn't accept --session-id/--resume — retry
+  # once WITHOUT session flags so a session-feature problem never fails the review
+  # closed (mirrors why we avoid --permission-mode). Only persist a session when a
+  # session-flagged call actually succeeds.
+  if [ "$rc" -ne 0 ] && [ "$use_session" -eq 1 ]; then
+    local rscan; rscan="$(mktemp)"; { cat "$err" 2>/dev/null; printf '\n%s\n' "$raw"; } > "$rscan"
+    if ! is_limit "$rscan"; then
+      echo "review-gate: [$stage] session call failed — retrying without a session." >&2
+      : > "$err"
+      raw="$(review_prompt "$CHANGE" | SKIP_REVIEW_GATE=1 claude "${cflags[@]}" 2>"$err")"
+      rc=$?; use_session=0
+    fi
+    rm -f "$rscan"
+  fi
   set -e
   if [ "$rc" -ne 0 ]; then
-    echo "review-gate: [claude] 'claude -p' exited $rc — treating as a failed review (fail-closed)." >&2
-    sed 's/^/  claude: /' "$err" >&2 2>/dev/null || true
+    # A Claude usage/session/rate limit is not a review failure — surface it so the
+    # gate degrades with a clear message instead of a scary "failed review".
+    local scan; scan="$(mktemp)"; { cat "$err" 2>/dev/null; printf '\n%s\n' "$raw"; } > "$scan"
+    if is_limit "$scan"; then
+      CLAUDE_RESET_EPOCH="$(parse_reset_epoch "$scan")"
+      rm -f "$err" "$msg" "$scan"; return 4
+    fi
+    rm -f "$scan"
+    echo "review-gate: [$stage] 'claude -p' exited $rc — treating as a failed review (fail-closed)." >&2
+    sed "s/^/  $stage: /" "$err" >&2 2>/dev/null || true
     rm -f "$err" "$msg"; exit 1
   fi
-  parse_verdict claude "$msg" "$raw" "$err"
+  parse_verdict "$stage" "$msg" "$raw" "$err"
   rm -f "$err" "$msg"
-  report_findings claude "$ALL"
+  [ "$use_session" -eq 1 ] && save_session "$stage" "$CHANGE" "$sid"
+  report_findings "$stage" "$ALL"
   [ "$(blocking_count "$BLOCKING")" -eq 0 ] && return 0 || return 2
 }
 
@@ -318,29 +408,59 @@ parse_reset_epoch() {
   echo $(( now + $(to_seconds "$CODEX_LIMIT_COOLDOWN") ))
 }
 
+# Run Codex over the working tree. A fresh session runs read-only and records its
+# session id (from the `session id:` startup line) so rounds 2..N of the same
+# change resume it instead of re-inferring. `codex exec resume` continues the
+# original read-only session; a failed resume (non-limit) falls back to a fresh one.
 run_codex() {
   have codex || die "'codex' CLI not found on PATH — cannot run the Codex review stage."
-  local err msg raw rc
+  local err msg raw rc csid resuming=0
   err="$(mktemp)"; msg="$(mktemp)"
+  csid="$(session_id_for codex "$CHANGE")"
+  _codex_fresh() { codex exec -m "$REVIEW_MODEL" -c model_reasoning_effort="\"$REVIEW_EFFORT\"" \
+    --sandbox read-only --skip-git-repo-check -o "$msg" "$(review_prompt "$CHANGE")" 2>"$err"; }
+  # `codex exec resume` takes no --sandbox flag, so force read-only via config —
+  # otherwise a resumed review could inherit a workspace-write policy and mutate the repo.
+  _codex_resume() { codex exec resume "$1" -m "$REVIEW_MODEL" -c sandbox_mode='"read-only"' \
+    --skip-git-repo-check -o "$msg" "$(review_prompt "$CHANGE")" 2>"$err"; }
   set +e
-  raw="$(codex exec -m "$REVIEW_MODEL" \
-    -c model_reasoning_effort="\"$REVIEW_EFFORT\"" \
-    --sandbox read-only \
-    --skip-git-repo-check \
-    -o "$msg" \
-    "$(review_prompt "$CHANGE")" 2>"$err")"
+  if [ -n "$csid" ]; then resuming=1; raw="$(_codex_resume "$csid")"; else raw="$(_codex_fresh)"; fi
   rc=$?
+  # Fail-safe: a failed resume that is not a usage limit → retry once fresh.
+  if [ "$rc" -ne 0 ] && [ "$resuming" -eq 1 ]; then
+    local rscan; rscan="$(mktemp)"; { cat "$err" 2>/dev/null; printf '\n%s\n' "$raw"; cat "$msg" 2>/dev/null; } > "$rscan"
+    if ! is_limit "$rscan"; then
+      echo "review-gate: [codex] resume failed — starting a fresh review session." >&2
+      : > "$err"; raw="$(_codex_fresh)"; rc=$?; resuming=0
+    fi
+    rm -f "$rscan"
+  fi
   set -e
   if [ "$rc" -ne 0 ]; then
-    if is_limit "$err"; then
-      RESET_EPOCH="$(parse_reset_epoch "$err")"
-      rm -f "$err" "$msg"; return 3
+    # A usage/limit message may surface on stderr, stdout, or the -o last-message
+    # file (the weekly-limit channel is not known), so scan all three combined —
+    # a missed limit would wrongly fail closed and reintroduce the mid-change stall.
+    local scan; scan="$(mktemp)"
+    { cat "$err" 2>/dev/null; printf '\n%s\n' "$raw"; cat "$msg" 2>/dev/null; } > "$scan"
+    if is_limit "$scan"; then
+      RESET_EPOCH="$(parse_reset_epoch "$scan")"
+      rm -f "$err" "$msg" "$scan"; return 3
     fi
+    rm -f "$scan"
     echo "review-gate: [codex] 'codex exec' exited $rc — treating as a failed review (fail-closed)." >&2
     sed 's/^/  codex: /' "$err" >&2 2>/dev/null || true
     rm -f "$err" "$msg"; exit 1
   fi
   parse_verdict codex "$msg" "$raw" "$err"
+  # Record a fresh session's id so the next round of this change resumes it. Scan
+  # stderr + stdout + the -o file (the "session id:" channel is not guaranteed),
+  # matching how limit detection scans all three.
+  if [ "$resuming" -eq 0 ]; then
+    local sidscan newid; sidscan="$(mktemp)"; { cat "$err" 2>/dev/null; printf '\n%s\n' "$raw"; cat "$msg" 2>/dev/null; } > "$sidscan"
+    newid="$(grep -ioE 'session id:[[:space:]]*[0-9a-fA-F-]{8,}' "$sidscan" | head -1 | grep -oE '[0-9a-fA-F-]{8,}' || true)"
+    rm -f "$sidscan"
+    [ -n "$newid" ] && save_session codex "$CHANGE" "$newid"
+  fi
   rm -f "$err" "$msg"
   report_findings codex "$ALL"
   [ "$(blocking_count "$BLOCKING")" -eq 0 ] && return 0 || return 2
@@ -349,101 +469,101 @@ run_codex() {
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
-main() {
-  local codex_allowed=1
+# A blocking FINAL review ($1 = reviewer label): bump the shared "final" round
+# counter, bail to human review after the max, else exit 2. Always terminal.
+final_block() {
+  local n; n="$(read_counter final)"; n=$(( n + 1 )); write_counter final "$n"
+  if [ "$n" -gt "$REVIEW_MAX_ROUNDS" ]; then
+    write_counter final 0
+    loud_banner "FINAL ($1) STAGE exceeded max rounds ($REVIEW_MAX_ROUNDS) — the [BLOCK] findings above need human review."
+    exit 0
+  fi
+  echo "review-gate: [$1] BLOCKING (round $n/$REVIEW_MAX_ROUNDS) — fix the [BLOCK] findings above; exiting 2." >&2
+  exit 2
+}
 
-  # Select the single change under review for both agents: the armed workstream
-  # marker (set by `review-gate start` / the apply workflow) when present; else, for
-  # ad-hoc manual runs, the most recently modified change. Empty falls back to a
-  # generic "review the uncommitted changes" prompt.
-  CHANGE="$(tr -d '\n' < "$ACTIVE_MARKER" 2>/dev/null || true)"
+main() {
+  # Select the single change under review: the armed workstream marker (set by
+  # `review-gate start` / the apply workflow) when present; else, for ad-hoc manual
+  # runs, the most recently modified change. Empty → generic "uncommitted changes".
+  CHANGE=""
+  [ -f "$ACTIVE_MARKER" ] && CHANGE="$(tr -d '\n' < "$ACTIVE_MARKER" 2>/dev/null || true)"
   if [ -z "$CHANGE" ]; then
     CHANGE="$(active_change)"
     local nchanges; nchanges="$(active_changes | grep -c . || true)"
-    if [ "${nchanges:-0}" -gt 1 ]; then
-      echo "review-gate: $nchanges non-archived changes found — reviewing the most recently modified: ${CHANGE:-<none>}." >&2
-    fi
+    [ "${nchanges:-0}" -gt 1 ] && echo "review-gate: $nchanges non-archived changes found — reviewing the most recently modified: ${CHANGE:-<none>}." >&2
   fi
 
-  # Claude-only mode: skip Codex until the recorded resume epoch has passed.
-  if [ -f "$CLAUDE_ONLY" ]; then
-    local resume now; resume="$(tr -dc '0-9' < "$CLAUDE_ONLY")"; resume="${resume:-0}"; now="$(now_epoch)"
-    if [ "$now" -ge "$resume" ]; then
-      rm -f "$CLAUDE_ONLY"
-      echo "review-gate: Claude-only cooldown elapsed — re-probing Codex." >&2
-    else
-      codex_allowed=0
-      loud_banner \
-        "CODEX REVIEW GATE — CLAUDE-ONLY MODE (Codex usage limit reached)" \
-        "Codex is temporarily disabled; reviewing with $CLAUDE_REVIEW_MODEL only." \
-        "Codex resumes automatically after $(human_time "$resume")." \
-        "Force a full review sooner with:  scripts/review-gate resume"
-      notify "Claude-only mode — Codex limited until $(human_time "$resume")"
-    fi
+  # Is Codex on cooldown from an earlier limit? While so, the FINAL reviewer is
+  # Claude ($FINAL_CLAUDE_MODEL) instead of Codex.
+  local codex_ok=1
+  if [ -f "$CODEX_COOLDOWN" ]; then
+    local resume now; resume="$(tr -dc '0-9' < "$CODEX_COOLDOWN")"; resume="${resume:-0}"; now="$(now_epoch)"
+    if [ "$now" -ge "$resume" ]; then rm -f "$CODEX_COOLDOWN"; echo "review-gate: Codex cooldown elapsed — re-probing Codex." >&2
+    else codex_ok=0; fi
   fi
 
-  # Stage 1 — Claude.
-  local rc=0; run_claude || rc=$?
-  if [ "$rc" -eq 2 ]; then
-    local n; n="$(read_counter claude)"; n=$(( n + 1 )); write_counter claude "$n"
+  # ---- Stage 1: cheap Sonnet pass (fresh session every round) ----
+  local rc=0 cheap_desc="cheap $CHEAP_REVIEW_MODEL"
+  run_claude_stage "$CHEAP_REVIEW_MODEL" cheap 0 || rc=$?
+  if [ "$rc" -eq 4 ]; then
+    cheap_desc="cheap stage skipped (rate-limited)"
+    loud_banner \
+      "CHEAP ($CHEAP_REVIEW_MODEL) STAGE RATE-LIMITED — skipping it this stop." \
+      "Falling through to the final reviewer; Claude should recover by $(human_time "$CLAUDE_RESET_EPOCH")."
+  elif [ "$rc" -eq 2 ]; then
+    local n; n="$(read_counter cheap)"; n=$(( n + 1 )); write_counter cheap "$n"
     if [ "$n" -gt "$REVIEW_MAX_ROUNDS" ]; then
-      write_counter claude 0
-      loud_banner "CLAUDE STAGE exceeded max rounds ($REVIEW_MAX_ROUNDS) — the [BLOCK] findings above need human review."
-      # Bail: treat the Claude stage as passed and fall through to Codex.
+      write_counter cheap 0
+      loud_banner "CHEAP ($CHEAP_REVIEW_MODEL) STAGE exceeded max rounds ($REVIEW_MAX_ROUNDS) — the [BLOCK] findings above need human review."
+      # bail → fall through to the final reviewer
     else
-      echo "review-gate: [claude] BLOCKING (round $n/$REVIEW_MAX_ROUNDS) — fix the [BLOCK] findings above; exiting 2." >&2
+      echo "review-gate: [cheap] BLOCKING (round $n/$REVIEW_MAX_ROUNDS) — fix the [BLOCK] findings above; exiting 2." >&2
       exit 2
     fi
   else
-    write_counter claude 0
+    write_counter cheap 0
   fi
 
-  # Claude stage passed (clean or bailed to human review).
-  if [ "$codex_allowed" -eq 0 ]; then
-    echo "review-gate: Claude stage clean; Codex skipped (Claude-only mode)." >&2
-    exit 0
-  fi
-
-  # Codex-pass cache: skip Codex while the reviewed diff is unchanged.
-  if [ -f "$CODEX_PASS" ]; then
-    local fp cur; fp="$(cat "$CODEX_PASS" 2>/dev/null || true)"; cur="$(diff_fingerprint)"
+  # ---- Final-pass cache: skip the expensive reviewer while the diff is unchanged ----
+  if [ -f "$FINAL_PASS" ]; then
+    local fp cur; fp="$(cat "$FINAL_PASS" 2>/dev/null || true)"; cur="$(diff_fingerprint)"
     if [ -n "$fp" ] && [ "$fp" = "$cur" ]; then
-      echo "review-gate: Codex review cached (diff unchanged since last clean pass) — skipping Codex."
+      echo "review-gate: final review cached (diff unchanged since last clean pass) — skipping the expensive stage."
       exit 0
     fi
   fi
 
-  # Stage 2 — Codex.
-  local crc=0; run_codex || crc=$?
-  case "$crc" in
-    0)
-      write_counter codex 0
-      diff_fingerprint > "$CODEX_PASS"
-      echo "Two-stage review clean (Claude + Codex)."
-      exit 0
-      ;;
-    2)
-      local n; n="$(read_counter codex)"; n=$(( n + 1 )); write_counter codex "$n"
-      if [ "$n" -gt "$REVIEW_MAX_ROUNDS" ]; then
-        write_counter codex 0
-        loud_banner "CODEX STAGE exceeded max rounds ($REVIEW_MAX_ROUNDS) — the [BLOCK] findings above need human review."
-        exit 0
-      fi
-      echo "review-gate: [codex] BLOCKING (round $n/$REVIEW_MAX_ROUNDS) — fix the [BLOCK] findings above; exiting 2." >&2
-      exit 2
-      ;;
-    3)
-      mkdir -p "$CLAUDE_DIR"
-      printf '%s\n' "$RESET_EPOCH" > "$CLAUDE_ONLY"
-      loud_banner \
-        "CODEX USAGE LIMIT REACHED — entering CLAUDE-ONLY MODE." \
-        "The Claude stage already passed, so this stop is allowed to proceed." \
-        "Codex will be skipped until $(human_time "$RESET_EPOCH")." \
-        "Force a retry sooner with:  scripts/review-gate resume"
-      notify "Codex limit reached — Claude-only until $(human_time "$RESET_EPOCH")"
-      exit 0
-      ;;
-  esac
+  # ---- Stage 2: expensive final reviewer — Codex if it has tokens, else Claude Opus ----
+  if [ "$codex_ok" -eq 1 ]; then
+    local crc=0; run_codex || crc=$?
+    case "$crc" in
+      0) write_counter final 0; diff_fingerprint > "$FINAL_PASS"; echo "Review clean ($cheap_desc + Codex)."; exit 0 ;;
+      2) final_block codex ;;
+      3) mkdir -p "$CLAUDE_DIR"; printf '%s\n' "$RESET_EPOCH" > "$CODEX_COOLDOWN"
+         loud_banner \
+           "CODEX USAGE LIMIT — final review falls back to $FINAL_CLAUDE_MODEL." \
+           "Codex resumes automatically after $(human_time "$RESET_EPOCH")." \
+           "Force a Codex retry sooner with:  scripts/review-gate resume"
+         notify "Codex limited — final reviewer is $FINAL_CLAUDE_MODEL until $(human_time "$RESET_EPOCH")"
+         codex_ok=0 ;;
+    esac
+  fi
+
+  # Codex unavailable (cooldown or just limited) → final reviewer is Claude Opus.
+  if [ "$codex_ok" -eq 0 ]; then
+    local orc=0; run_claude_stage "$FINAL_CLAUDE_MODEL" final 1 || orc=$?
+    case "$orc" in
+      0) write_counter final 0; diff_fingerprint > "$FINAL_PASS"; echo "Review clean ($cheap_desc + $FINAL_CLAUDE_MODEL)."; exit 0 ;;
+      2) final_block "$FINAL_CLAUDE_MODEL" ;;
+      4) loud_banner \
+           "NO FINAL REVIEW PERFORMED — Codex and Claude are both rate-limited." \
+           "The cheap stage ran, but no expensive reviewer is available this stop." \
+           "This stop is allowed to proceed; please review the change by hand before merging."
+         notify "All reviewers rate-limited — no final review this stop"
+         exit 0 ;;
+    esac
+  fi
 }
 
 main "$@"

@@ -12,7 +12,7 @@
 #   review-gate off      disable the gate until re-enabled
 #   review-gate on       re-enable the gate
 #   review-gate status   report gate state, armed workstream, and review mode
-#   review-gate resume   leave Claude-only mode now (re-enable the Codex stage)
+#   review-gate resume   clear the Codex cooldown (re-probe Codex next run)
 #
 # The gate runs on Stop ONLY while armed (a `.claude/.review-gate-active` marker):
 # it does not review on ordinary stops. Archiving the armed change auto-disarms.
@@ -25,7 +25,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SENTINEL="$ROOT/.claude/.review-gate-disabled"
-CLAUDE_ONLY="$ROOT/.claude/.review-gate-claude-only"
+CODEX_COOLDOWN="$ROOT/.claude/.review-gate-codex-cooldown"
 ACTIVE="$ROOT/.claude/.review-gate-active"
 
 # Most recently modified non-archived change (used when `start` gets no name).
@@ -51,7 +51,7 @@ usage: review-gate {start [change]|stop|on|off|status|resume}
   on       re-enable the review gate
   off      disable the review gate (persists until `review-gate on`)
   status   report gate state, armed workstream, and review mode
-  resume   leave Claude-only mode now and re-enable the Codex stage
+  resume   clear the Codex cooldown so Codex is re-probed next run
 EOF
   exit 2
 }
@@ -66,15 +66,15 @@ report_armed() {
 }
 
 report_mode() {
-  if [ -e "$CLAUDE_ONLY" ]; then
-    local resume now; resume="$(tr -dc '0-9' < "$CLAUDE_ONLY")"; resume="${resume:-0}"; now="$(date +%s)"
+  if [ -e "$CODEX_COOLDOWN" ]; then
+    local resume now; resume="$(tr -dc '0-9' < "$CODEX_COOLDOWN")"; resume="${resume:-0}"; now="$(date +%s)"
     if [ "$now" -lt "$resume" ]; then
-      echo "review-gate: Mode: CLAUDE-ONLY (Codex usage limit) — Codex resumes at $(human_time "$resume")"
+      echo "review-gate: Mode: Codex on cooldown (usage limit) — final reviewer is Claude until $(human_time "$resume")"
     else
-      echo "review-gate: Mode: two-stage (Claude-only cooldown elapsed; Codex re-probes on the next run)"
+      echo "review-gate: Mode: normal (Codex cooldown elapsed; Codex re-probes on the next run)"
     fi
   else
-    echo "review-gate: Mode: two-stage (Claude → Codex)"
+    echo "review-gate: Mode: normal (cheap Sonnet → Codex; Claude Opus if Codex is limited)"
   fi
 }
 
@@ -92,9 +92,11 @@ case "${1:-}" in
     fi
     mkdir -p "$(dirname "$ACTIVE")"
     printf '%s\n' "$ch" > "$ACTIVE"
+    rm -f "$ROOT"/.claude/.review-gate-*-rounds
     echo "review-gate: ARMED for change '$ch' — the review gate will run on stops until 'review-gate stop' or archive."
     ;;
   stop)
+    rm -f "$ROOT"/.claude/.review-gate-*-rounds
     if [ -e "$ACTIVE" ]; then
       rm -f "$ACTIVE"
       echo "review-gate: DISARMED — the review gate will not run until the next 'review-gate start'."
@@ -121,11 +123,11 @@ case "${1:-}" in
     report_mode
     ;;
   resume)
-    if [ -e "$CLAUDE_ONLY" ]; then
-      rm -f "$CLAUDE_ONLY"
-      echo "review-gate: Claude-only mode cleared — full two-stage review restored on the next run."
+    if [ -e "$CODEX_COOLDOWN" ]; then
+      rm -f "$CODEX_COOLDOWN"
+      echo "review-gate: Codex cooldown cleared — Codex will be re-probed on the next run."
     else
-      echo "review-gate: not in Claude-only mode — nothing to resume."
+      echo "review-gate: Codex is not on cooldown — nothing to resume."
     fi
     ;;
   *)
