@@ -8,14 +8,20 @@
 #   2. persistent disable — .claude/.review-gate-disabled present → exit 0
 #   3. armed check        — no .claude/.review-gate-active marker → exit 0
 #   4. sync               — refresh managed scripts from the canonical checkout
-#   5. dirty-tree check   — clean working tree → exit 0
-#   6. run the reviewer   — exec scripts/review-gate.sh (exit code propagates)
+#   5. run the reviewer   — exec scripts/review-gate.sh (exit code propagates)
 #
 # The gate runs only while ARMED for a workstream: `review-gate start` (run when
 # you begin implementation, e.g. from /openspec-apply-change) writes the marker;
 # `review-gate stop` or archiving the change clears it. Steps 1–3 short-circuit
 # BEFORE sync, so an idle, disabled, or bypassed repo never reviews or mutates
 # the working tree.
+#
+# There is deliberately NO dirty-tree gate: whether the change is committed or
+# not does not tell us whether it has been reviewed. The reviewer's own content
+# fingerprint (a git tree hash of the working state, committed + uncommitted)
+# decides whether anything actually needs (re-)reviewing, so an unchanged,
+# already-passed state returns instantly from cache while committed-but-unreviewed
+# code is still reviewed.
 #
 # The canonical checkout lives at ${REVIEW_GATE_HOME:-$HOME/Projects/openspec-codex-gate}.
 # When it is absent, sync is skipped silently and the committed copies are used,
@@ -73,10 +79,11 @@ sync_from_canonical() {
 }
 sync_from_canonical
 
-# 5. Nothing changed → nothing to review.
-if [ -z "$(git status --porcelain 2>/dev/null)" ]; then
-  exit 0
-fi
-
-# 6. Run the reviewer; its exit code (notably 2 = blocking) propagates.
+# 5. Run the reviewer; its exit code (notably 2 = blocking) propagates.
+# We deliberately do NOT gate on a dirty working tree: whether the change is
+# committed or not says nothing about whether it has been reviewed. The reviewer
+# verifies the armed change against its specs (reading committed code too), and
+# its own content-fingerprint cache decides whether anything actually needs
+# re-reviewing — a clean, unchanged, already-passed state returns instantly from
+# cache, while committed-but-unreviewed code still gets reviewed.
 exec bash "$ROOT/scripts/review-gate.sh"

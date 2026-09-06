@@ -133,14 +133,11 @@ sha256() {
   fi
 }
 
-# The uncommitted changes, used to compute the Codex-pass cache fingerprint. The
-# gate's own transient files (.claude/.review-gate-*) are skipped so they cannot
-# perturb the fingerprint — otherwise writing the cache would change the next
-# run's fingerprint and the cache would never hit. They are excluded from BOTH the
-# tracked diff and the untracked listing: if a repo committed them before adopting
-# the gitignore they show up in `git diff HEAD`, and their churn every run would
-# otherwise defeat the cache entirely.
+# Fallback content of the working tree (committed + uncommitted), used only when a
+# git tree hash can't be produced. The gate's own transient files
+# (.claude/.review-gate-*) are skipped so they cannot perturb the fingerprint.
 diff_content() {
+  git rev-parse HEAD 2>/dev/null || true
   git diff HEAD -- ':(exclude,glob).claude/.review-gate-*' 2>/dev/null || git diff HEAD 2>/dev/null || true
   git ls-files --others --exclude-standard -z 2>/dev/null | while IFS= read -r -d '' f; do
     case "$f" in .claude/.review-gate-*) continue ;; esac
@@ -149,8 +146,34 @@ diff_content() {
   done
 }
 
-# A stable fingerprint of the uncommitted changes, for the Codex-pass cache.
-diff_fingerprint() { diff_content | sha256; }
+# A CONTENT fingerprint of the current working tree, for the final-pass cache. It
+# hashes the actual code as it stands — committed AND uncommitted alike — so the
+# cache tracks the state of the change's implementation, NOT how clean the
+# checkout happens to be. We build a throwaway index seeded from HEAD, stage every
+# working-tree change into it, and take git's own tree object id:
+#   - identical content hashes identically regardless of commit history, so
+#     committing already-reviewed work does NOT force a needless re-review;
+#   - any real edit (committed or not) changes the tree id → the cache invalidates
+#     and the reviewer runs again;
+#   - the gate's own .claude/.review-gate-* markers are excluded (and .gitignored
+#     files are ignored by `git add` anyway), so their per-run churn never counts.
+# The real index and working tree are untouched. Falls back to hashing
+# diff_content when no HEAD/tree is available (e.g. a repo with no commits).
+diff_fingerprint() {
+  local idx tree
+  idx="$(mktemp)"
+  if GIT_INDEX_FILE="$idx" git read-tree HEAD 2>/dev/null \
+     && GIT_INDEX_FILE="$idx" git add -A -- ':(exclude,glob).claude/.review-gate-*' 2>/dev/null; then
+    # Drop the gate's own markers from the index — both any that `git add` still
+    # let through and, crucially, any that a repo committed before adopting the
+    # gitignore (those arrive via read-tree HEAD, so excluding them from `add`
+    # alone would leave their per-run churn in the tree id and defeat the cache).
+    GIT_INDEX_FILE="$idx" git rm --cached -q --ignore-unmatch -- ':(glob).claude/.review-gate-*' 2>/dev/null || true
+    tree="$(GIT_INDEX_FILE="$idx" git write-tree 2>/dev/null || true)"
+  fi
+  rm -f "$idx"
+  if [ -n "${tree:-}" ]; then printf '%s\n' "$tree"; else diff_content | sha256; fi
+}
 
 # ---------------------------------------------------------------------------
 # Round counters (per stage: claude|codex)

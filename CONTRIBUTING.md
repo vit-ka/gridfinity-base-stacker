@@ -4,12 +4,15 @@
 
 This repo runs a two-stage review gate as a Claude Code `Stop` hook. It runs
 **only while armed** for a workstream (so it stays out of the way on ordinary
-edits). When armed and the working tree is dirty, the gate first runs a cheap
-**Claude (Sonnet)** review that verifies the active OpenSpec change and blocks
-the session on actionable defects; once that is clean it runs the expensive final
-reviewer — **Codex**, or **Claude Opus** only when Codex is rate-limited
-(`scripts/review-gate-hook.sh` → `scripts/review-gate.sh`). A clean final pass is
-cached against the diff. The scripts are kept in sync from the shared checkout at
+edits). When armed, the gate reviews the active OpenSpec change whether the work
+is committed or not: it first runs a cheap **Claude (Sonnet)** review that
+verifies the change and blocks the session on actionable defects; once that is
+clean it runs the expensive final reviewer — **Codex**, or **Claude Opus** only
+when Codex is rate-limited (`scripts/review-gate-hook.sh` → `scripts/review-gate.sh`).
+A clean final pass is cached against the change **content** — a git tree hash of
+the working state, committed and uncommitted alike — so committing already-reviewed
+work does not trigger a re-review and an unchanged change returns instantly from
+cache. The scripts are kept in sync from the shared checkout at
 `${REVIEW_GATE_HOME:-~/Projects/openspec-codex-gate}` on each run — edit them
 there, not here.
 
