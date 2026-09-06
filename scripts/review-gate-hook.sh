@@ -10,9 +10,10 @@
 #   4. sync               — refresh managed scripts from the canonical checkout
 #   5. run the reviewer   — exec scripts/review-gate.sh (exit code propagates)
 #
-# The gate runs only while ARMED for a workstream: `review-gate start` (run when
-# you begin implementation, e.g. from /openspec-apply-change) writes the marker;
-# `review-gate stop` or archiving the change clears it. Steps 1–3 short-circuit
+# The gate runs only while ARMED for a workstream: `review-gate start-auto-review`
+# (run when you begin implementation, e.g. from /openspec-apply-change) writes the
+# marker; `review-gate stop-auto-review` or archiving the change clears it. (For an
+# on-demand review outside a stop, run `review-gate start`.) Steps 1–3 short-circuit
 # BEFORE sync, so an idle, disabled, or bypassed repo never reviews or mutates
 # the working tree.
 #

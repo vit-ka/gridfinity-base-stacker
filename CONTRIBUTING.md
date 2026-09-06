@@ -20,9 +20,21 @@ there, not here.
 flow does this for you):
 
 ```sh
-scripts/review-gate start [change]   # arm (defaults to the most recent change)
-scripts/review-gate stop             # disarm (end the workstream)
+scripts/review-gate start-auto-review [change]   # arm (defaults to the most recent change)
+scripts/review-gate stop-auto-review             # disarm (end the workstream)
 ```
+
+**Want to review right now?** Run a fresh review on demand (it ignores the pass
+cache), without waiting for a stop:
+
+```sh
+scripts/review-gate start              # full round now (cheap Sonnet → final reviewer)
+scripts/review-gate start 2            # only the final reviewer (skip the cheap stage)
+scripts/review-gate start <change>     # review a specific change (even if archived)
+```
+
+`start` targets the armed change (or the most recent one) unless you name a
+change; a named change is a one-shot that does not change the armed workstream.
 
 **Codex usage limit?** The gate does not stall: it falls back to **Claude Opus**
 as the final reviewer and re-probes Codex automatically once the limit resets.

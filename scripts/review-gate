@@ -6,13 +6,19 @@
 # checks. While disabled, the gate is skipped entirely (no review, no sync) so
 # you can commit by hand without interruption.
 #
-#   review-gate start [change]  arm the gate for a workstream (run when you begin
-#                              implementation, e.g. from /openspec-apply-change)
-#   review-gate stop            disarm the gate (end the workstream)
+#   review-gate start [change] [stage]  run a review NOW (fresh — ignores the
+#                              pass cache): stage 1 = cheap Sonnet, 2 = final
+#                              reviewer; bare `start` runs the full round. An
+#                              optional change name reviews that change (even if
+#                              archived) without touching the armed workstream.
+#   review-gate start-auto-review [change]  arm the gate for a workstream (rarely
+#                              typed by hand — auto-fired by /openspec-apply-change)
+#   review-gate stop-auto-review  disarm the gate (end the workstream)
 #   review-gate off      disable the gate until re-enabled
 #   review-gate on       re-enable the gate
 #   review-gate status   report gate state, armed workstream, and review mode
 #   review-gate resume   clear the Codex cooldown (re-probe Codex next run)
+#   review-gate help     print the useful-commands cheat sheet
 #
 # The gate runs on Stop ONLY while armed (a `.claude/.review-gate-active` marker):
 # it does not review on ordinary stops. Archiving the armed change auto-disarms.
@@ -42,18 +48,21 @@ human_time() {
     || echo "epoch $1"
 }
 
-usage() {
-  cat >&2 <<'EOF'
-usage: review-gate {start [change]|stop|on|off|status|resume}
-  start    arm the gate for an implementation workstream (defaults to the most
-           recently modified change; pass a name to be explicit)
-  stop     disarm the gate (end the workstream)
-  on       re-enable the review gate
-  off      disable the review gate (persists until `review-gate on`)
-  status   report gate state, armed workstream, and review mode
-  resume   clear the Codex cooldown so Codex is re-probed next run
+# The handful of commands worth knowing, printed on arm and on `help`/bare. Goes
+# to stdout so the arm hook (UserPromptSubmit) can surface it to the session.
+usage_cheatsheet() {
+  cat <<'EOF'
+review-gate — useful commands:
+  review-gate start [change] [stage]   review now: fresh (ignores the pass cache);
+                                       stage 1 = cheap Sonnet, 2 = final reviewer;
+                                       bare 'start' runs the full round. A change
+                                       name reviews that change (even if archived)
+                                       without changing the armed workstream.
+  review-gate status                   gate state, armed workstream, review mode
+  review-gate stop-auto-review         disarm the auto-gate (end the workstream)
+  review-gate resume                   clear a Codex cooldown (re-probe next run)
+  review-gate off                      disable the gate until 'review-gate on'
 EOF
-  exit 2
 }
 
 report_armed() {
@@ -61,7 +70,7 @@ report_armed() {
     local ch; ch="$(tr -d '\n' < "$ACTIVE" 2>/dev/null)"
     echo "review-gate: ARMED for workstream: ${ch:-<unknown change>}"
   else
-    echo "review-gate: not armed (idle — the gate will not run on stops; use 'review-gate start')"
+    echo "review-gate: not armed (idle — the gate will not run on stops; use 'review-gate start-auto-review')"
   fi
 }
 
@@ -80,15 +89,57 @@ report_mode() {
 
 case "${1:-}" in
   start)
+    # Manual, on-demand review. Order-independent positional args by type: a
+    # purely-numeric token is the stage (1|2), anything else is the change name;
+    # both optional. Forces a fresh review and (with a change) targets it for this
+    # one run WITHOUT touching the armed marker — the shared orchestrator does the
+    # work (REVIEW_START_STAGE / REVIEW_FORCE / REVIEW_CHANGE_OVERRIDE).
+    # Argument-validation errors exit 1 (misuse), never 2 — the manual review's
+    # exit codes mirror the reviewer (0 clean, 2 blocking, 1 error), so a caller
+    # must never mistake a bad invocation for a completed blocking review.
+    shift
+    stage=""; change=""
+    for tok in "$@"; do
+      if printf '%s' "$tok" | grep -qE '^[0-9]+$'; then
+        if [ -n "$stage" ]; then
+          echo "review-gate: start takes at most one stage (got '$stage' and '$tok')." >&2; exit 1
+        fi
+        stage="$tok"
+      else
+        if [ -n "$change" ]; then
+          echo "review-gate: start takes at most one change name (got '$change' and '$tok')." >&2; exit 1
+        fi
+        change="$tok"
+      fi
+    done
+    stage="${stage:-1}"
+    case "$stage" in
+      1|2) ;;
+      *) echo "review-gate: stage must be 1 (cheap) or 2 (final reviewer) — got '$stage'." >&2; exit 1 ;;
+    esac
+    if [ -n "$change" ]; then
+      case "$change" in
+        */*|.|..|archive)
+          echo "review-gate: '$change' is not a valid change name — pass a single change (active or archived)." >&2
+          exit 1 ;;
+      esac
+    fi
+    export REVIEW_START_STAGE="$stage" REVIEW_FORCE=1
+    if [ -n "$change" ]; then export REVIEW_CHANGE_OVERRIDE="$change"; fi
+    rc=0
+    bash "$ROOT/scripts/review-gate.sh" || rc=$?
+    exit "$rc"
+    ;;
+  start-auto-review)
     ch="${2:-}"
     [ -n "$ch" ] || ch="$(latest_change)"
     if [ -z "$ch" ]; then
-      echo "review-gate: no change found to arm — pass one explicitly: review-gate start <change>" >&2
+      echo "review-gate: no change found to arm — pass one explicitly: review-gate start-auto-review <change>" >&2
       exit 2
     fi
     # Accept only a real, active change: a single path component (no '/'), not the
-    # 'archive' container, whose tasks.md exists. This refuses `start archive`,
-    # nested paths like `<change>/specs`, and nonexistent names.
+    # 'archive' container, whose tasks.md exists. This refuses `start-auto-review
+    # archive`, nested paths like `<change>/specs`, and nonexistent names.
     case "$ch" in
       */*|.|..|archive)
         echo "review-gate: '$ch' is not a valid change name — pass a single active change under openspec/changes/." >&2
@@ -101,16 +152,23 @@ case "${1:-}" in
     mkdir -p "$(dirname "$ACTIVE")"
     printf '%s\n' "$ch" > "$ACTIVE"
     rm -f "$ROOT"/.claude/.review-gate-*-rounds
-    echo "review-gate: ARMED for change '$ch' — the review gate will run on stops until 'review-gate stop' or archive."
+    echo "review-gate: ARMED for change '$ch' — the review gate will run on stops until 'review-gate stop-auto-review' or archive."
+    usage_cheatsheet
     ;;
-  stop)
+  stop-auto-review)
     rm -f "$ROOT"/.claude/.review-gate-*-rounds
     if [ -e "$ACTIVE" ]; then
       rm -f "$ACTIVE"
-      echo "review-gate: DISARMED — the review gate will not run until the next 'review-gate start'."
+      echo "review-gate: DISARMED — the review gate will not run until the next 'review-gate start-auto-review'."
     else
       echo "review-gate: not armed — nothing to stop."
     fi
+    ;;
+  stop)
+    # `stop` no longer arms/disarms — it was renamed. Point at the new verb.
+    echo "review-gate: 'stop' was renamed — to disarm the auto-gate use 'review-gate stop-auto-review'." >&2
+    echo "review-gate: (note: 'review-gate start' now runs a manual review on demand.)" >&2
+    exit 2
     ;;
   off)
     mkdir -p "$(dirname "$SENTINEL")"
@@ -138,7 +196,12 @@ case "${1:-}" in
       echo "review-gate: Codex is not on cooldown — nothing to resume."
     fi
     ;;
+  help|"")
+    usage_cheatsheet
+    ;;
   *)
-    usage
+    echo "review-gate: unknown command '$1'." >&2
+    usage_cheatsheet
+    exit 2
     ;;
 esac

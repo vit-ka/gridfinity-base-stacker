@@ -31,12 +31,14 @@ fi
 
 # Arm only on an actual /openspec-apply-change slash-command invocation — the
 # command as the first token of the prompt — so a prompt that merely mentions it
-# in prose does not arm. `review-gate start` (no arg) targets the most recently
-# modified change (the one being applied).
+# in prose does not arm. `review-gate start-auto-review` (no arg) targets the most
+# recently modified change (the one being applied). Its stdout (the arm notice +
+# the useful-commands cheat sheet) is forwarded so a UserPromptSubmit hook surfaces
+# it to the session; stderr is suppressed and the hook never blocks (always exit 0).
 trimmed="${prompt#"${prompt%%[![:space:]]*}"}"   # strip leading whitespace
 case "$trimmed" in
   /openspec-apply-change|/openspec-apply-change[[:space:]]*)
-    [ -x "$ROOT/scripts/review-gate" ] && bash "$ROOT/scripts/review-gate" start >/dev/null 2>&1 || true
+    [ -x "$ROOT/scripts/review-gate" ] && bash "$ROOT/scripts/review-gate" start-auto-review 2>/dev/null || true
     ;;
 esac
 

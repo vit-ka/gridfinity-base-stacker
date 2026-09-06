@@ -92,8 +92,18 @@ ACTIVE_MARKER="$CLAUDE_DIR/.review-gate-active"          # armed workstream: the
 # Per-stage reused review sessions live in .review-gate-<stage>-session as
 # "<change>\t<session-id>" (see session_file/session_id_for/save_session).
 CHANGE=""                                            # the single change under review; set in main
+CHANGE_DIR=""                                         # its resolved artifacts dir (active or archived); set in main
 CLAUDE_RESET_EPOCH=""                                # set by a Claude stage when rate-limited
 RESET_EPOCH=""                                        # set by run_codex on a Codex limit
+
+# Manual-run inputs, set by `review-gate start` (see scripts/review-gate). They do
+# not apply to the automatic Stop-hook path, which leaves them unset:
+#   REVIEW_START_STAGE  (1)  first stage to run: 1 = cheap+final round, 2 = final only
+#   REVIEW_FORCE        ()   non-empty = skip the pre-cheap pass-cache short-circuit
+#   REVIEW_CHANGE_OVERRIDE () one-shot change target; does NOT read/write the armed marker
+REVIEW_START_STAGE="${REVIEW_START_STAGE:-1}"
+REVIEW_FORCE="${REVIEW_FORCE:-}"
+REVIEW_CHANGE_OVERRIDE="${REVIEW_CHANGE_OVERRIDE:-}"
 
 die()  { echo "review-gate: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -277,14 +287,52 @@ active_change() {
     | sed -E 's#.*/changes/([^/]+)/tasks\.md$#\1#'
 }
 
+# Resolve a change NAME to its artifacts directory: the active dir
+# openspec/changes/<name>/ first, else an archived dir openspec/changes/archive/*/
+# whose basename is <name> (exact) or *-<name> (a dated archive prefix). Echoes the
+# resolved dir and returns 0; returns 1 (nothing echoed) when nothing matches;
+# returns 2 and lists candidates on stderr when the archived match is ambiguous.
+# Exact-basename matches win over dated-suffix matches.
+resolve_change_dir() {
+  local name="$1"
+  [ -n "$name" ] || return 1
+  if [ -d "openspec/changes/$name" ]; then
+    printf '%s' "openspec/changes/$name"; return 0
+  fi
+  local d base; local -a exact=() suffix=()
+  for d in openspec/changes/archive/*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"; base="$(basename "$d")"
+    case "$base" in
+      "$name")   exact+=("$d") ;;
+      *-"$name") suffix+=("$d") ;;
+    esac
+  done
+  if [ "${#exact[@]}" -gt 0 ]; then
+    if [ "${#exact[@]}" -gt 1 ]; then
+      echo "review-gate: ambiguous archived change '$name' — candidates: ${exact[*]}" >&2; return 2
+    fi
+    printf '%s' "${exact[0]}"; return 0
+  fi
+  if [ "${#suffix[@]}" -gt 0 ]; then
+    if [ "${#suffix[@]}" -gt 1 ]; then
+      echo "review-gate: ambiguous archived change '$name' — candidates: ${suffix[*]}" >&2; return 2
+    fi
+    printf '%s' "${suffix[0]}"; return 0
+  fi
+  return 1
+}
+
 # The shared review prompt. Names the single change under review so each agent
-# reads openspec/changes/<name>/ and locates the related code itself, rather than
-# being handed a precomputed diff. $1 is the change name (may be empty).
+# reads its artifacts dir and locates the related code itself, rather than being
+# handed a precomputed diff. $1 is the change name (may be empty); $2 is its
+# resolved artifacts dir (defaults to openspec/changes/<name>/ when omitted).
 review_prompt() {
-  local change="$1"
+  local change="$1" dir="${2:-}"
+  [ -n "$dir" ] || dir="openspec/changes/$change"
   if [ -n "$change" ]; then
     printf 'You are the code-review gate for this repository. Verify that the OpenSpec change "%s" is implemented correctly.\n\n' "$change"
-    printf 'First read the artifacts for this change under openspec/changes/%s/ — proposal.md, design.md, tasks.md, and specs/**/*.md — to understand exactly what it is supposed to do. Then review this repository and judge whether the implementation of that change is correct, complete, and faithful to those specs. Whether the relevant code is already committed or still uncommitted does not matter — review the implementation as it now stands.\n\n' "$change"
+    printf 'First read the artifacts for this change under %s/ — proposal.md, design.md, tasks.md, and specs/**/*.md — to understand exactly what it is supposed to do. Then review this repository and judge whether the implementation of that change is correct, complete, and faithful to those specs. Whether the relevant code is already committed or still uncommitted does not matter — review the implementation as it now stands.\n\n' "$dir"
     printf 'Stay scoped to THIS change: report defects only in the code that implements it. Do not audit the repository at large and do not flag pre-existing issues unrelated to this change.\n\n'
   else
     printf 'You are the code-review gate for this repository. Review the uncommitted changes for actionable defects.\n\n'
@@ -403,7 +451,7 @@ run_claude_stage() {
     fi
   fi
   set +e
-  raw="$(review_prompt "$CHANGE" | SKIP_REVIEW_GATE=1 claude "${cflags[@]}" ${sflag[@]+"${sflag[@]}"} 2>"$err")"
+  raw="$(review_prompt "$CHANGE" "$CHANGE_DIR" | SKIP_REVIEW_GATE=1 claude "${cflags[@]}" ${sflag[@]+"${sflag[@]}"} 2>"$err")"
   rc=$?
   # Fail-safe: if a session-flagged call fails for a non-limit reason — a stale
   # session, or a `claude` build that doesn't accept --session-id/--resume — retry
@@ -417,7 +465,7 @@ run_claude_stage() {
     if ! is_limit "$err"; then
       echo "review-gate: [$stage] session call failed — retrying without a session." >&2
       : > "$err"
-      raw="$(review_prompt "$CHANGE" | SKIP_REVIEW_GATE=1 claude "${cflags[@]}" 2>"$err")"
+      raw="$(review_prompt "$CHANGE" "$CHANGE_DIR" | SKIP_REVIEW_GATE=1 claude "${cflags[@]}" 2>"$err")"
       rc=$?; use_session=0
     fi
   fi
@@ -494,11 +542,11 @@ run_codex() {
   err="$(mktemp)"; msg="$(mktemp)"
   csid="$(session_id_for codex "$CHANGE")"
   _codex_fresh() { codex exec -m "$REVIEW_MODEL" -c model_reasoning_effort="\"$REVIEW_EFFORT\"" \
-    --sandbox read-only --skip-git-repo-check -o "$msg" "$(review_prompt "$CHANGE")" 2>"$err"; }
+    --sandbox read-only --skip-git-repo-check -o "$msg" "$(review_prompt "$CHANGE" "$CHANGE_DIR")" 2>"$err"; }
   # `codex exec resume` takes no --sandbox flag, so force read-only via config —
   # otherwise a resumed review could inherit a workspace-write policy and mutate the repo.
   _codex_resume() { codex exec resume "$1" -m "$REVIEW_MODEL" -c sandbox_mode='"read-only"' \
-    --skip-git-repo-check -o "$msg" "$(review_prompt "$CHANGE")" 2>"$err"; }
+    --skip-git-repo-check -o "$msg" "$(review_prompt "$CHANGE" "$CHANGE_DIR")" 2>"$err"; }
   set +e
   if [ -n "$csid" ]; then resuming=1; raw="$(_codex_resume "$csid")"; else raw="$(_codex_fresh)"; fi
   rc=$?
@@ -554,21 +602,48 @@ final_block() {
 }
 
 main() {
-  # Select the single change under review: the armed workstream marker (set by
-  # `review-gate start` / the apply workflow) when present; else, for ad-hoc manual
-  # runs, the most recently modified change. Empty → generic "uncommitted changes".
-  CHANGE=""
-  [ -f "$ACTIVE_MARKER" ] && CHANGE="$(tr -d '\n' < "$ACTIVE_MARKER" 2>/dev/null || true)"
-  if [ -z "$CHANGE" ]; then
-    CHANGE="$(active_change || true)"   # never abort under set -e/pipefail when zero non-archived changes
-    local nchanges; nchanges="$(active_changes | grep -c . || true)"
-    [ "${nchanges:-0}" -gt 1 ] && echo "review-gate: $nchanges non-archived changes found — reviewing the most recently modified: ${CHANGE:-<none>}." >&2
+  # Select the single change under review. A manual `review-gate start <change>`
+  # sets REVIEW_CHANGE_OVERRIDE: a one-shot target that does NOT read or write the
+  # armed marker, resolving its directory whether the change is active or archived.
+  # Otherwise: the armed workstream marker (set by `start-auto-review` / the apply
+  # workflow) when present; else, for ad-hoc runs, the most recently modified
+  # change. Empty → generic "uncommitted changes".
+  CHANGE=""; CHANGE_DIR=""
+  local full_run=1; [ "$REVIEW_START_STAGE" = 2 ] && full_run=0
+  if [ -n "$REVIEW_CHANGE_OVERRIDE" ]; then
+    CHANGE="$REVIEW_CHANGE_OVERRIDE"
+    local rrc=0; CHANGE_DIR="$(resolve_change_dir "$CHANGE")" || rrc=$?
+    if [ "$rrc" = 2 ]; then exit 1; fi   # ambiguous — candidates already listed
+    [ "$rrc" = 0 ] || die "change '$CHANGE' not found under openspec/changes/ (active or archived) — cannot review."
+  else
+    [ -f "$ACTIVE_MARKER" ] && CHANGE="$(tr -d '\n' < "$ACTIVE_MARKER" 2>/dev/null || true)"
+    if [ -z "$CHANGE" ]; then
+      CHANGE="$(active_change || true)"   # never abort under set -e/pipefail when zero non-archived changes
+      local nchanges; nchanges="$(active_changes | grep -c . || true)"
+      [ "${nchanges:-0}" -gt 1 ] && echo "review-gate: $nchanges non-archived changes found — reviewing the most recently modified: ${CHANGE:-<none>}." >&2
+    fi
+    # Resolve the artifacts dir. Normally the armed/most-recent change is active, but
+    # a marker that names a change already archived (e.g. a direct run before the
+    # guard clears it) must still point the prompt at the archived artifacts (D4).
+    # This selection path must never fail closed, so an unresolvable name falls back
+    # to naming its (expected) active dir rather than aborting.
+    if [ -n "$CHANGE" ]; then
+      if [ -d "openspec/changes/$CHANGE" ]; then
+        CHANGE_DIR="openspec/changes/$CHANGE"
+      else
+        local mrc=0; CHANGE_DIR="$(resolve_change_dir "$CHANGE")" || mrc=$?
+        if [ "$mrc" = 2 ]; then exit 1; fi                      # ambiguous — candidates already listed
+        [ "$mrc" = 0 ] || CHANGE_DIR="openspec/changes/$CHANGE" # not found — name it anyway (non-fatal)
+      fi
+    fi
   fi
 
   # ---- Full-review cache: if this exact change passed a full clean review on this
   # exact content, skip the ENTIRE review — no reviewer runs. Keyed by change +
-  # fingerprint, so a different change with identical content is not covered. ----
-  if final_pass_matches; then
+  # fingerprint, so a different change with identical content is not covered. A
+  # forced manual run (REVIEW_FORCE, from `review-gate start`) skips this check and
+  # always reviews afresh. ----
+  if [ -z "$REVIEW_FORCE" ] && final_pass_matches; then
     echo "review-gate: review cached (nothing changed since the last clean pass) — skipping the review."
     exit 0
   fi
@@ -587,7 +662,13 @@ main() {
   # rate-limited skip is cacheable (the final reviewer is authoritative), but a
   # max-rounds BAIL is not — its blocking findings are unresolved, so caching over
   # them would permanently hide them on later cached runs.
+  # A manual `review-gate start 2` starts at the final stage: skip stage 1 entirely
+  # (and, being a partial run, never write the full-pass cache — see below).
   local rc=0 cheap_cacheable=1 cheap_desc="cheap $CHEAP_REVIEW_MODEL"
+  if [ "$full_run" = 0 ]; then
+    cheap_desc="cheap stage skipped (start 2 — final reviewer only)"
+    echo "review-gate: manual start at stage 2 — running only the final reviewer." >&2
+  else
   run_claude_stage "$CHEAP_REVIEW_MODEL" cheap 0 || rc=$?
   if [ "$rc" -eq 4 ]; then
     cheap_desc="cheap stage skipped (rate-limited)"
@@ -609,12 +690,13 @@ main() {
   else
     write_counter cheap 0
   fi
+  fi
 
   # ---- Stage 2: expensive final reviewer — Codex if it has tokens, else Claude Opus ----
   if [ "$codex_ok" -eq 1 ]; then
     local crc=0; run_codex || crc=$?
     case "$crc" in
-      0) write_counter final 0; if [ "$cheap_cacheable" = 1 ]; then write_final_pass; fi; echo "Review clean ($cheap_desc + Codex)."; exit 0 ;;
+      0) write_counter final 0; if [ "$full_run" = 1 ] && [ "$cheap_cacheable" = 1 ]; then write_final_pass; fi; echo "Review clean ($cheap_desc + Codex)."; exit 0 ;;
       2) final_block codex ;;
       3) mkdir -p "$CLAUDE_DIR"; printf '%s\n' "$RESET_EPOCH" > "$CODEX_COOLDOWN"
          codex_ok=0 ;;
@@ -627,7 +709,7 @@ main() {
     announce_codex_fallback
     local orc=0; run_claude_stage "$FINAL_CLAUDE_MODEL" final 1 || orc=$?
     case "$orc" in
-      0) write_counter final 0; if [ "$cheap_cacheable" = 1 ]; then write_final_pass; fi; echo "Review clean ($cheap_desc + $FINAL_CLAUDE_MODEL)."; exit 0 ;;
+      0) write_counter final 0; if [ "$full_run" = 1 ] && [ "$cheap_cacheable" = 1 ]; then write_final_pass; fi; echo "Review clean ($cheap_desc + $FINAL_CLAUDE_MODEL)."; exit 0 ;;
       2) final_block "$FINAL_CLAUDE_MODEL" ;;
       4) loud_banner \
            "NO FINAL REVIEW PERFORMED — Codex and Claude are both rate-limited." \
