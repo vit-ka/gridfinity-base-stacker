@@ -67,13 +67,23 @@ sync_from_canonical() {
   canon_root="$(cd "$canon" && pwd -P)"
   repo_root="$(pwd -P)"
   [ "$canon_root" != "$repo_root" ] || return 0    # don't sync the canonical repo onto itself
-  local name src dst
+  local name src dst tmp
   for name in "${MANAGED_SCRIPTS[@]}"; do
     src="$canon_root/scripts/$name"
     dst="$ROOT/scripts/$name"
     [ -f "$src" ] || continue
     if ! cmp -s "$src" "$dst"; then
-      cp -p "$src" "$dst"                           # canonical content + mode wins
+      # Replace via a same-dir temp + atomic rename — NEVER an in-place cp. This
+      # hook syncs ITSELF (review-gate-hook.sh is a managed script), and rewriting
+      # the running script's inode mid-execution corrupts bash's byte-offset read of
+      # it (a syntax error partway through) and skips the review that run. A rename
+      # swaps the directory entry to a NEW inode, so the already-running process
+      # keeps reading the old (now-unlinked) inode to completion; the update takes
+      # effect on the next run. cp -p carries canonical's content + mode onto the
+      # temp, and the temp shares dst's directory so the rename stays on one
+      # filesystem (a precondition for atomicity).
+      tmp="$dst.tmp.$$"
+      cp -p "$src" "$tmp" && mv -f "$tmp" "$dst" || { rm -f "$tmp"; continue; }
       echo "review-gate: synced scripts/$name from canonical ($canon_root)." >&2
     fi
   done
