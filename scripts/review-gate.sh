@@ -136,10 +136,12 @@ sha256() {
 # The uncommitted changes, used to compute the Codex-pass cache fingerprint. The
 # gate's own transient files (.claude/.review-gate-*) are skipped so they cannot
 # perturb the fingerprint — otherwise writing the cache would change the next
-# run's fingerprint and the cache would never hit in a repo that does not
-# git-ignore them.
+# run's fingerprint and the cache would never hit. They are excluded from BOTH the
+# tracked diff and the untracked listing: if a repo committed them before adopting
+# the gitignore they show up in `git diff HEAD`, and their churn every run would
+# otherwise defeat the cache entirely.
 diff_content() {
-  git diff HEAD 2>/dev/null || true
+  git diff HEAD -- ':(exclude,glob).claude/.review-gate-*' 2>/dev/null || git diff HEAD 2>/dev/null || true
   git ls-files --others --exclude-standard -z 2>/dev/null | while IFS= read -r -d '' f; do
     case "$f" in .claude/.review-gate-*) continue ;; esac
     printf '\n===== untracked: %s =====\n' "$f"
@@ -267,6 +269,8 @@ parse_verdict() {
     echo "review-gate: [$label] could not parse a JSON review result." >&2
     echo "review-gate: [$label] stderr follows:" >&2
     sed "s/^/  $label: /" "$err" >&2 2>/dev/null || true
+    echo "review-gate: [$label] raw output follows (truncated):" >&2
+    { { [ -s "$msg" ] && cat "$msg"; printf '%s' "$raw"; } | head -c 2000; echo; } | sed "s/^/  $label> /" >&2
     exit 1
   fi
   if ! printf '%s' "$json" | jq -e '.findings | all(
@@ -336,25 +340,26 @@ run_claude_stage() {
   # closed (mirrors why we avoid --permission-mode). Only persist a session when a
   # session-flagged call actually succeeds.
   if [ "$rc" -ne 0 ] && [ "$use_session" -eq 1 ]; then
-    local rscan; rscan="$(mktemp)"; { cat "$err" 2>/dev/null; printf '\n%s\n' "$raw"; } > "$rscan"
-    if ! is_limit "$rscan"; then
+    # Limit detection scans ONLY stderr: claude prints usage limits there, while
+    # the review's own findings (stdout) can legitimately contain words like
+    # 'rate limit' or '429' and must not be mistaken for a limit.
+    if ! is_limit "$err"; then
       echo "review-gate: [$stage] session call failed — retrying without a session." >&2
       : > "$err"
       raw="$(review_prompt "$CHANGE" | SKIP_REVIEW_GATE=1 claude "${cflags[@]}" 2>"$err")"
       rc=$?; use_session=0
     fi
-    rm -f "$rscan"
   fi
   set -e
   if [ "$rc" -ne 0 ]; then
     # A Claude usage/session/rate limit is not a review failure — surface it so the
     # gate degrades with a clear message instead of a scary "failed review".
-    local scan; scan="$(mktemp)"; { cat "$err" 2>/dev/null; printf '\n%s\n' "$raw"; } > "$scan"
-    if is_limit "$scan"; then
-      CLAUDE_RESET_EPOCH="$(parse_reset_epoch "$scan")"
-      rm -f "$err" "$msg" "$scan"; return 4
+    # Scan ONLY stderr (see the retry note above): the review's own findings on
+    # stdout can contain limit-ish words and must not trip this.
+    if is_limit "$err"; then
+      CLAUDE_RESET_EPOCH="$(parse_reset_epoch "$err")"
+      rm -f "$err" "$msg"; return 4
     fi
-    rm -f "$scan"
     echo "review-gate: [$stage] 'claude -p' exited $rc — treating as a failed review (fail-closed)." >&2
     sed "s/^/  $stage: /" "$err" >&2 2>/dev/null || true
     rm -f "$err" "$msg"; exit 1
@@ -427,26 +432,21 @@ run_codex() {
   if [ -n "$csid" ]; then resuming=1; raw="$(_codex_resume "$csid")"; else raw="$(_codex_fresh)"; fi
   rc=$?
   # Fail-safe: a failed resume that is not a usage limit → retry once fresh.
+  # Limit detection scans ONLY stderr: Codex prints usage limits there, while the
+  # review's own findings (stdout / -o file) can legitimately contain words like
+  # "rate limit" or "429" and must not be mistaken for a limit.
   if [ "$rc" -ne 0 ] && [ "$resuming" -eq 1 ]; then
-    local rscan; rscan="$(mktemp)"; { cat "$err" 2>/dev/null; printf '\n%s\n' "$raw"; cat "$msg" 2>/dev/null; } > "$rscan"
-    if ! is_limit "$rscan"; then
+    if ! is_limit "$err"; then
       echo "review-gate: [codex] resume failed — starting a fresh review session." >&2
       : > "$err"; raw="$(_codex_fresh)"; rc=$?; resuming=0
     fi
-    rm -f "$rscan"
   fi
   set -e
   if [ "$rc" -ne 0 ]; then
-    # A usage/limit message may surface on stderr, stdout, or the -o last-message
-    # file (the weekly-limit channel is not known), so scan all three combined —
-    # a missed limit would wrongly fail closed and reintroduce the mid-change stall.
-    local scan; scan="$(mktemp)"
-    { cat "$err" 2>/dev/null; printf '\n%s\n' "$raw"; cat "$msg" 2>/dev/null; } > "$scan"
-    if is_limit "$scan"; then
-      RESET_EPOCH="$(parse_reset_epoch "$scan")"
-      rm -f "$err" "$msg" "$scan"; return 3
+    if is_limit "$err"; then
+      RESET_EPOCH="$(parse_reset_epoch "$err")"
+      rm -f "$err" "$msg"; return 3
     fi
-    rm -f "$scan"
     echo "review-gate: [codex] 'codex exec' exited $rc — treating as a failed review (fail-closed)." >&2
     sed 's/^/  codex: /' "$err" >&2 2>/dev/null || true
     rm -f "$err" "$msg"; exit 1
@@ -494,6 +494,16 @@ main() {
     [ "${nchanges:-0}" -gt 1 ] && echo "review-gate: $nchanges non-archived changes found — reviewing the most recently modified: ${CHANGE:-<none>}." >&2
   fi
 
+  # ---- Full-review cache: if nothing has changed since the last clean pass (both
+  # stages passed on this exact diff), skip the ENTIRE review — no reviewer runs. ----
+  if [ -f "$FINAL_PASS" ]; then
+    local fp cur; fp="$(cat "$FINAL_PASS" 2>/dev/null || true)"; cur="$(diff_fingerprint)"
+    if [ -n "$fp" ] && [ "$fp" = "$cur" ]; then
+      echo "review-gate: review cached (nothing changed since the last clean pass) — skipping the review."
+      exit 0
+    fi
+  fi
+
   # Is Codex on cooldown from an earlier limit? While so, the FINAL reviewer is
   # Claude ($FINAL_CLAUDE_MODEL) instead of Codex.
   local codex_ok=1
@@ -523,15 +533,6 @@ main() {
     fi
   else
     write_counter cheap 0
-  fi
-
-  # ---- Final-pass cache: skip the expensive reviewer while the diff is unchanged ----
-  if [ -f "$FINAL_PASS" ]; then
-    local fp cur; fp="$(cat "$FINAL_PASS" 2>/dev/null || true)"; cur="$(diff_fingerprint)"
-    if [ -n "$fp" ] && [ "$fp" = "$cur" ]; then
-      echo "review-gate: final review cached (diff unchanged since last clean pass) — skipping the expensive stage."
-      exit 0
-    fi
   fi
 
   # ---- Stage 2: expensive final reviewer — Codex if it has tokens, else Claude Opus ----
