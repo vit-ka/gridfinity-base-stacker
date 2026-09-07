@@ -14,7 +14,10 @@ the working state, committed and uncommitted alike — so committing already-rev
 work does not trigger a re-review and an unchanged change returns instantly from
 cache. The scripts are kept in sync from the shared checkout at
 `${REVIEW_GATE_HOME:-~/Projects/openspec-codex-gate}` on each run — edit them
-there, not here.
+there, not here. The hooks are wired via `$CLAUDE_PROJECT_DIR` so they resolve from
+any working directory; a change to how the hooks are wired reaches this repo only on
+a re-bootstrap (the `.claude/settings.json` wiring is not auto-synced, unlike the
+scripts).
 
 **Starting work?** Arm the gate for your change (the `/openspec-apply-change`
 flow does this for you):

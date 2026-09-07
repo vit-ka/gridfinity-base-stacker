@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash scripts/review-gate-hook.sh",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/review-gate-hook.sh\"",
             "timeout": 600
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash scripts/review-gate-arm.sh",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/review-gate-arm.sh\"",
             "timeout": 30
           }
         ]
