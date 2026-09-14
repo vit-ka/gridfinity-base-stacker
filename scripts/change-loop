@@ -1,0 +1,1731 @@
+#!/usr/bin/env python3
+"""change-loop — host-invoked helper actions for the $change loop.
+
+Managed file: change-loop-managed-file. — host-invoked helper actions for the $change loop.
+
+The host coordinates ONLY by invoking these explicit actions in sequence:
+  init | persist-input | show-input | check-input | run-plan |
+  run-plan-review | run-code | run-code-review | record-verdict | status |
+  history | reset-rounds | check-provider | fingerprint-plan |
+  fingerprint-code | import-provenance | lock-recover
+
+No hooks. No fallback providers. No homemade OpenSpec scaffolding.
+Exit codes: 0 = clean / handoff recorded (stop is allowed),
+            2 = blocking findings recorded, 1 = misuse / misconfiguration,
+            3 = change locked by another run.
+
+Env: CHANGE_LOOP_ROOT (repo root, default: this checkout's root),
+     CHANGE_LOOP_STORE (openspec store id), CHANGE_LOOP_DRIVER=fixture +
+     CHANGE_LOOP_FIXTURE_DIR (offline tests), per-action --model/--effort
+     flags plus --fresh (deliberately mint a new session).
+"""
+
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "lib"))
+
+from changeloop import (EXIT_BLOCKING, EXIT_LOCKED, EXIT_MISUSE, EXIT_OK,
+                        MAX_ROUNDS, PROVIDERS_ALL)
+from changeloop import openspec as OS
+from changeloop import providers as PV
+from changeloop import state as ST
+
+ACTION_ROLE = {
+    "run-plan": ("planWriter", "plan-writer", PV.AUTHOR),
+    "run-plan-review": ("planReviewer", "plan-review", PV.REVIEWER),
+    "run-code": ("coder", "coder", PV.AUTHOR),
+    "run-code-review": ("codeReviewer", "code-review", PV.REVIEWER),
+}
+
+SCOPE_STEP = {"plan-review": "plan", "code-review": "code"}
+REVIEW_PENDING = {"plan-review": "plan-review", "code-review": "code-review"}
+PENDING_AFTER_AUTHOR = {"run-plan": "plan-review", "run-code": "code-review"}
+
+
+def usage():
+    sys.stderr.write(
+        "usage: change-loop <action> [args]\n"
+        "  init <change> <plan-writer> <plan-reviewer> <coder> <code-reviewer>\n"
+        "    (each role: provider or provider:model, e.g. codex:gpt-6-astra)\n"
+        "  persist-input <change> [--prose TEXT|--prose-file F] "
+        "[--decisions-file F]... [--artifact PATH]...\n"
+        "  show-input <change> | check-input <change>\n"
+        "  run-plan [--model M] [--effort E] [--fresh] <change>\n"
+        "  run-plan-review [--model M] [--effort E] [--fresh] <change>\n"
+        "  run-code [--model M] [--effort E] [--fresh] <change>\n"
+        "  run-code-review [--model M] [--effort E] [--fresh] <change>\n"
+        "    (every role invocation needs an explicit model: the init\n"
+        "    mapping or --model; missing models refuse before invocation —\n"
+        "    the loop never defaults or falls back. Effort is explicit on\n"
+        "    every invocation: reviewers medium, authors high, each\n"
+        "    overridable via --effort; never an ambient CLI default.\n"
+        "    --fresh deliberately mints a new session instead of resuming\n"
+        "    the stored one.)\n"
+        "  record-verdict <change> <plan-review|code-review> <verdict-file>\n"
+        "  status [--json] <change>\n"
+        "  history [--plain] <change>\n"
+        "  reset-rounds <change> --confirm\n"
+        "  check-provider <provider>\n"
+        "  fingerprint-plan <change> | fingerprint-code\n"
+        "  import-provenance <change> --consumed N --source TEXT [--note TEXT]\n"
+        "  lock-recover <change>\n")
+    return EXIT_MISUSE
+
+
+def _parse_role_token(token):
+    """Split a role argument into (provider, model); model may be ''."""
+    if ":" in token:
+        provider, _, model = token.partition(":")
+        return provider.strip(), model.strip()
+    return token.strip(), ""
+
+
+def _cli_command(*args):
+    """Render the exact followup CLI command (selected store placed per
+    real CLI help: behind the subcommand, nested for new change — never
+    a global prefix)."""
+    return " ".join(OS.argv_for(None, *args))
+
+
+def _resolved_artifact_block(root, change):
+    """The CLI-resolved artifact files, so same-named changes in other
+    stores cannot be mistaken for this round's content."""
+    try:
+        files = OS.artifact_files(root, change)
+    except ST.LoopError:
+        files = []
+    if not files:
+        return "  (no CLI-resolved artifact files)"
+    return "\n".join("  %s" % path for path in files)
+
+
+def _review_prompt(root, change, kind, plan_fp, code_fp):
+    return (
+        "You are the %s reviewer for OpenSpec change '%s'.\n"
+        "Review ONLY the current content. You MUST NOT modify any files, "
+        "run writers, execute hooks, or change configuration: read-only "
+        "review.\n"
+        "%s"
+        "Resolve artifacts ONLY in the selected store above — the same "
+        "change name may exist elsewhere with different content:\n"
+        "  %s\n"
+        "CLI-resolved artifact files for this round:\n"
+        "%s\n"
+        "Scope fingerprints for this round:\n"
+        "  plan: %s\n"
+        "  code: %s\n"
+        "Severity scale: P0 (blocker), P1 (should fix), P2 (consider), "
+        "P3 (nit).\n"
+        "At the default threshold, P0-P2 findings BLOCK; P3 never blocks.\n"
+        "Limits, errors, or lack of access are NOT verdicts: report status "
+        "\"limit\" or \"error\" with a summary instead.\n"
+        "Emit EXACTLY one JSON object on stdout, no prose wrapper:\n"
+        "{\"status\":\"clean|blocking|error|limit\","
+        "\"findings\":[{\"severity\":\"P0|P1|P2|P3\",\"title\":\"..\","
+        "\"detail\":\"..\"}],\"summary\":\"..\"}\n"
+        % (kind, change, _planning_scope_block(root),
+           _cli_command("status", "--change", change, "--json"),
+           _resolved_artifact_block(root, change), plan_fp, code_fp))
+
+
+def _findings_block(state):
+    findings = state.get("lastFindings") or []
+    if not findings:
+        return ""
+    lines = ["## Reviewer findings to fix (round %d consumed verdict)"
+             % state.get("consumed", 0),
+             "Address EVERY finding below; they blocked the previous round.",
+             ""]
+    for finding in findings:
+        lines.append("- [%s] %s: %s" % (finding.get("severity"),
+                                        finding.get("title"),
+                                        finding.get("detail")))
+    lines.append("")
+    lines.append("The preserved verdict history for this change records the "
+                 "full context.")
+    return "\n".join(lines) + "\n"
+
+
+def _planning_scope_block(root):
+    store = OS.store_id() or "(default OpenSpec root)"
+    return ("Planning root: %s\n"
+            "OpenSpec store: %s\n" % (root, store))
+
+
+def _plan_prompt(root, change, state):
+    with open(ST.input_file(root, change), "r", encoding="utf-8",
+              errors="replace") as fh:
+        context = fh.read()
+    findings = _findings_block(state)
+    if findings:
+        findings = "\n" + findings
+    return (
+        "You are the plan-writer for OpenSpec change '%s'.\n"
+        "Read the plan-writer input context below, then obtain the artifact "
+        "template and instructions via the openspec CLI and write planning "
+        "artifacts ONLY at the CLI-resolved output paths:\n"
+        "  %s\n"
+        "  %s\n"
+        "Acceptance: %s\n"
+        "%s"
+        "CLI-resolved artifact files (selected store only — the same "
+        "change name may exist elsewhere with different content):\n"
+        "%s\n"
+        "Never scaffold change directories by hand; the CLI owns all "
+        "artifact structure.\n"
+        "%s\n"
+        "## Input context\n"
+        "%s\n" % (change,
+                  _cli_command("status", "--change", change, "--json"),
+                  _cli_command("instructions", "<artifact-id>",
+                               "--change", change, "--json"),
+                  _cli_command("validate", change, "--strict"),
+                  _planning_scope_block(root),
+                  _resolved_artifact_block(root, change),
+                  findings, context))
+
+
+def _code_prompt(root, change, state):
+    with open(ST.input_file(root, change), "r", encoding="utf-8",
+              errors="replace") as fh:
+        context = fh.read()
+    findings = _findings_block(state)
+    if findings:
+        findings = "\n" + findings
+    return (
+        "You are the coder for OpenSpec change '%s'.\n"
+        "Implement the approved plan (planning artifacts resolved via "
+        "'%s'; task progress via '%s'). Write implementation code "
+        "only; do not rewrite planning artifacts except as the plan "
+        "requires.\n"
+        "%s"
+        "CLI-resolved artifact files (selected store only):\n"
+        "%s\n"
+        "%s"
+        "Plan-writer input context for reference:\n"
+        "%s\n" % (change,
+                  _cli_command("status", "--change", change, "--json"),
+                  _cli_command("instructions", "apply",
+                               "--change", change, "--json"),
+                  _planning_scope_block(root),
+                  _resolved_artifact_block(root, change),
+                  findings, context))
+
+
+# --- init ---------------------------------------------------------------------
+
+def cmd_init(root, args):
+    if len(args) != 5:
+        sys.stderr.write(
+            "change-loop: $change takes exactly five arguments:\n"
+            "  $change <change-name> <plan-writer> <plan-reviewer> <coder> "
+            "<code-reviewer>\n"
+            "  Valid providers: %s\n"
+            "  (The description is accompanying prose, never a sixth "
+            "positional argument.)\n" % " ".join(PROVIDERS_ALL))
+        return EXIT_MISUSE
+    change, pw, pr, coder, cr = args
+    parsed = [_parse_role_token(token)
+              for token in (pw, pr, coder, cr)]
+    for role, _model in parsed:
+        if not PV.known(role):
+            sys.stderr.write(
+                "change-loop: unknown provider '%s'. Valid providers: %s.\n"
+                "  Expected syntax: $change <change-name> <plan-writer> "
+                "<plan-reviewer> <coder> <code-reviewer>\n"
+                "  Each role takes provider or provider:model "
+                "(e.g. codex:gpt-6-astra).\n"
+                % (role, " | ".join(PROVIDERS_ALL)))
+            return EXIT_MISUSE
+    for _role, model in parsed:
+        if ":" in model:
+            sys.stderr.write(
+                "change-loop: malformed model '%s' (no ':' allowed).\n"
+                % model)
+            return EXIT_MISUSE
+    if not OS.change_name_ok(change):
+        sys.stderr.write(
+            "change-loop: malformed change name '%s' (the openspec CLI will "
+            "not accept it).\n"
+            "  Expected syntax: $change <change-name> <plan-writer> "
+            "<plan-reviewer> <coder> <code-reviewer>\n" % change)
+        return EXIT_MISUSE
+    if not OS.change_exists(root, change):
+        print("change-loop: change '%s' is new — scaffolding via the "
+              "openspec CLI." % change)
+        try:
+            OS.new_change(root, change)
+        except ST.LoopError as exc:
+            sys.stderr.write("change-loop: %s\n" % exc)
+            return EXIT_MISUSE
+    roles = {"planWriter": parsed[0][0], "planReviewer": parsed[1][0],
+             "coder": parsed[2][0], "codeReviewer": parsed[3][0]}
+    models = {"planWriter": parsed[0][1], "planReviewer": parsed[1][1],
+              "coder": parsed[2][1], "codeReviewer": parsed[3][1]}
+    os.makedirs(ST.state_dir(root, change), exist_ok=True)
+    try:
+        with ST.locked(root, change):
+            path = ST.state_file(root, change)
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8") as fh:
+                    state = ST.normalize_state(json.load(fh))
+                current_roles = state.get("roles") or {}
+                mismatched = [k for k in roles
+                              if current_roles.get(k) != roles[k]]
+                if mismatched:
+                    sys.stderr.write(
+                        "change-loop: role mismatch for '%s' (%s); the loop "
+                        "keeps the recorded assignment and preserves rounds. "
+                        "Re-run with the recorded roles, or start a new "
+                        "change name.\n" % (
+                            change,
+                            ", ".join("%s: recorded=%s selected=%s"
+                                      % (k, current_roles.get(k), roles[k])
+                                      for k in mismatched)))
+                    ST.save_state(root, change, state)
+                    return EXIT_MISUSE
+                # Same providers: fill in newly mapped models (a re-init
+                # that adds explicit models never restarts work).
+                stored_models = state.get("models") or {}
+                filled = [k for k in models
+                          if models[k] and stored_models.get(k) != models[k]]
+                for key in filled:
+                    stored_models[key] = models[key]
+                state["models"] = stored_models
+                ST.save_state(root, change, state)
+                if filled:
+                    print("change-loop: loop state for '%s' already exists "
+                          "(preserved); models recorded for %s."
+                          % (change, ", ".join(sorted(filled))))
+                else:
+                    print("change-loop: loop state for '%s' already exists "
+                          "(preserved)." % change)
+                return EXIT_OK
+            consumed, notes = ST.recover_budget(root, change)
+            provenance = []
+            if consumed or notes:
+                provenance.append({
+                    "consumed": consumed,
+                    "source": "durable budget recovery at init: %s" % (
+                        "; ".join(notes) or "no prior rounds"),
+                    "note": "",
+                    "importedAt": ST.now_iso(),
+                })
+            state = ST.blank_state(change, roles, models=models,
+                                   consumed=consumed,
+                                   provenance=provenance)
+            ST.save_state(root, change, state)
+            open(ST.input_file(root, change), "a",
+                 encoding="utf-8").close()
+            if notes:
+                print("change-loop: initialized '%s' (step=plan, "
+                      "budget=%d/%d; recovered: %s)." % (
+                          change, consumed, MAX_ROUNDS, "; ".join(notes)))
+            else:
+                print("change-loop: initialized '%s' (step=plan, "
+                      "budget=0/%d)." % (change, MAX_ROUNDS))
+            return EXIT_OK
+    except ST.LockedError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_LOCKED
+
+
+# --- input context ---------------------------------------------------------------
+
+def _parse_persist_args(change, args):
+    prose = prose_file = None
+    decisions = []
+    artifacts = []
+    items = list(args)
+    while items:
+        flag = items.pop(0)
+        if flag == "--prose" and items:
+            prose = items.pop(0)
+        elif flag == "--prose-file" and items:
+            prose_file = items.pop(0)
+        elif flag == "--decisions-file" and items:
+            decisions.append(items.pop(0))
+        elif flag == "--artifact" and items:
+            artifacts.append(items.pop(0))
+        else:
+            raise ST.LoopError("unknown persist-input flag '%s'." % flag)
+    return prose, prose_file, decisions, artifacts
+
+
+def _read_text_file(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError as exc:
+        raise ST.LoopError("cannot read '%s': %s" % (path, exc))
+
+
+def _compose_input(root, change, prose, prose_file, decisions, artifacts):
+    parts = ["# Plan-writer input context for %s\n" % change]
+    if prose_file:
+        parts.append(_read_text_file(prose_file))
+    elif prose:
+        parts.append(prose + "\n")
+    for path in decisions:
+        parts.append("\n## Agreed exploration decisions (%s)\n\n%s"
+                     % (path, _read_text_file(path)))
+    snapshots = {}
+    for ref in artifacts:
+        full = ref if os.path.isabs(ref) else os.path.join(root, ref)
+        if not os.path.isfile(full):
+            raise ST.LoopError("referenced artifact '%s' does not exist." %
+                               ref)
+        try:
+            digest = ST.file_hash(full)
+        except OSError as exc:
+            raise ST.LoopError("cannot read referenced artifact '%s': %s" %
+                               (ref, exc))
+        snapshots[ref] = digest
+        parts.append("\n## Referenced artifact: %s (sha256:%s)\n" % (ref,
+                                                                    digest))
+    return "".join(parts), snapshots
+
+
+def cmd_persist_input(root, change, args):
+    try:
+        ST.require_change(root, change)
+        prose, prose_file, decisions, artifacts = _parse_persist_args(
+            change, args)
+        content, snapshots = _compose_input(root, change, prose, prose_file,
+                                            decisions, artifacts)
+    except ST.LoopError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_MISUSE
+    try:
+        with ST.locked(root, change):
+            state = ST.normalize_state(ST.load_state(root, change))
+            current = ""
+            if os.path.isfile(ST.input_file(root, change)):
+                current = _read_text_file(ST.input_file(root, change))
+            if current == content and state.get("inputArtifacts") == snapshots:
+                print("change-loop: input context for '%s' unchanged — step "
+                      "and verdicts untouched." % change)
+                ST.save_state(root, change, state)
+                return EXIT_OK
+            with open(ST.input_file(root, change), "w",
+                      encoding="utf-8") as fh:
+                fh.write(content)
+            state["inputArtifacts"] = snapshots
+            # New input supersedes every in-flight review: bump the input
+            # revision and clear pendings so a verdict recovered against
+            # the old request can never approve (acceptance binds the
+            # pending's revision to this one).
+            state["inputRevision"] = state.get("inputRevision", 0) + 1
+            state["pending"] = None
+            if state["approvals"].get("plan") is not None:
+                state["approvals"] = {"plan": None, "code": None,
+                                      "codePlan": None}
+                state["step"] = "plan"
+                ST.history_record(
+                    root, change, "input-context", None,
+                    "substantive input-context update after plan approval: "
+                    "routed next to plan-writer; plan/code approvals "
+                    "invalidated; sessions and consumed rounds preserved.")
+                ST.save_state(root, change, state)
+                print("change-loop: input context updated for '%s' — next "
+                      "step is plan-writer; dependent approvals invalidated "
+                      "(sessions/rounds preserved)." % change)
+                return EXIT_OK
+            if state.get("step") in ("handoff", "done"):
+                if state.get("step") == "done":
+                    state["approvals"] = {"plan": None, "code": None,
+                                          "codePlan": None}
+                if not state.get("exhausted"):
+                    state["step"] = "plan"
+                state["resumeStep"] = None
+                ST.history_record(
+                    root, change, "input-context", None,
+                    "input-context persisted over handoff/done: routed "
+                    "next to plan-writer.")
+                ST.save_state(root, change, state)
+                print("change-loop: input context persisted for '%s' — next "
+                      "step is plan-writer." % change)
+                return EXIT_OK
+            if state.get("step") in ("plan-review", "code-review"):
+                # New prose arrived after run-plan but before review: the
+                # recorded plan no longer reflects the request, so route
+                # next to the plan-writer instead of reviewing superseded
+                # content (and possibly burning a blocking round on it).
+                state["approvals"] = {"plan": None, "code": None,
+                                      "codePlan": None}
+                state["step"] = "plan"
+                ST.history_record(
+                    root, change, "input-context", None,
+                    "substantive input-context update at review-pending "
+                    "step: routed next to plan-writer; plan/code approvals "
+                    "invalidated; sessions and consumed rounds preserved.")
+                ST.save_state(root, change, state)
+                print("change-loop: input context updated for '%s' — next "
+                      "step is plan-writer; dependent approvals invalidated "
+                      "(sessions/rounds preserved)." % change)
+                return EXIT_OK
+            ST.history_record(
+                root, change, "input-context", None,
+                "input-context persisted/superseded for subsequent "
+                "plan-writer invocations.")
+            ST.save_state(root, change, state)
+            print("change-loop: input context persisted for '%s'." % change)
+            return EXIT_OK
+    except ST.LockedError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_LOCKED
+
+
+def cmd_show_input(root, change):
+    try:
+        ST.require_change(root, change)
+        sys.stdout.write(_read_text_file(ST.input_file(root, change)))
+        return EXIT_OK
+    except ST.LoopError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_MISUSE
+
+
+def input_present(root, change):
+    try:
+        body = _read_text_file(ST.input_file(root, change))
+    except ST.LoopError:
+        return False
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return True
+    return False
+
+
+def cmd_check_input(root, change):
+    try:
+        ST.require_change(root, change)
+    except ST.LoopError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_MISUSE
+    if input_present(root, change):
+        print("change-loop: input context present for '%s'." % change)
+        return EXIT_OK
+    sys.stderr.write(
+        "change-loop: no usable description or exploration context for "
+        "'%s'.\n"
+        "  Ask what to build BEFORE invoking any provider; never invent "
+        "scope from the change name.\n" % change)
+    return EXIT_BLOCKING
+
+
+# --- provider steps ------------------------------------------------------------
+# The whole step — eligibility, invocation, acceptance — runs under ONE lock
+# hold, so concurrent helpers serialize and the budget cannot be double-spent.
+
+def _current_fingerprints(root, change):
+    files = OS.artifact_files(root, change)
+    plan_fp = ST.plan_fingerprint(root, files)
+    code_fp = ST.code_fingerprint(root)
+    return plan_fp, code_fp
+
+
+def _artifacts_snapshot_ok(root, state):
+    """Re-hash referenced input artifacts; False when they changed."""
+    for ref, digest in (state.get("inputArtifacts") or {}).items():
+        full = ref if os.path.isabs(ref) else os.path.join(root, ref)
+        try:
+            current = ST.file_hash(full)
+        except OSError:
+            return False
+        if current != digest:
+            return False
+    return True
+
+
+def _refresh_locked(root, change, state):
+    plan_fp, code_fp = _current_fingerprints(root, change)
+    artifacts_ok = _artifacts_snapshot_ok(root, state)
+    invalidated = ST.refresh_approvals(state, plan_fp, code_fp,
+                                       artifacts_ok=artifacts_ok)
+    return plan_fp, code_fp, invalidated
+
+
+def _refresh_input_snapshot(root, state):
+    """Re-hash referenced input artifacts after they changed.
+
+    Returns (changed, unreadable): changed is True when at least one
+    saved digest was refreshed to new bytes; refs that are now
+    missing/unreadable keep their stale digest (still invalid next
+    round) and are named in unreadable.
+    """
+    snapshots = dict(state.get("inputArtifacts") or {})
+    unreadable = []
+    changed = False
+    for ref, old in snapshots.items():
+        full = ref if os.path.isabs(ref) else os.path.join(root, ref)
+        try:
+            if not os.path.isfile(full):
+                unreadable.append(ref)
+                continue
+            digest = ST.file_hash(full)
+        except OSError:
+            unreadable.append(ref)
+            continue
+        if digest != old:
+            snapshots[ref] = digest
+            changed = True
+    state["inputArtifacts"] = snapshots
+    return changed, unreadable
+
+
+def _reroute_for_input_artifacts(root, change, state, step_key,
+                                 always_record=False, verdict=None):
+    """Shared referenced-input invalidation transition.
+
+    A referenced input artifact changed out from under the loop: refresh
+    the saved snapshot to the new bytes, bump the input revision when
+    bytes moved (so a verdict recovered against superseded input can
+    never approve), clear approvals/pending, and route next to the
+    SELECTED plan-writer. Consumed rounds and sessions are preserved.
+    Pre-invocation refresh AND verdict acceptance share this transition
+    so both see the same routing instead of inconsistent branches. An
+    acceptance caller attaches the stale verdict it refused to approve.
+    """
+    changed, unreadable = _refresh_input_snapshot(root, state)
+    if changed:
+        state["inputRevision"] = state.get("inputRevision", 0) + 1
+    rerouted = (state.get("step"), state.get("resumeStep"),
+                state.get("pending"))
+    state["step"] = "plan"
+    state["pending"] = None
+    state["resumeStep"] = None
+    settled = ((not changed) and rerouted == (state.get("step"),
+                                              state.get("resumeStep"),
+                                              state.get("pending")))
+    if always_record or not settled:
+        ST.history_record(
+            root, change, step_key, verdict,
+            "referenced input changed after approval: snapshot "
+            "refreshed (%s); input revision now %d; plan/code "
+            "approvals cleared; routed next to the selected "
+            "plan-writer; consumed rounds preserved (%d/%d)%s."
+            % ("updated" if changed else "unchanged",
+               state.get("inputRevision", 0),
+               state.get("consumed", 0), MAX_ROUNDS,
+               ("; unreadable refs kept stale: %s"
+                % ", ".join(unreadable)) if unreadable else ""))
+    ST.save_state(root, change, state)
+    return changed
+
+
+def _reroute_for_plan_change(root, change, state, step_key, invalidated,
+                               verdict=None):
+    """Shared plan-content invalidation transition.
+
+    Plan-scope edits — coder task updates included — invalidate plan AND
+    code approvals: route legally to plan-review for the SELECTED
+    plan-reviewer with consumed rounds preserved, nothing auto-approved.
+    Routing anywhere else (code) would hit the stale-approval gate and
+    refuse every role action, so pre-invocation refresh AND verdict
+    acceptance share this transition. An acceptance caller attaches the
+    stale verdict it refused to approve.
+    """
+    state["step"] = "plan-review"
+    state["pending"] = None
+    state["resumeStep"] = None
+    ST.history_record(
+        root, change, step_key, verdict,
+        "plan content changed after approval (invalidated: "
+        "%s): plan/code approvals cleared; routed next to "
+        "plan-review for the selected plan-reviewer; consumed "
+        "rounds preserved (%d/%d)."
+        % (invalidated, state.get("consumed", 0), MAX_ROUNDS))
+    ST.save_state(root, change, state)
+
+
+def _check_eligibility(root, change, action, state, plan_fp):
+    """Raise LoopError unless this invocation is the legal next step."""
+    step = state.get("step")
+    if state.get("exhausted"):
+        raise ST.LoopError(
+            "budget exhausted for '%s' — no further invocation; findings "
+            "are preserved for the user." % change)
+    # A non-exhausted handoff (error/limit/interruption) may retry ONLY
+    # the action that was in flight (resumeStep): after a coder failure the
+    # host must re-run the coder, never skip ahead to code review. Handoffs
+    # recorded before resumeStep existed allow any role action.
+    # Every other step must be the action's legal predecessor.
+    retry = (step == "handoff")
+    if retry and state.get("resumeStep") not in (None, action):
+        raise ST.LoopError(
+            "wrong step for %s after handoff: the interrupted '%s' must be "
+            "retried first (run '%s' before any other role action)."
+            % (action, state.get("resumeStep"), state.get("resumeStep")))
+    if action == "run-plan":
+        if step != "plan" and not retry:
+            raise ST.LoopError(
+                "wrong step for run-plan: '%s' (need step 'plan')." % step)
+        if not input_present(root, change):
+            raise ST.LoopError(
+                "no usable description or exploration context for '%s'. Ask "
+                "what to build BEFORE invoking any provider; never invent "
+                "scope from the change name." % change)
+    elif action == "run-plan-review":
+        if step != "plan-review" and not retry:
+            raise ST.LoopError(
+                "wrong step for run-plan-review: '%s' (run-plan first)."
+                % step)
+    elif action == "run-code":
+        if step != "code" and not retry:
+            raise ST.LoopError(
+                "wrong step for run-code: '%s' (need an approved plan)."
+                % step)
+        if state["approvals"].get("plan") != plan_fp:
+            raise ST.LoopError(
+                "plan approval for '%s' is stale or missing — re-run "
+                "plan-review before code." % change)
+    elif action == "run-code-review":
+        if step != "code-review" and not retry:
+            raise ST.LoopError(
+                "wrong step for run-code-review: '%s' (run-code first)."
+                % step)
+        if state["approvals"].get("plan") != plan_fp:
+            raise ST.LoopError(
+                "plan approval for '%s' is stale or missing — re-run "
+                "plan-review before code review." % change)
+    if action in ("run-plan-review", "run-code-review"):
+        files = OS.artifact_files(root, change)
+        if not files:
+            raise ST.LoopError(
+                "no plan content for '%s': the CLI resolves no artifact "
+                "files (run-plan first)." % change)
+
+
+def _record_handoff(root, change, state, step_key, note, action=None):
+    path = ST.history_record(root, change, step_key, None, note)
+    state["step"] = "handoff"
+    state["pending"] = None
+    # Only the in-flight action may resume after this handoff.
+    state["resumeStep"] = action
+    ST.save_state(root, change, state)
+    print("change-loop: %s" % note)
+    print("  Recorded: %s" % path)
+    if action:
+        print("  Resume with: scripts/change-loop %s %s" % (action, change))
+
+
+def _record_usage(root, change, state, action, provider, model, role,
+                  session, mode, out_path, effort=""):
+    """Print one invocation's token usage and persist it durably."""
+    try:
+        record = PV.extract_usage(provider, out_path, model=model,
+                                  role=role, session=session or "",
+                                  action=action, mode=mode, effort=effort)
+    except Exception as exc:  # never let telemetry break the loop
+        record = {"provider": provider, "model": model or "",
+                  "role": role or "", "action": action or "",
+                  "session": session or "", "mode": mode or "",
+                  "effort": effort or "",
+                  "known": False, "input_total": None,
+                  "input_cached_read": None, "input_cache_write": None,
+                  "input_uncached": None, "output": None, "reasoning": None,
+                  "total": None, "cost_usd": None, "turns": None,
+                  "raw": None, "note": "usage parse failed: %s" % exc}
+    print(PV.format_usage(record))
+    try:
+        ST.append_usage(root, change, state, record)
+    except OSError as exc:
+        print("change-loop: WARNING: usage not persisted (%s)" % exc)
+
+
+_REVIEW_ACTION = {"plan-review": "run-plan-review",
+                  "code-review": "run-code-review"}
+
+
+def _run_provider_step(root, action, change, model, effort="", fresh=False):
+    role_key, session_key, role = ACTION_ROLE[action]
+    try:
+        ST.require_change(root, change)
+    except ST.LoopError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_MISUSE
+    try:
+        with ST.locked(root, change):
+            state = ST.normalize_state(ST.load_state(root, change))
+            live = ST.live_invocation(root, change)
+            if live is not None:
+                # A previous invocation tree outlived its helper (the
+                # kernel lock releases on helper death): refuse to
+                # overlap it rather than double-invoke or double-spend.
+                sys.stderr.write(
+                    "change-loop: a previous '%s' invocation tree "
+                    "(process group %d) is still active — refusing to "
+                    "overlap it. Retry after it exits; if the record is "
+                    "known stale, remove %s.\n"
+                    % (change, live, ST.invocation_file(root, change)))
+                return EXIT_LOCKED
+            provider = (state.get("roles") or {}).get(role_key)
+            if not PV.known(provider):
+                _record_handoff(
+                    root, change, state, session_key,
+                    "recorded role '%s' names unknown provider '%s' — "
+                    "incomplete handoff, no fallback invoked."
+                    % (role_key, provider),
+                    action=action)
+                return EXIT_MISUSE
+            if not model:
+                model = (state.get("models") or {}).get(role_key) or ""
+            if not model:
+                # Explicit models only: refuse BEFORE any provider runs.
+                sys.stderr.write(
+                    "change-loop: no model selected for role '%s' "
+                    "(provider '%s').\n"
+                    "  Remediation: re-run init with '%s:MODEL' for that "
+                    "role, or pass --model MODEL on this action; the loop "
+                    "never silently defaults or falls back to another "
+                    "model.\n" % (role_key, provider, provider))
+                ST.save_state(root, change, state)
+                return EXIT_MISUSE
+            state["models"][role_key] = model
+            # Explicit effort on every invocation: --effort wins, then the
+            # recorded role effort, else reviewers medium / authors high.
+            # The resolved level is recorded (like the model) and bound
+            # into session identity below; it is NEVER an ambient default.
+            if not effort:
+                effort = (state.get("efforts") or {}).get(role_key) or ""
+            if not effort:
+                effort = (PV.EFFORT_REVIEWER_DEFAULT
+                          if role == PV.REVIEWER
+                          else PV.EFFORT_AUTHOR_DEFAULT)
+            state["efforts"][role_key] = effort
+            try:
+                PV.check(provider)
+            except PV.ProviderError as exc:
+                _record_handoff(
+                    root, change, state, session_key,
+                    "selected provider '%s' unavailable (%s) — incomplete "
+                    "handoff, no fallback invoked." % (provider, exc),
+                    action=action)
+                return EXIT_MISUSE
+            try:
+                plan_fp, code_fp, _inv = _refresh_locked(root, change, state)
+            except ST.LoopError as exc:
+                _record_handoff(root, change, state, session_key,
+                                "fingerprint failure before invocation (%s) "
+                                "— incomplete handoff, refusing to approve "
+                                "anything." % exc,
+                                action=action)
+                return EXIT_MISUSE
+            if _inv == "input-artifacts":
+                # Changed REFERENCED input is a semantic input revision,
+                # not a plan artifact edit: the shared transition refreshes
+                # the saved snapshot, bumps the input revision (so a verdict
+                # recovered against superseded input can never approve),
+                # and routes to the SELECTED plan-writer — never to
+                # plan-review against a stale snapshot.
+                _reroute_for_input_artifacts(root, change, state,
+                                             session_key)
+            elif (_inv == "plan"
+                    and (state.get("step")
+                         in ("code", "code-review", "done")
+                         or (state.get("step") == "handoff"
+                             and state.get("resumeStep")
+                             in ("run-code", "run-code-review")))):
+                # Legitimate plan-scope edits — coder task updates
+                # included — invalidate approvals instead of deadlocking.
+                # Handoffs parked on an interrupted coder retry
+                # (run-code/run-code-review) and completed loops whose
+                # plan changed underneath re-enter review the same way,
+                # so no failure state refuses all four role actions.
+                _reroute_for_plan_change(root, change, state, session_key,
+                                         _inv)
+            try:
+                _check_eligibility(root, change, action, state, plan_fp)
+            except ST.LoopError as exc:
+                sys.stderr.write("change-loop: %s\n" % exc)
+                ST.save_state(root, change, state)
+                return EXIT_MISUSE
+            stored = (state.get("sessions") or {}).get(session_key) or {}
+            if (not fresh and stored.get("provider") == provider
+                    and stored.get("model") == model
+                    and stored.get("effort") == effort
+                    and stored.get("id")):
+                # Matching identity (change, role-step, provider, model,
+                # effort) resumes its dedicated session — muse, codex,
+                # AND claude (`--resume` in the same workspace, prompt on
+                # stdin). A resume the CLI cannot find hands off with the
+                # stored session preserved (fail closed below): never a
+                # silent fresh session, never a fallback provider.
+                mode, session_id = "resume", stored["id"]
+            else:
+                mode, session_id = "fresh", None
+                if provider in ("muse", "claude"):
+                    session_id = PV.new_session_id()
+            print("change-loop: invoking '%s' for '%s' with provider '%s' "
+                  "model '%s' effort '%s' (%s session '%s')."
+                  % (action, change, provider, model, effort, mode,
+                     session_id or "new"))
+            is_review = action in ("run-plan-review", "run-code-review")
+            if is_review:
+                state["pending"] = {
+                    "step": session_key,
+                    "planFp": plan_fp,
+                    "codeFp": (code_fp if action == "run-code-review"
+                               else None),
+                    "provider": provider,
+                    "model": model,
+                    "effort": effort,
+                    "session": session_id,
+                    "inputRev": state.get("inputRevision", 0),
+                }
+                ST.save_state(root, change, state)
+            if action == "run-plan":
+                prompt = _plan_prompt(root, change, state)
+            elif action == "run-code":
+                prompt = _code_prompt(root, change, state)
+            elif action == "run-plan-review":
+                prompt = _review_prompt(root, change, "plan", plan_fp, "-")
+            else:
+                prompt = _review_prompt(root, change, "code", plan_fp,
+                                        code_fp)
+            out_path = os.path.join(
+                ST.state_dir(root, change),
+                ".run.%s.%d" % (session_key, os.getpid()))
+            handoff_note = None
+            try:
+                rc, new_session, invoke_err = PV.invoke(
+                    provider, role, mode, session_id, model, prompt,
+                    out_path, root, effort,
+                    liveness_path=ST.invocation_file(root, change))
+            except PV.Interrupted as exc:
+                rc, new_session, invoke_err = None, "", ""
+                handoff_note = (
+                    "%s — incomplete handoff, no fallback invoked." % exc)
+            except (PV.ProviderError, PV.InvocationError) as exc:
+                rc, new_session, invoke_err = None, "", ""
+                if mode == "resume":
+                    # A missing/transient session never authorizes erasing
+                    # state or falling back: the stored session stays, the
+                    # budget is untouched, and the note names the remedy.
+                    handoff_note = (
+                        "resume of '%s' session '%s' failed (%s) — "
+                        "incomplete handoff: stored session preserved, "
+                        "budget unchanged, no silent fresh session started "
+                        "and no fallback invoked. Retry '%s %s', or pass "
+                        "--fresh to deliberately mint a new session."
+                        % (provider, session_id, exc, action, change))
+                else:
+                    handoff_note = (
+                        "provider '%s' invocation failed (%s) — incomplete "
+                        "handoff, no fallback invoked." % (provider, exc))
+            # Token telemetry for THIS invocation: printed and persisted
+            # even when the provider errored, when it reported usage.
+            _record_usage(root, change, state, action, provider, model,
+                          role, session_id, mode, out_path, effort)
+            if handoff_note is not None:
+                _record_handoff(root, change, state, session_key,
+                                handoff_note, action=action)
+                return EXIT_MISUSE
+            if rc != 0:
+                detail = (invoke_err or "").strip()[-1000:]
+                if mode == "resume":
+                    _record_handoff(
+                        root, change, state, session_key,
+                        "resume of '%s' session '%s' exited %d%s — "
+                        "incomplete handoff: stored session preserved, "
+                        "budget unchanged, no silent fresh session started "
+                        "and no fallback invoked. Retry '%s %s', or pass "
+                        "--fresh to deliberately mint a new session."
+                        % (provider, session_id, rc,
+                           (": %s" % detail) if detail else "",
+                           action, change),
+                        action=action)
+                    return EXIT_MISUSE
+                _record_handoff(root, change, state, session_key,
+                                "provider '%s' exited %d%s — incomplete "
+                                "handoff, no fallback invoked."
+                                % (provider, rc,
+                                   (": %s" % detail) if detail else ""),
+                                action=action)
+                return EXIT_MISUSE
+            if not new_session and PV.fixture_dir() is None:
+                _record_handoff(
+                    root, change, state, session_key,
+                    "provider '%s' reported no session id — incomplete "
+                    "handoff (refusing to fabricate one), no fallback "
+                    "invoked." % provider,
+                    action=action)
+                return EXIT_MISUSE
+            if new_session:
+                session_id = new_session
+            state["sessions"][session_key] = {"provider": provider,
+                                              "model": model,
+                                              "effort": effort,
+                                              "id": session_id or ""}
+            if is_review:
+                state["pending"]["session"] = session_id or ""
+                ST.save_state(root, change, state)
+                return _accept_review_output(root, change, state,
+                                             session_key, provider,
+                                             session_id or "", out_path)
+            state["step"] = PENDING_AFTER_AUTHOR[action]
+            state["resumeStep"] = None
+            ST.save_state(root, change, state)
+            print("change-loop: '%s' for '%s' finished (provider '%s' "
+                  "model '%s' effort '%s', session '%s')."
+                  % (action, change, provider, model, effort,
+                     session_id or "-"))
+            print("  Output captured; advance with the next helper action.")
+            print("  %s" % out_path)
+            return EXIT_OK
+    except ST.LockedError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_LOCKED
+
+
+def _decode_manual_verdict(path):
+    """Load a host-supplied verdict file: loop schema or claude envelope."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            obj = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return None, "verdict file is not valid JSON: %s" % exc
+    envelope_session = ""
+    if isinstance(obj, dict) and obj.get("type") == "result":
+        # Claude wire envelope: verdict JSON in result, and the
+        # provider-issued session in session_id. The envelope session is
+        # authoritative: a host-typed claim never overrides it.
+        envelope_session = obj.get("session_id") or ""
+        try:
+            obj = json.loads(obj.get("result") or "")
+        except (ValueError, AttributeError):
+            return None, "claude result text is not loop-verdict JSON"
+    verdict, error = ST.validate_verdict(obj)
+    if error or verdict is None:
+        return verdict, error
+    if envelope_session:
+        verdict.setdefault("reviewer", {})["session"] = envelope_session
+    return verdict, None
+
+
+def _accept_review_output(root, change, state, step_key, provider,
+                          session_id, out_path):
+    """Accept one reviewer run: freshness, identity, gates, budget."""
+    verdict, _note = PV.normalize(provider, out_path)
+    # Bind the verdict to the session that ACTUALLY produced it (the
+    # provider-issued id from this invocation), so _record_validated can
+    # demand proof instead of deriving it silently.
+    verdict.setdefault("reviewer", {})["session"] = session_id or ""
+    return _record_validated(root, change, state, step_key, verdict,
+                             auto=True)
+
+
+def _record_validated(root, change, state, step_key, verdict, auto):
+    scope = SCOPE_STEP[step_key]
+    pending = state.get("pending") or {}
+    # 1. A matching pending invocation must exist for this review step.
+    # A rejection here preserves the current legal next step EXACTLY
+    # (including a required replan after persist-input): the stale
+    # verdict is history only, never a transition to handoff and never
+    # an overwrite to run-plan-review.
+    if pending.get("step") != step_key:
+        ST.history_record(
+            root, change, step_key, verdict,
+            "verdict without a matching pending invocation — no state "
+            "change; current next step '%s' preserved."
+            % state.get("step"))
+        sys.stderr.write(
+            "change-loop: no pending %s invocation for '%s' — verdict kept "
+            "in history only, current next step '%s' preserved.\n"
+            % (step_key, change, state.get("step")))
+        return EXIT_MISUSE
+    # 1b. The pending invocation must predate any input revision: a
+    # verdict recovered against superseded input can never approve, even
+    # when the planning files look unchanged.
+    if pending.get("inputRev", 0) != state.get("inputRevision", 0):
+        ST.history_record(
+            root, change, step_key, verdict,
+            "verdict input revision %s does not match current input "
+            "revision %s — stale verdict, incomplete handoff; re-run the "
+            "author and review steps against current input."
+            % (pending.get("inputRev", 0),
+               state.get("inputRevision", 0)))
+        state["step"] = "plan"
+        state["pending"] = None
+        state["resumeStep"] = None
+        ST.save_state(root, change, state)
+        sys.stderr.write(
+            "change-loop: input context was revised after the pending %s "
+            "invocation for '%s' — stale verdict kept in history only; "
+            "next step is plan-writer.\n" % (step_key, change))
+        return EXIT_MISUSE
+    # 2. Reviewer identity must match the recorded assignment and session.
+    assigned = (state.get("roles") or {}).get(
+        "planReviewer" if step_key == "plan-review" else "codeReviewer")
+    if pending.get("provider") != assigned:
+        # Impostor verdict: the authoritative pending (identity + input
+        # revision stamped at invocation) stays live — an unmatched
+        # verdict must never destroy the in-flight review nor reroute
+        # the loop. History only, no state change.
+        ST.history_record(
+            root, change, step_key, verdict,
+            "pending invocation names provider '%s', not the recorded %s "
+            "'%s' — verdict kept in history only; pending invocation and "
+            "current next step '%s' preserved."
+            % (pending.get("provider"), step_key, assigned,
+               state.get("step")))
+        sys.stderr.write("change-loop: reviewer identity mismatch — verdict "
+                         "kept in history only, pending invocation "
+                         "preserved.\n")
+        return EXIT_MISUSE
+    claimed = (verdict.get("reviewer") or {}).get("session") or ""
+    pending_session = pending.get("session") or ""
+    # Session proof is REQUIRED: the verdict must name the pending
+    # invocation's live session. A hand-written clean verdict with no
+    # reviewer block after a killed reviewer run is refused here — the
+    # claim is never derived silently.
+    if not claimed or not pending_session or claimed != pending_session:
+        # Session proof failed: the verdict is not from the pending
+        # invocation. The authoritative pending stays live (history
+        # only) — an impostor session must never clear it or reroute
+        # the loop to handoff.
+        ST.history_record(
+            root, change, step_key, verdict,
+            "verdict session '%s' does not match pending session '%s' — "
+            "verdict kept in history only; pending invocation and "
+            "current next step '%s' preserved."
+            % (claimed, pending_session, state.get("step")))
+        sys.stderr.write("change-loop: verdict session does not match the "
+                         "pending invocation — verdict kept in history "
+                         "only, pending invocation preserved.\n")
+        return EXIT_MISUSE
+    # 3. Fingerprints must be unchanged since the review was invoked.
+    # Invalidation runs through the SAME shared transitions as
+    # pre-invocation refresh: referenced-input changes route to the
+    # plan-writer, and a plan change observed during code review routes
+    # to plan-review — never to code, where the stale-approval gate
+    # would refuse every role action. Stale verdicts are history only;
+    # the budget is untouched.
+    try:
+        plan_fp, code_fp, invalidated = _refresh_locked(root, change, state)
+    except ST.LoopError as exc:
+        ST.history_record(root, change, step_key, verdict,
+                          "fingerprint failure at acceptance (%s) — "
+                          "incomplete handoff." % exc)
+        state["step"] = "handoff"
+        state["pending"] = None
+        state["resumeStep"] = _REVIEW_ACTION[step_key]
+        ST.save_state(root, change, state)
+        sys.stderr.write("change-loop: %s — incomplete handoff.\n" % exc)
+        return EXIT_MISUSE
+    if invalidated == "input-artifacts":
+        # A referenced input outside the fingerprint scopes changed while
+        # the review ran: the verdict was earned against superseded
+        # context and can never approve, even though plan/code bytes
+        # match. Refresh provenance, advance the input revision, and
+        # route to the plan-writer (shared transition, stale verdict
+        # attached to its history record).
+        _reroute_for_input_artifacts(root, change, state, step_key,
+                                     always_record=True, verdict=verdict)
+        print("change-loop: referenced input changed during %s for '%s' "
+              "— stale verdict recorded to history only; next step is "
+              "plan-writer." % (step_key, change))
+        return EXIT_MISUSE
+    if step_key == "code-review" and (
+            invalidated == "plan" or pending.get("planFp") != plan_fp):
+        # The plan changed while code review ran: the verdict reviewed
+        # superseded requirements. Route to plan-review immediately via
+        # the shared transition — clearing the approval and then routing
+        # to code would deadlock every role action.
+        _reroute_for_plan_change(root, change, state, step_key,
+                                 invalidated or "plan", verdict=verdict)
+        print("change-loop: plan content changed during %s for '%s' — "
+              "stale verdict recorded to history only; next step is "
+              "plan-review." % (step_key, change))
+        return EXIT_MISUSE
+    want_code = pending.get("codeFp")
+    if pending.get("planFp") != plan_fp or (
+            want_code is not None and want_code != code_fp):
+        ST.history_record(
+            root, change, step_key, verdict,
+            "content changed while the review ran (pending plan=%s code=%s; "
+            "now plan=%s code=%s) — stale verdict, incomplete handoff; "
+            "re-run the review." % (pending.get("planFp"),
+                                    pending.get("codeFp"), plan_fp, code_fp))
+        state["step"] = scope
+        state["pending"] = None
+        state["resumeStep"] = None
+        ST.save_state(root, change, state)
+        print("change-loop: content changed during %s for '%s' — stale "
+              "verdict recorded to history only; re-run the review."
+              % (step_key, change))
+        return EXIT_MISUSE
+    if state.get("exhausted"):
+        ST.history_record(root, change, step_key, verdict,
+                          "post-exhaustion verdict (history only)")
+        state["pending"] = None
+        state["resumeStep"] = None
+        ST.save_state(root, change, state)
+        sys.stderr.write("change-loop: budget exhausted for '%s' — verdict "
+                         "recorded to history only, no state change.\n"
+                         % change)
+        return EXIT_MISUSE
+    consumed = state.get("consumed", 0)
+    status = verdict["status"]
+    if status == "clean":
+        gate_error = _acceptance_gates(root, change, step_key)
+        if gate_error:
+            ST.history_record(
+                root, change, step_key, verdict,
+                "clean verdict received but acceptance gates unmet (%s) — "
+                "no approval; re-run the author step." % gate_error)
+            state["step"] = scope
+            state["pending"] = None
+            state["resumeStep"] = None
+            ST.save_state(root, change, state)
+            sys.stderr.write(
+                "change-loop: clean %s verdict for '%s' but acceptance "
+                "gates unmet (%s) — no approval recorded.\n"
+                % (step_key, change, gate_error))
+            return EXIT_MISUSE
+        if step_key == "plan-review":
+            state["approvals"]["plan"] = plan_fp
+            state["fingerprints"]["plan"] = plan_fp
+            state["step"] = "code"
+            ST.history_record(
+                root, change, step_key, verdict,
+                "clean plan verdict against plan fingerprint %s" % plan_fp)
+            state["pending"] = None
+            state["resumeStep"] = None
+            state["lastFindings"] = []
+            ST.save_state(root, change, state)
+            print("change-loop: plan approved for '%s' — next step is code."
+                  % change)
+        else:
+            state["approvals"]["code"] = code_fp
+            state["approvals"]["codePlan"] = plan_fp
+            state["fingerprints"]["code"] = code_fp
+            state["fingerprints"]["plan"] = plan_fp
+            state["step"] = "done"
+            ST.history_record(
+                root, change, step_key, verdict,
+                "clean code verdict against code fingerprint %s (plan %s)"
+                % (code_fp, plan_fp))
+            state["pending"] = None
+            state["resumeStep"] = None
+            state["lastFindings"] = []
+            ST.save_state(root, change, state)
+            print("change-loop: code approved for '%s' — loop done."
+                  % change)
+        return EXIT_OK
+    if status == "blocking":
+        consumed += 1
+        state["consumed"] = consumed
+        state["lastFindings"] = verdict["findings"]
+        if consumed >= MAX_ROUNDS:
+            state["exhausted"] = True
+            state["step"] = "handoff"
+            state["pending"] = None
+            state["resumeStep"] = None
+            ST.history_record(
+                root, change, step_key, verdict,
+                "fifth blocking verdict (%d/%d) — loop stops, no sixth "
+                "invocation, user handoff with findings preserved"
+                % (consumed, MAX_ROUNDS),
+                consumed=True)
+            ST.save_state(root, change, state)
+            sys.stderr.write(
+                "change-loop: blocking verdict %d/%d for '%s' — budget "
+                "exhausted. No further reviewer invocation; findings "
+                "preserved for the user.\n" % (consumed, MAX_ROUNDS, change))
+            return EXIT_BLOCKING
+        state["step"] = scope
+        state["pending"] = None
+        state["resumeStep"] = None
+        ST.history_record(root, change, step_key, verdict,
+                          "blocking verdict %d/%d" % (consumed, MAX_ROUNDS),
+                          consumed=True)
+        ST.save_state(root, change, state)
+        sys.stderr.write("change-loop: blocking verdict %d/%d for '%s' "
+                         "recorded.\n" % (consumed, MAX_ROUNDS, change))
+        return EXIT_BLOCKING
+    # error | limit: selected-providers-only, never fall back.
+    state["step"] = "handoff"
+    state["pending"] = None
+    state["resumeStep"] = _REVIEW_ACTION[step_key]
+    ST.history_record(
+        root, change, step_key, verdict,
+        "provider %s — incomplete handoff, no fallback provider invoked"
+        % status)
+    ST.save_state(root, change, state)
+    print("change-loop: %s for '%s' — incomplete handoff (budget unchanged "
+          "at %d/%d). No other provider invoked."
+          % (status, change, consumed, MAX_ROUNDS))
+    return EXIT_OK
+
+
+def _acceptance_gates(root, change, step_key):
+    """Return '' when a clean verdict may approve, else the blocker."""
+    ready, detail = OS.planning_readiness(root, change)
+    if not ready:
+        return detail
+    ok, output = OS.validate_strict(root, change)
+    if not ok:
+        return "strict validation failed: %s" % output[-1000:]
+    if step_key == "code-review":
+        complete, task_detail = OS.tasks_completion(root, change)
+        if not complete:
+            return task_detail
+    return ""
+
+
+# --- record-verdict (host-supplied file; strict refusal, never lenient) --------
+
+def cmd_record_verdict(root, change, step_key, verdict_path):
+    if step_key not in ("plan-review", "code-review"):
+        sys.stderr.write("change-loop: step must be plan-review or "
+                         "code-review.\n")
+        return EXIT_MISUSE
+    try:
+        ST.require_change(root, change)
+    except ST.LoopError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_MISUSE
+    verdict, error = _decode_manual_verdict(verdict_path)
+    try:
+        with ST.locked(root, change):
+            state = ST.normalize_state(ST.load_state(root, change))
+            if error:
+                ST.history_record(
+                    root, change, step_key, None,
+                    "rejected verdict file (%s) — no state change." % error)
+                ST.save_state(root, change, state)
+                sys.stderr.write("change-loop: rejected verdict file: %s\n"
+                                 % error)
+                return EXIT_MISUSE
+            return _record_validated(root, change, state, step_key, verdict,
+                                     auto=False)
+    except ST.LockedError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_LOCKED
+
+
+# --- read-only reports ------------------------------------------------------------
+# status takes no lock and writes nothing: success is a recorded clean
+# verdict against the CURRENT fingerprint, recomputed here in memory.
+
+def _status_report(root, change):
+    ST.require_change(root, change)
+    state = ST.normalize_state(ST.load_state(root, change))
+    try:
+        files = OS.artifact_files(root, change)
+        plan_fp = ST.plan_fingerprint(root, files)
+        code_fp = ST.code_fingerprint(root)
+        fp_error = ""
+    except ST.LoopError as exc:
+        plan_fp = code_fp = None
+        fp_error = str(exc)
+    artifacts_ok = _artifacts_snapshot_ok(root, state)
+    approvals = state.get("approvals") or {}
+    plan_current = bool(plan_fp and approvals.get("plan") == plan_fp
+                        and artifacts_ok)
+    code_current = bool(code_fp and approvals.get("code") == code_fp
+                        and approvals.get("codePlan") == plan_fp
+                        and artifacts_ok)
+    if state.get("step") == "done" and code_current:
+        completion = "clean"
+    elif state.get("exhausted"):
+        completion = "exhausted"
+    elif state.get("step") == "handoff":
+        completion = "handoff"
+    else:
+        completion = "incomplete"
+    report = dict(state)
+    report["completion"] = completion
+    report["currentFingerprints"] = {"plan": plan_fp, "code": code_fp}
+    report["approvalsCurrent"] = {"plan": plan_current, "code": code_current}
+    if fp_error:
+        report["fingerprintError"] = fp_error
+    return report
+
+
+def _usage_line(entry):
+    """Truthful one-line usage summary for a totals aggregate.
+
+    Unknown counters print as unknown (never fabricated zeros); known
+    subtotals print with their reporter completeness
+    (`partial: K of M known`) unless every known invocation reported
+    them. Completeness splits known into complete vs partial.
+    """
+    entry = entry or {}
+    invocations = entry.get("invocations", 0) or 0
+    known = entry.get("known", 0) or 0
+    complete = entry.get("complete", 0) or 0
+    partial = entry.get("partial", 0) or 0
+    unknown = entry.get("unknown", 0) or 0
+    head = ("%d invocation(s): %d known (%d complete, %d partial), "
+            "%d unknown" % (invocations, known, complete, partial,
+                            unknown))
+    counters = []
+    for key, label in (("total", "total"), ("input_total", "in"),
+                       ("output", "out")):
+        kc = entry.get(key + "_known", 0) or 0
+        if kc == 0:
+            counters.append("%s=unknown" % label)
+        elif kc < known:
+            counters.append("%s=%s (partial: %d of %d known)"
+                            % (label, entry.get(key, 0), kc, known))
+        else:
+            counters.append("%s=%s" % (label, entry.get(key, 0)))
+    cost_known = entry.get("cost_known", 0) or 0
+    if cost_known:
+        if cost_known < known:
+            counters.append("cost_usd=%.4f (partial: %d of %d known)"
+                            % (entry.get("cost_usd", 0.0) or 0.0,
+                               cost_known, known))
+        else:
+            counters.append("cost_usd=%.4f"
+                            % (entry.get("cost_usd", 0.0) or 0.0))
+    return "%s; tokens %s" % (head, " ".join(counters))
+
+
+def cmd_status(root, args):
+    as_json = False
+    change = ""
+    for arg in args:
+        if arg == "--json":
+            as_json = True
+        else:
+            change = arg
+    if not change:
+        sys.stderr.write("change-loop: status needs a change name.\n")
+        return EXIT_MISUSE
+    try:
+        report = _status_report(root, change)
+    except ST.LoopError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_MISUSE
+    if as_json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return EXIT_OK
+    print("change:      %s" % report["change"])
+    roles = report["roles"]
+    models = report.get("models") or {}
+
+    def _rm(key):
+        label = "%s/%s" % (roles.get(key) or "?",
+                           models.get(key) or "no-model")
+        return label
+    print("roles:       plan-writer=%s plan-reviewer=%s coder=%s "
+          "code-reviewer=%s" % (_rm("planWriter"), _rm("planReviewer"),
+                                _rm("coder"), _rm("codeReviewer")))
+    efforts = report.get("efforts") or {}
+
+    def _ef(key):
+        return efforts.get(key) or "unset"
+
+    print("efforts:     plan-writer=%s plan-reviewer=%s coder=%s "
+          "code-reviewer=%s (reviewers medium, authors high unless "
+          "--effort overrides)" % (_ef("planWriter"), _ef("planReviewer"),
+                                   _ef("coder"), _ef("codeReviewer")))
+    print("step:        %s%s" % (report["step"],
+                                 (" (resume: %s)" % report["resumeStep"])
+                                 if report.get("resumeStep") else ""))
+    print("budget:      %d/%d%s" % (report["consumed"], report["maxRounds"],
+                                    " (exhausted)" if report["exhausted"]
+                                    else ""))
+    totals = report.get("usageTotals") or {}
+    print("usage:       %s" % _usage_line(totals))
+    by_provider = report.get("usageByProvider") or {}
+    for key in sorted(by_provider):
+        entry = by_provider[key] or {}
+        provider, _, model = key.partition("|")
+        print("usage %s/%s: %s" % (provider, model or "?",
+                                   _usage_line(entry)))
+    print("plan:        %s" % ("approved @ %s" % report["approvals"]["plan"]
+                               if report["approvals"].get("plan")
+                               else "not approved"))
+    print("code:        %s" % ("approved @ %s" % report["approvals"]["code"]
+                               if report["approvals"].get("code")
+                               else "not approved"))
+    print("completion:  %s" % report["completion"])
+    return EXIT_OK
+
+
+def cmd_history(root, args):
+    plain = False
+    change = ""
+    for arg in args:
+        if arg == "--plain":
+            plain = True
+        else:
+            change = arg
+    if not change:
+        sys.stderr.write("change-loop: history needs a change name.\n")
+        return EXIT_MISUSE
+    records = [(path, record)
+               for path, record in ST.iter_history(root, change)]
+    if not records:
+        print("change-loop: no history for '%s'." % change)
+        return EXIT_OK
+    for path, record in records:
+        if plain:
+            verdict = record.get("verdict") or {}
+            print("%s [%s] %s: %s %s" % (record.get("recordedAt"),
+                                         record.get("step"),
+                                         verdict.get("status", "note"),
+                                         record.get("note"),
+                                         verdict.get("summary", "")))
+        else:
+            print("--- %s" % path)
+            print(json.dumps(record, indent=2, sort_keys=True))
+            print("")
+    return EXIT_OK
+
+
+def cmd_reset_rounds(root, change, confirm):
+    if confirm != "--confirm":
+        sys.stderr.write(
+            "change-loop: reset-rounds needs explicit user authorization.\n"
+            "  Re-run as: change-loop reset-rounds %s --confirm\n"
+            "  (General implementation or retry requests do not authorize "
+            "reset.)\n" % change)
+        return EXIT_MISUSE
+    try:
+        ST.require_change(root, change)
+    except ST.LoopError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_MISUSE
+    try:
+        with ST.locked(root, change):
+            state = ST.normalize_state(ST.load_state(root, change))
+            state["consumed"] = 0
+            state["exhausted"] = False
+            state["pending"] = None
+            state["resumeStep"] = None
+            if state.get("step") == "handoff":
+                state["step"] = "plan"
+            ST.history_record(
+                root, change, "budget", None,
+                "explicit user-authorized budget reset (sessions, "
+                "fingerprints, history preserved; bounds all budget "
+                "sources including old-gate and migration imports)")
+            ST.save_state(root, change, state)
+            print("change-loop: budget reset for '%s' (sessions, "
+                  "fingerprints, history preserved)." % change)
+            return EXIT_OK
+    except ST.LockedError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_LOCKED
+
+
+def cmd_check_provider(provider):
+    try:
+        PV.check(provider)
+    except PV.ProviderError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_MISUSE
+    print("change-loop: provider '%s' is available." % provider)
+    return EXIT_OK
+
+
+def cmd_fingerprint_plan(root, change):
+    try:
+        ST.require_change(root, change)
+        print(ST.plan_fingerprint(root, OS.artifact_files(root, change)))
+        return EXIT_OK
+    except ST.LoopError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_MISUSE
+
+
+def cmd_fingerprint_code(root):
+    try:
+        print(ST.code_fingerprint(root))
+        return EXIT_OK
+    except ST.LoopError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_MISUSE
+
+
+def cmd_import_provenance(root, change, args):
+    consumed = source = note = None
+    items = list(args)
+    while items:
+        flag = items.pop(0)
+        if flag == "--consumed" and items:
+            consumed = items.pop(0)
+        elif flag == "--source" and items:
+            source = items.pop(0)
+        elif flag == "--note" and items:
+            note = items.pop(0)
+        else:
+            sys.stderr.write("change-loop: unknown import-provenance flag "
+                             "'%s'.\n" % flag)
+            return EXIT_MISUSE
+    try:
+        number = int(consumed)
+    except (TypeError, ValueError):
+        number = -1
+    if number < 0 or not source:
+        sys.stderr.write("change-loop: import-provenance needs --consumed N "
+                         "--source TEXT.\n")
+        return EXIT_MISUSE
+    try:
+        ST.require_change(root, change)
+    except ST.LoopError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_MISUSE
+    try:
+        with ST.locked(root, change):
+            state = ST.normalize_state(ST.load_state(root, change))
+            state["consumed"] = max(state.get("consumed", 0),
+                                    min(number, MAX_ROUNDS))
+            state["provenance"].append({
+                "consumed": number, "source": source, "note": note or "",
+                "importedAt": ST.now_iso()})
+            if state["consumed"] >= MAX_ROUNDS:
+                state["exhausted"] = True
+                if state.get("step") != "done":
+                    state["step"] = "handoff"
+            ST.history_record(
+                root, change, "budget", None,
+                "imported budget provenance: %d consumed (%s)%s" % (
+                    number, source, (" — %s" % note) if note else ""))
+            ST.save_state(root, change, state)
+            print("change-loop: provenance recorded for '%s' (%d consumed "
+                  "via %s)." % (change, number, source))
+            return EXIT_OK
+    except ST.LockedError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_LOCKED
+
+
+def cmd_lock_recover(root, change):
+    # Locks are kernel-managed flock: a crashed holder releases on process
+    # exit, so there is never a stale lock to clear. The action stays for
+    # host compatibility.
+    try:
+        ST.require_change(root, change)
+    except ST.LoopError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        return EXIT_MISUSE
+    print("change-loop: locks for '%s' are kernel-managed (no stale "
+          "recovery needed)." % change)
+    return EXIT_OK
+
+
+# --- entry ------------------------------------------------------------------------------------
+
+def main(argv):
+    if not argv:
+        return usage()
+    root = ST.resolve_root()
+    action = argv[0]
+    rest = argv[1:]
+    if action == "init":
+        return cmd_init(root, rest)
+    if action == "persist-input":
+        if not rest:
+            sys.stderr.write("change-loop: persist-input needs a change "
+                             "name.\n")
+            return EXIT_MISUSE
+        return cmd_persist_input(root, rest[0], rest[1:])
+    if action == "show-input":
+        if len(rest) != 1:
+            sys.stderr.write("change-loop: show-input needs a change "
+                             "name.\n")
+            return EXIT_MISUSE
+        return cmd_show_input(root, rest[0])
+    if action == "check-input":
+        if len(rest) != 1:
+            sys.stderr.write("change-loop: check-input needs a change "
+                             "name.\n")
+            return EXIT_MISUSE
+        return cmd_check_input(root, rest[0])
+    if action in ACTION_ROLE:
+        model = ""
+        effort = ""
+        fresh = False
+        items = list(rest)
+        while items and items[0] in ("--model", "--effort", "--fresh"):
+            flag = items.pop(0)
+            if flag == "--fresh":
+                fresh = True
+                continue
+            if not items:
+                sys.stderr.write("change-loop: %s needs a value and a "
+                                 "change name.\n" % flag)
+                return EXIT_MISUSE
+            value = items.pop(0)
+            if not value.strip():
+                sys.stderr.write("change-loop: %s needs a non-empty "
+                                 "value.\n" % flag)
+                return EXIT_MISUSE
+            if flag == "--model":
+                model = value
+            else:
+                effort = value
+        if len(items) != 1:
+            sys.stderr.write("change-loop: %s needs a change name.\n"
+                             % action)
+            return EXIT_MISUSE
+        return _run_provider_step(root, action, items[0], model, effort,
+                                  fresh)
+    if action == "record-verdict":
+        if len(rest) != 3:
+            sys.stderr.write("change-loop: record-verdict needs <change> "
+                             "<plan-review|code-review> <verdict-file>.\n")
+            return EXIT_MISUSE
+        return cmd_record_verdict(root, rest[0], rest[1], rest[2])
+    if action == "status":
+        return cmd_status(root, rest)
+    if action == "history":
+        return cmd_history(root, rest)
+    if action == "reset-rounds":
+        if len(rest) != 2:
+            return cmd_reset_rounds(root, rest[0] if rest else "", "")
+        return cmd_reset_rounds(root, rest[0], rest[1])
+    if action == "check-provider":
+        if len(rest) != 1:
+            sys.stderr.write("change-loop: check-provider needs a "
+                             "provider.\n")
+            return EXIT_MISUSE
+        return cmd_check_provider(rest[0])
+    if action == "fingerprint-plan":
+        if len(rest) != 1:
+            sys.stderr.write("change-loop: fingerprint-plan needs a change "
+                             "name.\n")
+            return EXIT_MISUSE
+        return cmd_fingerprint_plan(root, rest[0])
+    if action == "fingerprint-code":
+        if rest:
+            sys.stderr.write("change-loop: fingerprint-code takes no "
+                             "arguments.\n")
+            return EXIT_MISUSE
+        return cmd_fingerprint_code(root)
+    if action == "import-provenance":
+        if not rest:
+            sys.stderr.write("change-loop: import-provenance needs a change "
+                             "name.\n")
+            return EXIT_MISUSE
+        return cmd_import_provenance(root, rest[0], rest[1:])
+    if action == "lock-recover":
+        if len(rest) != 1:
+            sys.stderr.write("change-loop: lock-recover needs a change "
+                             "name.\n")
+            return EXIT_MISUSE
+        return cmd_lock_recover(root, rest[0])
+    return usage()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except ST.LockedError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        sys.exit(EXIT_LOCKED)
+    except ST.LoopError as exc:
+        sys.stderr.write("change-loop: %s\n" % exc)
+        sys.exit(exc.exit_code)
