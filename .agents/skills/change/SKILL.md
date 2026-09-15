@@ -30,14 +30,21 @@ Example: `$change abc-test muse:muse-spark-1.3-contributor codex:gpt-6-astra mus
   create no state, invoke nothing. A sixth positional is NEVER a description.
 - A well-formed name that does not exist yet is NOT an error: scaffold it with
   `scripts/change-loop init ...` (which uses `openspec new` via the CLI).
-- Every role invocation needs an explicit model id — from the init mapping
-  or a per-action `--model` override. A missing model refuses BEFORE any
-  provider runs: the loop never defaults or falls back. Every invocation
-  also carries an explicit reasoning effort — reviewers `medium`, authors
-  `high`, each overridable per action via `--effort` (wired as
-  `muse --reasoning-effort`, `codex -c model_reasoning_effort=`,
-  `claude --effort`; never an ambient CLI default). The helper prints
-  the selected provider/model/effort before each invocation.
+- Every role invocation resolves its model per invocation: a `--model`
+  override, then the recorded init mapping, then the pre-configured
+  provider default (`CHANGE_LOOP_DEFAULT_MODEL_<PROVIDER>` env override
+  first, then the built-in value: `muse` → `muse-spark-1.3`,
+  `claude` → `claude-fable-5-1`, `codex` → `gpt-6-astra`;
+  `grok`/`gemini` have no default). A missing model refuses BEFORE any
+  provider runs: the loop never falls back to another provider or a
+  CLI-built-in default. Only explicit models are recorded — a
+  provider-default resolution is re-resolved every run and never
+  persisted. Every invocation also carries an explicit reasoning effort
+  — reviewers `medium`, authors `high`, each overridable per action via
+  `--effort` (wired as `muse --reasoning-effort`,
+  `codex -c model_reasoning_effort=`, `claude --effort`; never an ambient
+  CLI default). The helper prints the selected provider/model/source
+  (explicit vs. provider default) before each invocation.
 
 Validate by running (it enforces all of the above and records the roles):
 

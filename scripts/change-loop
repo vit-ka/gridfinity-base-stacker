@@ -49,7 +49,8 @@ def usage():
     sys.stderr.write(
         "usage: change-loop <action> [args]\n"
         "  init <change> <plan-writer> <plan-reviewer> <coder> <code-reviewer>\n"
-        "    (each role: provider or provider:model, e.g. codex:gpt-6-astra)\n"
+        "    (each role: provider or provider:model, e.g. codex:gpt-6-astra;\n"
+        "    a bare provider resolves its pre-configured provider default)\n"
         "  persist-input <change> [--prose TEXT|--prose-file F] "
         "[--decisions-file F]... [--artifact PATH]...\n"
         "  show-input <change> | check-input <change>\n"
@@ -57,9 +58,15 @@ def usage():
         "  run-plan-review [--model M] [--effort E] [--fresh] <change>\n"
         "  run-code [--model M] [--effort E] [--fresh] <change>\n"
         "  run-code-review [--model M] [--effort E] [--fresh] <change>\n"
-        "    (every role invocation needs an explicit model: the init\n"
-        "    mapping or --model; missing models refuse before invocation —\n"
-        "    the loop never defaults or falls back. Effort is explicit on\n"
+        "    (model resolution per invocation: --model override, then the\n"
+        "    recorded init mapping, then the pre-configured provider\n"
+        "    default (CHANGE_LOOP_DEFAULT_MODEL_<PROVIDER> env override\n"
+        "    first, then the built-in value); missing models refuse before\n"
+        "    invocation — the loop never falls back to another provider or\n"
+        "    a CLI-built-in default. Only explicit models are recorded;\n"
+        "    provider-default resolutions are re-resolved every run and\n"
+        "    never persisted. The helper prints provider/model/source\n"
+        "    before each invocation. Effort is explicit on\n"
         "    every invocation: reviewers medium, authors high, each\n"
         "    overridable via --effort; never an ambient CLI default.\n"
         "    --fresh deliberately mints a new session instead of resuming\n"
@@ -122,7 +129,8 @@ def _review_prompt(root, change, kind, plan_fp, code_fp):
         "At the default threshold, P0-P2 findings BLOCK; P3 never blocks.\n"
         "Limits, errors, or lack of access are NOT verdicts: report status "
         "\"limit\" or \"error\" with a summary instead.\n"
-        "Emit EXACTLY one JSON object on stdout, no prose wrapper:\n"
+        "Emit bare JSON ONLY: exactly one JSON object on stdout, "
+        "no code fence, no prose before or after:\n"
         "{\"status\":\"clean|blocking|error|limit\","
         "\"findings\":[{\"severity\":\"P0|P1|P2|P3\",\"title\":\"..\","
         "\"detail\":\"..\"}],\"summary\":\"..\"}\n"
@@ -716,17 +724,18 @@ def _record_handoff(root, change, state, step_key, note, action=None):
 
 
 def _record_usage(root, change, state, action, provider, model, role,
-                  session, mode, out_path, effort=""):
+                  session, mode, out_path, effort="", source=""):
     """Print one invocation's token usage and persist it durably."""
     try:
         record = PV.extract_usage(provider, out_path, model=model,
                                   role=role, session=session or "",
-                                  action=action, mode=mode, effort=effort)
+                                  action=action, mode=mode, effort=effort,
+                                  source=source)
     except Exception as exc:  # never let telemetry break the loop
         record = {"provider": provider, "model": model or "",
                   "role": role or "", "action": action or "",
                   "session": session or "", "mode": mode or "",
-                  "effort": effort or "",
+                  "effort": effort or "", "source": source or "",
                   "known": False, "input_total": None,
                   "input_cached_read": None, "input_cache_write": None,
                   "input_uncached": None, "output": None, "reasoning": None,
@@ -774,20 +783,30 @@ def _run_provider_step(root, action, change, model, effort="", fresh=False):
                     % (role_key, provider),
                     action=action)
                 return EXIT_MISUSE
-            if not model:
-                model = (state.get("models") or {}).get(role_key) or ""
-            if not model:
-                # Explicit models only: refuse BEFORE any provider runs.
+            explicit = (model or "").strip()
+            if not explicit:
+                explicit = ((state.get("models") or {}).get(role_key)
+                            or "").strip()
+            resolved, source = PV.resolve_model(provider, explicit)
+            try:
+                model = PV.require_model(provider, resolved)
+            except PV.ProviderError:
+                # No explicit model and no configured default: refuse
+                # BEFORE any provider runs.
                 sys.stderr.write(
                     "change-loop: no model selected for role '%s' "
                     "(provider '%s').\n"
                     "  Remediation: re-run init with '%s:MODEL' for that "
-                    "role, or pass --model MODEL on this action; the loop "
-                    "never silently defaults or falls back to another "
-                    "model.\n" % (role_key, provider, provider))
+                    "role, pass --model MODEL on this action, or configure "
+                    "a provider default via CHANGE_LOOP_DEFAULT_MODEL_%s; "
+                    "the loop never falls back to another provider's model "
+                    "or a CLI-built-in default.\n"
+                    % (role_key, provider, provider,
+                       provider.upper()))
                 ST.save_state(root, change, state)
                 return EXIT_MISUSE
-            state["models"][role_key] = model
+            if explicit:
+                state["models"][role_key] = explicit
             # Explicit effort on every invocation: --effort wins, then the
             # recorded role effort, else reviewers medium / authors high.
             # The resolved level is recorded (like the model) and bound
@@ -863,8 +882,8 @@ def _run_provider_step(root, action, change, model, effort="", fresh=False):
                 if provider in ("muse", "claude"):
                     session_id = PV.new_session_id()
             print("change-loop: invoking '%s' for '%s' with provider '%s' "
-                  "model '%s' effort '%s' (%s session '%s')."
-                  % (action, change, provider, model, effort, mode,
+                  "model '%s' source '%s' effort '%s' (%s session '%s')."
+                  % (action, change, provider, model, source, effort, mode,
                      session_id or "new"))
             is_review = action in ("run-plan-review", "run-code-review")
             if is_review:
@@ -922,7 +941,7 @@ def _run_provider_step(root, action, change, model, effort="", fresh=False):
             # Token telemetry for THIS invocation: printed and persisted
             # even when the provider errored, when it reported usage.
             _record_usage(root, change, state, action, provider, model,
-                          role, session_id, mode, out_path, effort)
+                          role, session_id, mode, out_path, effort, source)
             if handoff_note is not None:
                 _record_handoff(root, change, state, session_key,
                                 handoff_note, action=action)
@@ -997,8 +1016,11 @@ def _decode_manual_verdict(path):
         # provider-issued session in session_id. The envelope session is
         # authoritative: a host-typed claim never overrides it.
         envelope_session = obj.get("session_id") or ""
+        candidate = PV.extract_verdict_text(obj.get("result") or "")
+        if candidate is None:
+            return None, "claude result text is not loop-verdict JSON"
         try:
-            obj = json.loads(obj.get("result") or "")
+            obj = json.loads(candidate)
         except (ValueError, AttributeError):
             return None, "claude result text is not loop-verdict JSON"
     verdict, error = ST.validate_verdict(obj)
@@ -1341,8 +1363,23 @@ def _status_report(root, change):
         completion = "handoff"
     else:
         completion = "incomplete"
+    roles = state.get("roles") or {}
+    models = state.get("models") or {}
+    resolved_models = {}
+    model_sources = {}
+    for key in ("planWriter", "planReviewer", "coder", "codeReviewer"):
+        prov = (roles.get(key) or "")
+        rec = (models.get(key) or "")
+        if prov and PV.known(prov):
+            rm, src = PV.resolve_model(prov, rec)
+        else:
+            rm, src = "", PV.SOURCE_NONE
+        resolved_models[key] = rm
+        model_sources[key] = src
     report = dict(state)
     report["completion"] = completion
+    report["resolvedModels"] = resolved_models
+    report["modelSources"] = model_sources
     report["currentFingerprints"] = {"plan": plan_fp, "code": code_fp}
     report["approvalsCurrent"] = {"plan": plan_current, "code": code_current}
     if fp_error:
@@ -1429,6 +1466,16 @@ def cmd_status(root, args):
           "code-reviewer=%s (reviewers medium, authors high unless "
           "--effort overrides)" % (_ef("planWriter"), _ef("planReviewer"),
                                    _ef("coder"), _ef("codeReviewer")))
+    resolved = report.get("resolvedModels") or {}
+    sources = report.get("modelSources") or {}
+
+    def _rs(key):
+        rm = resolved.get(key) or "no-model"
+        return "%s/%s(%s)" % (roles.get(key) or "?",
+                              rm, sources.get(key) or "none")
+    print("resolved:    plan-writer=%s plan-reviewer=%s coder=%s "
+          "code-reviewer=%s" % (_rs("planWriter"), _rs("planReviewer"),
+                                _rs("coder"), _rs("codeReviewer")))
     print("step:        %s%s" % (report["step"],
                                  (" (resume: %s)" % report["resumeStep"])
                                  if report.get("resumeStep") else ""))

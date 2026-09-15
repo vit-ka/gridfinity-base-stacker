@@ -8,8 +8,10 @@ Verified against installed binaries (observed --help + old-gate production):
              on fresh only; resume reuses the same UUID and keeps its
              model; effort is explicit on EVERY invocation — reviewers
              medium, authors high unless `--effort` overrides). Authors
-             run with default permissions (the only author role that can
-             write without extra flags). Reviewers add `--disable-write`
+             pass `--approval-mode never` on fresh and resume invocations
+             so headless runs cannot wait for interactive approval, with
+             the sandbox kept on (no `--yolo`, `--disable-sandbox`, or
+             `--trust-workspace`). Reviewers add `--disable-write`
              AND `--disable-shell` (`--disable-write` alone still permits
              shell writes). Workspace skills/rules load only with
              `--trust-workspace`, which the loop never passes.
@@ -82,6 +84,10 @@ counters, so muse usage is honestly reported UNKNOWN (never zero).
 Declared-only (no verified contract; selection refuses until verified):
   grok, gemini.
 
+Every provider child runs with OPENSPEC_TELEMETRY=0 and
+OPENSPEC_NO_UPDATE_CHECK=1 so OpenSpec telemetry/update requests cannot
+stall under sandbox proxies; the helper's own environment is unchanged.
+
 Fixture driver: CHANGE_LOOP_DRIVER=fixture + CHANGE_LOOP_FIXTURE_DIR=<dir>
 runs fully offline:
   <dir>/<provider>.present          exists => binary considered present
@@ -96,6 +102,7 @@ runs fully offline:
 import errno
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -116,7 +123,8 @@ AUTHOR = "author"
 _CONTRACT_FLAGS = {
     "muse": (["muse", "exec", "--help"],
              ["--session-id", "--prompt-file", "--json", "--workspace",
-              "--disable-write", "--disable-shell", "--reasoning-effort"]),
+              "--disable-write", "--disable-shell", "--reasoning-effort",
+              "--approval-mode"]),
     "codex": (["codex", "exec", "--help"],
               ["resume", "--json", "--model", "--sandbox", "--cd"]),
     "claude": (["claude", "--help"],
@@ -306,15 +314,59 @@ def _check_resume_contract(provider):
 # positionals, on fresh AND resume). Paths with spaces survive intact as
 # single argv elements / stdin bytes.
 
+# Pre-configured default model per verified provider. grok/gemini have no
+# entry while declared-only. A CHANGE_LOOP_DEFAULT_MODEL_<PROVIDER> env
+# value (uppercased provider name), when set to a non-empty model id,
+# overrides the built-in entry; empty or unset means the built-in applies
+# (or "no default" for providers without an entry).
+DEFAULT_MODELS = {
+    "muse": "muse-spark-1.3",
+    "claude": "claude-fable-5-1",
+    "codex": "gpt-6-astra",
+}
+
+SOURCE_EXPLICIT = "explicit"
+SOURCE_DEFAULT = "provider-default"
+SOURCE_NONE = "none"
+
+
+def default_model(provider):
+    """Configured default model id for a provider, or "" when none."""
+    env_key = "CHANGE_LOOP_DEFAULT_MODEL_%s" % str(provider).upper()
+    env_value = os.environ.get(env_key) or ""
+    if env_value.strip():
+        return env_value.strip()
+    return DEFAULT_MODELS.get(provider) or ""
+
+
+def resolve_model(provider, recorded):
+    """Resolve (model, source) for one invocation.
+
+    Precedence: explicit recorded value (a --model override or the
+    recorded mapping, already merged by the caller), then the
+    pre-configured provider default (env override first, then the
+    built-in value). Returns (model, source) where source is
+    "explicit", "provider-default", or "none" (nothing resolved).
+    """
+    if recorded and str(recorded).strip():
+        return str(recorded).strip(), SOURCE_EXPLICIT
+    default = default_model(provider)
+    if default:
+        return default, SOURCE_DEFAULT
+    return "", SOURCE_NONE
+
+
 def require_model(provider, model):
-    """Refuse before invocation when no explicit model id is selected."""
+    """Refuse before invocation when no model id resolved."""
     if not model or not str(model).strip():
         raise ProviderError(
             "no model selected for provider '%s'.\n"
             "  Remediation: init the change with 'provider:model' roles "
-            "(e.g. %s:MODEL) or pass --model MODEL on this action; the "
-            "loop never silently defaults or falls back to another model."
-            % (provider, provider))
+            "(e.g. %s:MODEL), pass --model MODEL on this action, or "
+            "configure a provider default via "
+            "CHANGE_LOOP_DEFAULT_MODEL_%s; the loop never falls back to "
+            "another provider's model or a CLI-built-in default."
+            % (provider, provider, str(provider).upper()))
     return str(model).strip()
 
 
@@ -355,6 +407,10 @@ def build_args(provider, role, mode, session, model, prompt, root,
         if reviewer:
             # --disable-write alone still permits shell writes.
             argv += ["--disable-write", "--disable-shell"]
+        else:
+            # Headless authors cannot answer approval prompts; keep the
+            # sandbox on while making approval behavior explicit.
+            argv += ["--approval-mode", "never"]
         return argv
     if provider == "codex":
         # Hook-disabled + never-prompt + explicit reasoning effort on
@@ -628,7 +684,12 @@ def invoke(provider, role, mode, session, model, prompt_text, out_path, root,
         # (provider child plus its tool descendants), never just the
         # immediate child. The group's pgid is recorded (liveness_path)
         # so a later helper refuses to overlap it if THIS helper dies.
+        # Suppress OpenSpec background requests in provider children only:
+        # sandbox proxy settings can otherwise stall each OpenSpec call.
+        env = {**os.environ, "OPENSPEC_TELEMETRY": "0",
+               "OPENSPEC_NO_UPDATE_CHECK": "1"}
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, cwd=root,
+                                env=env,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                                 start_new_session=True)
@@ -800,6 +861,61 @@ def _capture_session_id(provider, argv, out_path, _err_text):
 # verdict-shaped JSON nested under tool/command-output payloads (captured
 # stdout echoing a fixture, quoted intermediate JSON) is never a verdict.
 
+# --- free-text verdict unwrapping --------------------------------------------------
+# Reviewers sometimes wrap the verdict JSON in a single markdown code fence
+# (```json ... ``` or ``` ... ```), optionally preceded/followed by short
+# prose. extract_verdict_text() unwraps that one shape and returns the
+# candidate JSON string; every free-text verdict path (claude result,
+# muse terminal text, codex assistant message text, manual claude-envelope
+# decode) feeds its text through it ahead of the unchanged validate_verdict
+# gate. Anything that is not exactly one candidate object — multiple fenced
+# blocks, an unclosed fence, brace-looking content or leftover fence
+# delimiters outside the single fence, an empty fence — yields None
+# (callers record error, never clean). Bare JSON passes through unchanged,
+# even when JSON string values contain backticks (whole-text decoding is
+# tried before fence extraction, so backticks inside strings stay data);
+# prose around bare (unfenced) JSON is NOT tolerated (the downstream
+# json.loads rejects it). Fence boundaries are never guessed from the
+# first triple-backtick run alone: every later ``` is tried as the
+# closing fence in turn, and only a split whose inner parses as JSON
+# with delimiter-free surroundings counts — so backticks inside JSON
+# strings cannot masquerade as the closing fence.
+
+_FENCE_OPEN_RE = re.compile(r"```(?:[ \t]*[Jj][Ss][Oo][Nn])?[ \t]*\r?\n?")
+
+
+def extract_verdict_text(text):
+    """Candidate verdict JSON for free text, or None when not exactly one."""
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    try:
+        json.loads(stripped)
+        return stripped
+    except ValueError:
+        pass
+    opening = _FENCE_OPEN_RE.search(text)
+    if opening is None:
+        return None
+    index = opening.end()
+    while True:
+        close = text.find("```", index)
+        if close < 0:
+            return None
+        inner = text[opening.end():close].strip()
+        outside = text[:opening.start()] + text[close + 3:]
+        if inner:
+            try:
+                json.loads(inner)
+            except ValueError:
+                pass
+            else:
+                if ("```" not in outside and "{" not in outside
+                        and "}" not in outside):
+                    return inner
+        index = close + 3
+
+
 # Payload keys whose subtrees are tool/command output, never the reviewer's
 # verdict. Matching is case-insensitive; assistant message text ("text",
 # "message", "content", ...) is NOT in this set.
@@ -847,10 +963,11 @@ def _assistant_verdicts(event):
             for value in node:
                 visit(value, under_tool_output)
         elif isinstance(node, str) and not under_tool_output:
-            text = node.strip()
-            if text.startswith("{") and '"status"' in text:
+            candidate = extract_verdict_text(node)
+            if (candidate is not None and candidate.startswith("{")
+                    and '"status"' in candidate):
                 try:
-                    obj = json.loads(text)
+                    obj = json.loads(candidate)
                 except ValueError:
                     return
                 if (isinstance(obj, dict) and "status" in obj
@@ -1142,8 +1259,13 @@ def _normalize_muse(raw_path):
         return _error_verdict(
             provider, "muse terminal carries no reviewer text; recorded "
                       "as error (not clean)")
+    candidate = extract_verdict_text(text)
+    if candidate is None:
+        return _error_verdict(
+            provider, "muse terminal text is not loop-verdict JSON; "
+                      "recorded as error (not clean)")
     try:
-        obj = json.loads(text.strip())
+        obj = json.loads(candidate)
     except ValueError:
         return _error_verdict(
             provider, "muse terminal text is not loop-verdict JSON; "
@@ -1184,8 +1306,13 @@ def normalize(provider, raw_path):
             return _error_verdict(
                 provider, "claude result is not reviewer text; recorded "
                           "as error (not clean)")
+        candidate = extract_verdict_text(envelope.get("result") or "")
+        if candidate is None:
+            return _error_verdict(
+                provider, "claude result text is not loop-verdict JSON; "
+                          "recorded as error (not clean)")
         try:
-            obj = json.loads(envelope.get("result") or "")
+            obj = json.loads(candidate)
         except (ValueError, AttributeError):
             return _error_verdict(
                 provider, "claude result text is not loop-verdict JSON; "
@@ -1403,7 +1530,7 @@ def _muse_usage(raw_path):
 
 
 def extract_usage(provider, raw_path, model="", role="", session="",
-                  action="", mode="", effort=""):
+                  action="", mode="", effort="", source=""):
     """Normalized per-invocation usage record (see module docstring)."""
     parsed = None
     if provider == "codex":
@@ -1415,6 +1542,7 @@ def extract_usage(provider, raw_path, model="", role="", session="",
     record = {"provider": provider, "model": model or "", "role": role or "",
               "action": action or "", "session": session or "",
               "mode": mode or "", "effort": effort or "",
+              "source": source or "",
               "known": parsed is not None,
               # Complete only when every headline counter was reported:
               # a partially known invocation (some counters None) is
