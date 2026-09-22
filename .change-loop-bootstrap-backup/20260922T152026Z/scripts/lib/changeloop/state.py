@@ -180,7 +180,6 @@ def _atomic_write_json(path, obj):
 
 
 def save_state(root, change, state):
-    normalize_budget(state, root, change)
     state["updatedAt"] = now_iso()
     _atomic_write_json(state_file(root, change), state)
 
@@ -517,35 +516,34 @@ _LEGACY_NON_CONSUMING_NOTES = (
 
 
 def _replay_history_consumed(root, change):
-    """Reconstruct ((plan_consumed, code_consumed), saw_reset) from append-only history records.
+    """Reconstruct (consumed, saw_reset) from append-only history records.
 
     Replay is ordered: a reset zeroes the running count, so only imports
     and consumed verdicts recorded AFTER the last reset count. The reset
     therefore bounds every historical budget source, not just history
     replay (see recover_budget).
     """
-    counts = {step: 0 for step in REVIEW_STEPS}
+    consumed = 0
     saw_reset = False
     for _path, record in iter_history(root, change):
         step = record.get("step")
         note = record.get("note") or ""
         verdict = record.get("verdict") or {}
         if step == "budget" and "budget reset" in note:
-            counts = {step: 0 for step in REVIEW_STEPS}
+            consumed = 0
             saw_reset = True
         elif step == "budget" and "imported budget provenance" in note:
             match = re.search(r"(\d+) consumed", note)
             if match:
-                for phase in counts:
-                    counts[phase] = max(counts[phase], int(match.group(1)))
+                consumed = max(consumed, int(match.group(1)))
         elif step in REVIEW_STEPS and verdict.get("status") == "blocking":
             if "consumed" in record:
                 if record.get("consumed") is True:
-                    counts[step] += 1
+                    consumed += 1
             elif not any(marker in note
                          for marker in _LEGACY_NON_CONSUMING_NOTES):
-                counts[step] += 1
-    return (counts["plan-review"], counts["code-review"]), saw_reset
+                consumed += 1
+    return consumed, saw_reset
 
 
 def _old_gate_consumed(root, change):
@@ -579,8 +577,9 @@ def _old_gate_consumed(root, change):
         used = data.get("used")
         if isinstance(used, bool):
             continue
-        if isinstance(used, int) and used >= 0:
-            best = max(best, min(used, MAX_ROUNDS))
+        if isinstance(used, int) and 0 <= used <= MAX_ROUNDS:
+            if used > best:
+                best = used
             sources.append("%s (used=%d)" % (path, used))
     return best, sources
 
@@ -600,13 +599,13 @@ def _migrated_budget(root, change):
         value = changes.get(change, 0)
     else:
         value = data.get("consumed", 0)
-    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-        return min(value, MAX_ROUNDS), ["%s (change %s: %d)" % (path, change, value)]
+    if isinstance(value, int) and 0 < value <= MAX_ROUNDS:
+        return value, ["%s (change %s: %d)" % (path, change, value)]
     return 0, []
 
 
 def recover_budget(root, change):
-    """Return ((plan_consumed, code_consumed), provenance_notes) from all durable sources.
+    """Return (consumed, provenance_notes) from all durable sources.
 
     An explicit reset in the replayed history bounds EVERY historical
     source: old-gate files and migration snapshots predate the loop's
@@ -618,27 +617,24 @@ def recover_budget(root, change):
     """
     history_consumed, saw_reset = _replay_history_consumed(root, change)
     notes = []
-    if any(history_consumed):
-        notes.append("committed verdict history replays plan %d, code %d consumed round(s)"
+    if history_consumed:
+        notes.append("committed verdict history replays %d consumed round(s)"
                      % history_consumed)
     if saw_reset:
         notes.append("explicit reset bounds all pre-reset budget sources")
-        return tuple(min(n, MAX_ROUNDS) for n in history_consumed), notes
+        return min(history_consumed, MAX_ROUNDS), notes
     old_consumed, old_sources = _old_gate_consumed(root, change)
     mig_consumed, mig_sources = _migrated_budget(root, change)
-    consumed = tuple(max(n, old_consumed, mig_consumed)
-                     for n in history_consumed)
+    consumed = max(history_consumed, old_consumed, mig_consumed)
     for source in old_sources:
         notes.append("old-gate budget %s" % source)
     for source in mig_sources:
         notes.append("migration-imported budget %s" % source)
-    return tuple(min(n, MAX_ROUNDS) for n in consumed), notes
+    return min(consumed, MAX_ROUNDS), notes
 
 
 def blank_state(change, roles, models=None, consumed=0, provenance=None,
-                efforts=None, consumed_plan=None, consumed_code=None):
-    plan = min(MAX_ROUNDS, max(0, consumed if consumed_plan is None else consumed_plan))
-    code = min(MAX_ROUNDS, max(0, consumed if consumed_code is None else consumed_code))
+                efforts=None):
     return {
         "change": change,
         "roles": dict(roles),
@@ -652,13 +648,9 @@ def blank_state(change, roles, models=None, consumed=0, provenance=None,
         "step": "plan",
         # After an error/limit handoff, only this action may resume.
         "resumeStep": None,
-        "consumedPlan": plan,
-        "consumedCode": code,
-        "planExhausted": plan >= MAX_ROUNDS,
-        "codeExhausted": code >= MAX_ROUNDS,
-        "consumed": max(plan, code),
+        "consumed": consumed,
         "maxRounds": MAX_ROUNDS,
-        "exhausted": plan >= MAX_ROUNDS or code >= MAX_ROUNDS,
+        "exhausted": consumed >= MAX_ROUNDS,
         "fingerprints": {"plan": None, "code": None, "codePlan": None},
         "approvals": {"plan": None, "code": None, "codePlan": None},
         "sessions": {},
@@ -693,40 +685,7 @@ def blank_state(change, roles, models=None, consumed=0, provenance=None,
     }
 
 
-def normalize_budget(state, root=None, change=None):
-    """Migrate legacy allowance, then derive aliases from phase state only."""
-    if "consumedPlan" not in state or "consumedCode" not in state:
-        legacy = state.get("consumed", 0)
-        legacy = max(0, legacy) if isinstance(legacy, int) else 0
-        (plan, code), _ = (_replay_history_consumed(root, change or state["change"])
-                          if root is not None else ((0, 0), False))
-        remainder = max(0, legacy - (plan + code))
-        state["consumedPlan"] = plan + remainder
-        state["consumedCode"] = code + remainder
-        exhausted = legacy >= MAX_ROUNDS or bool(state.get("exhausted"))
-        state["planExhausted"] = exhausted
-        state["codeExhausted"] = exhausted
-    for phase in ("plan", "code"):
-        key = "consumed" + phase.title()
-        count = state[key]
-        state[key] = max(0, min(count, MAX_ROUNDS)) if isinstance(count, int) else 0
-        flag = phase + "Exhausted"
-        state[flag] = bool(state.get(flag)) or state[key] >= MAX_ROUNDS
-    state["maxRounds"] = MAX_ROUNDS
-    state["consumed"] = max(state["consumedPlan"], state["consumedCode"])
-    state["exhausted"] = state["planExhausted"] or state["codeExhausted"]
-
-
-def budget_text(state):
-    return "plan %d/%d, code %d/%d" % (
-        state["consumedPlan"], MAX_ROUNDS, state["consumedCode"], MAX_ROUNDS)
-
-
-def exhausted_phases(state):
-    return [phase for phase in ("plan", "code") if state[phase + "Exhausted"]]
-
-
-def normalize_state(state, root=None, change=None):
+def normalize_state(state):
     """Forward-fill new keys; pin the fixed budget; normalize exhaustion."""
     state.setdefault("sessions", {})
     state.setdefault("pending", None)
@@ -775,7 +734,13 @@ def normalize_state(state, root=None, change=None):
                                       "codePlan": None})
     state.setdefault("approvals", {"plan": None, "code": None,
                                    "codePlan": None})
-    normalize_budget(state, root, change)
+    state["maxRounds"] = MAX_ROUNDS
+    if not isinstance(state.get("consumed"), int):
+        state["consumed"] = 0
+    state["consumed"] = max(0, min(state["consumed"], MAX_ROUNDS))
+    if state["consumed"] >= MAX_ROUNDS:
+        state["exhausted"] = True
+    state.setdefault("exhausted", False)
     if state.get("step") not in ("plan", "plan-review", "code",
                                  "code-review", "done", "handoff"):
         state["step"] = "plan"
@@ -787,7 +752,7 @@ def normalize_state(state, root=None, change=None):
 # --- token usage ------------------------------------------------------------
 # Per-invocation usage records append to usage.jsonl (one JSON object per
 # line); cumulative totals live in state["usageTotals"]. Both are durable
-# and entirely separate from the blocking-verdict allowances (`consumedPlan` / `consumedCode`).
+# and entirely separate from the blocking-verdict budget (`consumed`).
 
 def usage_file(root, change):
     return os.path.join(state_dir(root, change), "usage.jsonl")

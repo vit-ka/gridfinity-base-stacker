@@ -213,29 +213,23 @@ scripts/change-loop status <change>
 Each role takes `codex | claude | muse | grok | gemini`, optionally with an
 explicit model (`provider:model`, for example
 `scripts/change-loop init abc-test muse:muse-spark-1.3-contributor codex:gpt-6-astra muse:muse-spark-1.3-contributor codex:gpt-6-astra`).
-The description is accompanying prose, never a positional argument. An existing
-change with populated planning artifacts needs no prose: `init` and
-`check-input` record those CLI-resolved artifacts as the input context
-automatically.
+The description is accompanying prose, never a positional argument.
 `grok`/`gemini` are declared-only until their CLI contracts are verified —
 selecting one fails fast instead of invoking. Only selected providers run:
 findings, errors, limits, and exhaustion never fall back to another
 provider. Every invocation needs an explicit model (init mapping or
 `--model`); a missing model refuses before invocation — never a silent
 default or fallback. Every invocation also carries an explicit reasoning
-effort (all roles default to `medium`; never an ambient CLI default).
-Resolution prefers a `--effort` override, then saved role effort, then the
-medium default. Saved high efforts remain effective until explicitly
-overridden with `--effort medium`. The helper prints the
+effort (reviewers `medium`, authors `high`, each overridable via
+`--effort`; never an ambient CLI default), and the helper prints the
 selected provider/model/effort plus one token-usage line per invocation.
 Matching change/role/provider/model/effort resumes its dedicated session
 (`--fresh` deliberately mints a new one); a resume the CLI cannot find
 records an actionable incomplete handoff with the stored session
 preserved — never a silent fresh session, never a fallback provider.
 
-Plan and code review each have an independent allowance of five blocking
-(P0–P2) verdicts per change; the fifth in either phase stops the loop
-with no further invocation.
+One cumulative allowance of five blocking (P0–P2) verdicts is shared across
+plan and code review; the fifth stops the loop with no sixth invocation.
 Clean results, errors, and limits consume nothing. Verdicts append to the
 committable `.change-loop-history/` store; transient state lives under
 `.change-loop/` (git-ignored). Per-invocation token usage appends to a
@@ -243,17 +237,12 @@ per-change usage log with cumulative totals, kept apart from the budget. A
 step succeeds only with a clean reviewer verdict against current content —
 helper exit zero alone is never proof. An error/limit handoff parks the
 in-flight action: only it may run next. Only explicit user authorization
-for `scripts/change-loop reset-rounds <change> --confirm` permits fresh
-allowances for both phases.
+for `scripts/change-loop reset-rounds <change> --confirm` permits a fresh
+budget.
 
 All OpenSpec artifact work goes through the `openspec` CLI (`new`, `status`,
 `instructions`, `validate --strict`, `archive`); helpers never scaffold change
-directories or embed artifact templates. Every role invocation receives
-fresh, complete CLI-resolved change context in the selected store (status
-plus artifact or apply instructions with full file contents, rebuilt for
-fresh, retry, and resumed sessions); persisted prose accompanies it, and
-the coder follows the openspec-apply-change skill in the selected scope
-while reviewers stay read-only. Run
+directories or embed artifact templates. Run
 `scripts/sync-change-loop.sh` to refresh managed copies from the canonical
 checkout (explicit host invocation only, never from hooks).
 <!-- change-loop-docs:end -->"""
@@ -266,28 +255,19 @@ Coordinate implementation with the $change skill: parse exactly five arguments
 (change name plus plan-writer, plan-reviewer, coder, code-reviewer — each
 `provider` or `provider:model`), take the
 description from accompanying prose and/or agreed exploration context (ask
-before invoking when nothing usable exists; never invent scope). An existing
-change with populated planning artifacts needs no prose: `init` and
-`check-input` record those CLI-resolved artifacts as the input context
-automatically. Persist input
+before invoking when nothing usable exists; never invent scope), persist input
 via `scripts/change-loop persist-input`, and drive each step with the matching
 helper action in the selected provider session (every invocation needs an
 explicit model: init mapping or `--model`; missing models refuse before
 invocation, never default or fallback; every invocation also carries an
-explicit effort: all roles default to medium; resolution is `--effort`
-override, then saved role effort, then the default. The helper
+explicit effort: reviewers medium, authors high, or `--effort`; the helper
 prints provider/model/effort and one token-usage line per invocation).
 Never do role work in the host
 session, never fall back to another provider, and never treat helper exit zero
-as review evidence. Plan and code review each have an independent five-verdict
-budget per change; at exhaustion in either phase stop and wait for user
-direction. Only
+as review evidence. The five-verdict budget is cumulative per change across
+plan and code review; at exhaustion stop and wait for user direction. Only
 explicit user authorization for `reset-rounds <change> --confirm` permits that
-reset of both allowances. Every role invocation gets fresh, complete
-CLI-resolved context (status plus artifact or apply instructions with full file contents,
-rebuilt for fresh, retry, and resumed sessions); the coder follows the
-openspec-apply-change skill in the selected scope while reviewers stay
-read-only. See CONTRIBUTING.md for controls, shared state, and skill setup.
+reset. See CONTRIBUTING.md for controls, shared state, and skill setup.
 <!-- change-loop-instructions:end -->"""
 
 

@@ -10,8 +10,8 @@ PROVIDERS_ALL = ("codex", "claude", "muse", "grok", "gemini")
 PROVIDERS_VERIFIED = ("muse", "codex", "claude")
 PROVIDERS_DECLARED = ("grok", "gemini")
 
-# Each phase has a FIXED five-verdict allowance per change: plan review
-# and code review consume independently. It is a constant, not configuration: no environment
+# The five-verdict allowance is FIXED and cumulative per change across plan
+# and code review. It is a constant, not configuration: no environment
 # variable can raise it.
 MAX_ROUNDS = 5
 

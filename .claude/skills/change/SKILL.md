@@ -40,8 +40,9 @@ Example: `$change abc-test muse:muse-spark-1.3-contributor codex:gpt-6-astra mus
   CLI-built-in default. Only explicit models are recorded — a
   provider-default resolution is re-resolved every run and never
   persisted. Every invocation also carries an explicit reasoning effort
-  — reviewers `medium`, authors `high`, each overridable per action via
-  `--effort` (wired as `muse --reasoning-effort`,
+  — all four roles default to `medium`. Resolution is per-action
+  `--effort`, then saved role effort, then the `medium` default
+  (wired as `muse --reasoning-effort`,
   `codex -c model_reasoning_effort=`, `claude --effort`; never an ambient
   CLI default). The helper prints the selected provider/model/source
   (explicit vs. provider default) before each invocation.
@@ -55,18 +56,27 @@ scripts/change-loop init <change-name> <plan-writer> <plan-reviewer> <coder> <co
 ## 2. Establish the description (never invent it)
 
 The description is the accompanying prose in the same user message and/or
-prior agreed exploration context (`explore` is optional: when present, its
-accepted decisions and relevant artifacts join the input; when absent, the
-prose alone suffices). With no usable prose or context, ask what to build
-BEFORE invoking any provider — never invent scope from the change name.
+prior agreed exploration context, and/or the change's own existing planning
+artifacts — never a positional argument. An existing change needs no prose:
+`init` and `check-input` automatically record its CLI-resolved planning
+artifacts as the input context (reporting that source), so proceed straight
+to `run-plan` with no question asked and no scope invented from the change
+name.
 
-Persist it faithfully (no plan authoring) before the first plan-writer run:
+Persist accompanying prose faithfully (no plan authoring) before the first
+plan-writer run — it layers on top of the recorded artifacts:
 
 ```sh
 scripts/change-loop persist-input <change-name> --prose "..." \
   [--decisions-file PATH]... [--artifact PATH]...
 scripts/change-loop check-input <change-name>   # missing input: ask first, invoke nothing
 ```
+
+Ask what to build BEFORE invoking any provider — never invent scope from
+the change name — ONLY when no usable input exists at all: a freshly
+scaffolded change (created by `init` because it did not exist yet) with no
+prose or exploration context, or an existing change whose artifacts are all
+empty or absent.
 
 Later prose or newly agreed exploration decisions supersede the stored input
 for subsequent plan-writer rounds (re-run `persist-input`). A substantive
@@ -83,12 +93,26 @@ findings, errors, limits, or exhaustion — record the incomplete handoff.
 
 ```sh
 scripts/change-loop run-plan <change-name>            # plan-writer drafts via CLI-resolved templates
-scripts/change-loop run-plan-review <change-name>     # plan-reviewer verdict (budget: shared 5)
+scripts/change-loop run-plan-review <change-name>     # plan-reviewer verdict (plan budget: 5)
 scripts/change-loop run-code <change-name>            # coder implements the approved plan
-scripts/change-loop run-code-review <change-name>     # code-reviewer verdict (same budget)
+scripts/change-loop run-code-review <change-name>     # code-reviewer verdict (code budget: 5)
 scripts/change-loop status <change-name>              # explicit status (exit zero is never proof of clean)
 scripts/change-loop history --plain <change-name>     # append-only verdict history
 ```
+
+Every role invocation rebuilds fresh, complete CLI-resolved change context
+in the selected store — status plus artifact instructions with full file
+contents for planning roles, status plus apply instructions (context files,
+tasks, progress, project context, guidance) for implementation roles —
+rebuilt for fresh, retry, and resumed sessions alike. Persisted prose and
+accepted exploration decisions accompany the live artifacts for every role;
+paths alone, summaries, and session memory never substitute for current
+contents. The coder follows the `openspec-apply-change` skill in the
+selected scope and marks work complete only when fully implemented; a
+missing skill is an explicit handoff, never a reduced workflow. Reviewers
+stay read-only while receiving equivalent host-resolved criteria, and
+context-resolution failures park the in-flight action instead of invoking
+any provider on partial context.
 
 Each `run-*` action also accepts `[--model M] [--effort E] [--fresh]`:
 `--model` overrides the recorded model for that role (and records it),
@@ -125,11 +149,12 @@ action next (`status` names it); anything else is refused. A step counts
 as successful only with a clean reviewer verdict against the current
 content fingerprint, bound to the pending invocation's live session.
 
-One cumulative allowance of five blocking (P0–P2) verdicts is shared across
-plan and code review. Clean results, errors, and limits consume nothing. The
-fifth blocking verdict stops the loop with no sixth invocation and no further
+Plan and code review each have an independent allowance of five blocking
+(P0–P2) verdicts per change. Each blocking verdict consumes only its own
+phase's allowance. Clean results, errors, and limits consume nothing. The
+fifth blocking verdict in either phase stops all invocations and further
 autonomous fixing — hand the preserved findings to the user. Only an explicit
-user-authorized reset permits a fresh budget:
+user-authorized reset permits fresh allowances for both phases:
 
 ```sh
 scripts/change-loop reset-rounds <change-name> --confirm

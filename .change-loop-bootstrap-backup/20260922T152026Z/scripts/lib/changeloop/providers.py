@@ -7,7 +7,7 @@ Verified against installed binaries (observed --help + old-gate production):
              --session-id UUID [--model M] --reasoning-effort E` (model
              on fresh only; resume reuses the same UUID and keeps its
              model; effort is explicit on EVERY invocation — reviewers
-             and authors medium unless `--effort` overrides). Authors
+             medium, authors high unless `--effort` overrides). Authors
              pass `--approval-mode never` on fresh and resume invocations
              so headless runs cannot wait for interactive approval, with
              the sandbox kept on (no `--yolo`, `--disable-sandbox`, or
@@ -20,7 +20,7 @@ Verified against installed binaries (observed --help + old-gate production):
              Every path passes `-c features.hooks=false
              -c approval_policy="never"` (hook-disabled, never approve)
              plus `-c model_reasoning_effort="E"` (explicit reasoning
-             effort on EVERY invocation — all roles medium
+             effort on EVERY invocation — reviewers medium, authors high
              unless `--effort` overrides; a config override because
              `codex exec` exposes no `--effort` flag).
              Resume via `codex exec resume SID -m M --json PROMPT` plus
@@ -75,7 +75,7 @@ Explicit models: every verified-provider invocation requires a non-empty
 model id (no silent CLI defaults, no fallback). Explicit effort: every
 verified-provider invocation carries an explicit reasoning-effort level
 (muse `--reasoning-effort`, codex `-c model_reasoning_effort=`, claude
-`--effort`) — all roles medium, each overridable via the
+`--effort`) — reviewers medium, authors high, each overridable via the
 helper's `--effort` flag; reviewer effort NEVER falls through to an
 ambient CLI default. Usage: per-invocation
 counters are extracted from the provider's REAL output file
@@ -155,11 +155,11 @@ _CLAUDE_AUTHOR_ALLOW = ("Read Grep Glob Edit Write "
                         "Bash(sh:*) Bash(make:*) Bash(node:*) Bash(npm:*) "
                         "Bash(npx:*)")
 
-# Explicit reasoning effort defaults to medium for authors and reviewers.
-# The helper resolves --effort, then saved role effort, then this default.
+# Explicit reasoning effort per role kind. Reviewers run medium; authors
+# run high; the helper's `--effort` flag overrides either per invocation.
 # Effort is ALWAYS rendered into argv (never left to an ambient CLI
 # default) and bound into session identity alongside provider and model.
-EFFORT_AUTHOR_DEFAULT = "medium"
+EFFORT_AUTHOR_DEFAULT = "high"
 EFFORT_REVIEWER_DEFAULT = "medium"
 
 _AUTH_HINTS = ("authenticat", "login", "unauthorized", " 401", "403",
@@ -307,7 +307,7 @@ def _check_resume_contract(provider):
 # --- invocation construction (verified providers only) ------------------------
 # build_args(provider, role, fresh|resume, session, model, prompt, root,
 #            effort=None). Effort resolves to an explicit level (the passed
-# value, else medium for all roles) and is ALWAYS rendered
+# value, else reviewers medium / authors high) and is ALWAYS rendered
 # into argv — reviewer effort never falls through to an ambient CLI
 # default. prompt delivery per provider: muse via --prompt-file, codex
 # positional, claude on stdin (its variadic tool flags swallow
