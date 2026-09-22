@@ -16,11 +16,8 @@ Exit codes: 0 = clean / handoff recorded (stop is allowed),
 
 Env: CHANGE_LOOP_ROOT (repo root, default: this checkout's root),
      CHANGE_LOOP_STORE (openspec store id), CHANGE_LOOP_DRIVER=fixture +
-     CHANGE_LOOP_FIXTURE_DIR (offline tests), CHANGE_LOOP_APPLY_SKILL
-     (override path to the bundled apply skill file; honored only
-     under the fixture driver — never in normal provider runs),
-     per-action --model/--effort flags plus --fresh (deliberately mint
-     a new session).
+     CHANGE_LOOP_FIXTURE_DIR (offline tests), per-action --model/--effort
+     flags plus --fresh (deliberately mint a new session).
 """
 
 import json
@@ -223,45 +220,6 @@ def _plan_prompt(root, change, state):
                   ctx, findings, context))
 
 
-# Bundled `openspec-apply-change` skill, resolved against this helper's
-# own directory — never against the implementation workspace (whose
-# checkout need not carry the loop's skills) and never via provider
-# workspace skill loading (which an untrusted workspace skips). An
-# unreadable file raises LoopError, which the provider-step wrapper
-# records as an explicit incomplete handoff with no provider invoked.
-# CHANGE_LOOP_APPLY_SKILL overrides the path, but ONLY under the
-# fixture driver (offline tests): normal provider runs always use the
-# bundled file, so a workspace-relative override can never substitute
-# untrusted content for the helper's own skill.
-_APPLY_SKILL_REL = os.path.join(".agents", "skills",
-                                "openspec-apply-change", "SKILL.md")
-
-
-def _apply_skill_path():
-    if PV.fixture_dir() is not None:
-        override = (os.environ.get("CHANGE_LOOP_APPLY_SKILL")
-                    or "").strip()
-        if override:
-            return override
-    helper_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.normpath(os.path.join(helper_dir, "..",
-                                         _APPLY_SKILL_REL))
-
-
-def _read_apply_skill():
-    path = _apply_skill_path()
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            body = fh.read()
-    except (OSError, UnicodeDecodeError) as exc:
-        raise ST.LoopError(
-            "cannot read required apply skill '%s': %s" % (path, exc))
-    if not body.strip():
-        raise ST.LoopError(
-            "required apply skill '%s' is empty" % path)
-    return body
-
-
 def _code_prompt(root, change, state):
     with open(ST.input_file(root, change), "r", encoding="utf-8",
               errors="replace") as fh:
@@ -270,8 +228,7 @@ def _code_prompt(root, change, state):
     if findings:
         findings = "\n" + findings
     ctx = OS.format_apply_block(OS.resolve_apply_context(root, change))
-    skill = _read_apply_skill()
-    head = (
+    return (
         "You are the coder for OpenSpec change '%s'.\n"
         "Follow the `openspec-apply-change` skill for this change in the "
         "selected scope: read the full change context below (current "
@@ -280,9 +237,7 @@ def _code_prompt(root, change, state):
         "each pending task, and mark a task complete only after its "
         "specified behavior is fully implemented. Write implementation "
         "code only; do not rewrite planning artifacts except as the plan "
-        "requires. The full skill contents are embedded below, so this "
-        "run never depends on provider workspace skill loading (which "
-        "an untrusted workspace skips).\n"
+        "requires.\n"
         "If the required skill is unavailable, stop and report an explicit "
         "incomplete handoff naming the missing skill instead of "
         "proceeding with a reduced description-only workflow.\n"
@@ -299,13 +254,9 @@ def _code_prompt(root, change, state):
         "%s"
         "%s\n"
         "%s"
-        "## Bundled `openspec-apply-change` skill contents "
-        "(workspace skill loading is not required)\n"
-        "%s\n"
         "Plan-writer input context for reference:\n"
         "%s\n" % (change, _planning_scope_block(root), ctx,
-                  findings, skill, context))
-    return head
+                  findings, context))
 
 
 # --- init ---------------------------------------------------------------------
