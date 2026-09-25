@@ -321,7 +321,7 @@ def _check_resume_contract(provider):
 # (or "no default" for providers without an entry).
 DEFAULT_MODELS = {
     "muse": "muse-spark-1.3",
-    "claude": "claude-opus-5-5",
+    "claude": "claude-fable-5-1",
     "codex": "gpt-6-astra",
 }
 

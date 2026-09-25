@@ -34,7 +34,7 @@ Example: `$change abc-test muse:muse-spark-1.3-contributor codex:gpt-6-astra mus
   override, then the recorded init mapping, then the pre-configured
   provider default (`CHANGE_LOOP_DEFAULT_MODEL_<PROVIDER>` env override
   first, then the built-in value: `muse` → `muse-spark-1.3`,
-  `claude` → `claude-opus-5-5`, `codex` → `gpt-6-astra`;
+  `claude` → `claude-fable-5-1`, `codex` → `gpt-6-astra`;
   `grok`/`gemini` have no default). A missing model refuses BEFORE any
   provider runs: the loop never falls back to another provider or a
   CLI-built-in default. Only explicit models are recorded — a
